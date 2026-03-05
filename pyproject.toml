@@ -19,10 +19,12 @@ classifiers = [
 dependencies = [
   "torch>=2.8,<2.9",
   "triton>=3.2,<4",
-  "flash-attn>=2.8.0",
 ]
 
 [project.optional-dependencies]
+dev = [
+  "flash-attn>=2.8.0",
+]
 benchmark = [
   "matplotlib",
   "pandas",

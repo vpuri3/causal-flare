@@ -4,7 +4,8 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from causal_flare import RecurrentFLARE, flare_chunk_triton
+from causal_flare import flare_chunk_triton
+from causal_flare.recurrent import RecurrentFLARE
 from causal_flare.torch import flare_causal_chunked, flare_causal_reference
 
 

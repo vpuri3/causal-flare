@@ -18,8 +18,6 @@ import triton
 import triton.language as tl
 import triton.testing
 
-from flash_attn import flash_attn_func
-
 # Backward profiling (set by main for a single run)
 _BWD_PROFILE_MODE = None  # "triton3"
 _BWD_PROFILE_TIMINGS = {}

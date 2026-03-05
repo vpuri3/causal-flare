@@ -15,8 +15,6 @@ import triton
 import triton.language as tl
 import triton.testing
 
-from flash_attn import flash_attn_func
-
 # Backward profiling (set by main for a single run)
 _BWD_PROFILE_MODE = None  # "triton3"
 _BWD_PROFILE_TIMINGS = {}
@@ -3779,17 +3777,12 @@ def flare_noncausal(Q, K, V, scale=1.0):
     H, M, D = Q.size()
     B, N, H, D = K.size()
 
-    if K.dtype != torch.float32:
-        Q_bmhd = Q.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1)
-        Z = flash_attn_func(Q_bmhd, K, V, causal=False, softmax_scale=scale)
-        Y = flash_attn_func(K, Q_bmhd, Z, causal=False, softmax_scale=scale)
-    else:
-        Q = Q.unsqueeze(0).expand(B, -1, -1, -1)
-        K = K.permute(0, 2, 1, 3)
-        V = V.permute(0, 2, 1, 3)
+    Q = Q.unsqueeze(0).expand(B, -1, -1, -1)
+    K = K.permute(0, 2, 1, 3)
+    V = V.permute(0, 2, 1, 3)
 
-        Y = F.scaled_dot_product_attention(Q, K, V, is_causal=False, scale=scale)
-        Z = F.scaled_dot_product_attention(K, Q, Y, is_causal=False, scale=scale)
+    Y = F.scaled_dot_product_attention(Q, K, V, is_causal=False, scale=scale)
+    Z = F.scaled_dot_product_attention(K, Q, Y, is_causal=False, scale=scale)
 
     return Y
 
@@ -3803,13 +3796,10 @@ def causal_SDPA(Q, K, V):
         raise ValueError(
             f"Q, K, V must have the same shape for causal SDPA. Got Q.shape={Q.shape}, K.shape={K.shape}, V.shape={V.shape}"
         )
-    if K.dtype != torch.float32:
-        Y = flash_attn_func(Q, K, V, causal=True)
-    else:
-        Q = Q.permute(0, 2, 1, 3)
-        K = K.permute(0, 2, 1, 3)
-        V = V.permute(0, 2, 1, 3)
-        Y = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+    Q = Q.permute(0, 2, 1, 3)
+    K = K.permute(0, 2, 1, 3)
+    V = V.permute(0, 2, 1, 3)
+    Y = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
     return Y
 
@@ -3830,28 +3820,18 @@ def flare_causal_reference(Q, K, V, scale=1.0):
         Q = Q.float()
         K = K.float()
         V = V.float()
-    if K.dtype != torch.float32:
-        Q_bmhd = Q.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1)
-        Y = torch.zeros_like(K)
-        for t in range(N):
-            Kt = K[:, :t+1, :, :]
-            Vt = V[:, :t+1, :, :]
-            Zt = flash_attn_func(Q_bmhd, Kt, Vt, causal=False, softmax_scale=scale)
-            Yt = flash_attn_func(Kt, Q_bmhd, Zt, causal=False, softmax_scale=scale)
-            Y[:, t, :, :] = Yt[:, t, :, :]
-    else:
-        Q_bhmd = Q.unsqueeze(0).expand(B, -1, -1, -1)
-        K = K.permute(0, 2, 1, 3)
-        V = V.permute(0, 2, 1, 3)
-        Y = torch.zeros_like(K)
-        for t in range(N):
-            Kt = K[:, :, :t+1, :]
-            Vt = V[:, :, :t+1, :]
-            Zt = F.scaled_dot_product_attention(Q_bhmd, Kt, Vt, is_causal=False, scale=scale)
-            Yt = F.scaled_dot_product_attention(Kt, Q_bhmd, Zt, is_causal=False, scale=scale)
-            Y[:, :, t] = Yt[:, :, t]
+    Q_bhmd = Q.unsqueeze(0).expand(B, -1, -1, -1)
+    K = K.permute(0, 2, 1, 3)
+    V = V.permute(0, 2, 1, 3)
+    Y = torch.zeros_like(K)
+    for t in range(N):
+        Kt = K[:, :, :t+1, :]
+        Vt = V[:, :, :t+1, :]
+        Zt = F.scaled_dot_product_attention(Q_bhmd, Kt, Vt, is_causal=False, scale=scale)
+        Yt = F.scaled_dot_product_attention(Kt, Q_bhmd, Zt, is_causal=False, scale=scale)
+        Y[:, :, t] = Yt[:, :, t]
 
-        Y = Y.permute(0, 2, 1, 3)
+    Y = Y.permute(0, 2, 1, 3)
 
     return Y
 

@@ -16,7 +16,7 @@ pip install causal-flare==0.0.1
 For local development:
 
 ```bash
-pip install -e .[test,benchmark]
+pip install -e .[dev,test,benchmark]
 ```
 
 ## Quick start
@@ -35,11 +35,12 @@ y = flare_chunk_triton(q, k, v)
 ## Benchmarks
 
 ```bash
-python -m causal_flare.benchmark_prefill_decode --help
-python -m causal_flare.benchmark_train_step --help
+python benchmark/benchmark_prefill_decode.py --help
+python benchmark/benchmark_train_step.py --help
 ```
 
 ## Notes
 
 - This project currently keeps optional integration hooks for running inside the original FLA monorepo.
-- CUDA + Triton + flash-attn are expected for full functionality.
+- CUDA + Triton are runtime dependencies.
+- `flash-attn` is a dev extra (`.[dev]`) and is intended for benchmark-only workflows.

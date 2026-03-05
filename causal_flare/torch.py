@@ -281,17 +281,12 @@ def flare_noncausal(Q, K, V, scale=None):
     B, N, H, D = K.size()
     scale = _resolve_attn_scale(scale, D)
 
-    if K.dtype != torch.float32:
-        Q_bmhd = Q.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1)
-        Z = flash_attn_func(Q_bmhd, K, V, causal=False, softmax_scale=scale)
-        Y = flash_attn_func(K, Q_bmhd, Z, causal=False, softmax_scale=scale)
-    else:
-        Q = Q.unsqueeze(0).expand(B, -1, -1, -1)
-        K = K.permute(0, 2, 1, 3)
-        V = V.permute(0, 2, 1, 3)
+    Q = Q.unsqueeze(0).expand(B, -1, -1, -1)
+    K = K.permute(0, 2, 1, 3)
+    V = V.permute(0, 2, 1, 3)
 
-        Y = F.scaled_dot_product_attention(Q, K, V, is_causal=False, scale=scale)
-        Z = F.scaled_dot_product_attention(K, Q, Y, is_causal=False, scale=scale)
+    Y = F.scaled_dot_product_attention(Q, K, V, is_causal=False, scale=scale)
+    Z = F.scaled_dot_product_attention(K, Q, Y, is_causal=False, scale=scale)
 
     return Y
 
@@ -305,13 +300,10 @@ def causal_SDPA(Q, K, V):
         raise ValueError(
             f"Q, K, V must have the same shape for causal SDPA. Got Q.shape={Q.shape}, K.shape={K.shape}, V.shape={V.shape}"
         )
-    if K.dtype != torch.float32:
-        Y = flash_attn_func(Q, K, V, causal=True)
-    else:
-        Q = Q.permute(0, 2, 1, 3)
-        K = K.permute(0, 2, 1, 3)
-        V = V.permute(0, 2, 1, 3)
-        Y = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+    Q = Q.permute(0, 2, 1, 3)
+    K = K.permute(0, 2, 1, 3)
+    V = V.permute(0, 2, 1, 3)
+    Y = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
     return Y
 
@@ -341,34 +333,21 @@ def flare_causal_reference(Q_enc, K_enc, V_enc, Q_dec=None, K_dec=None, scale=No
         Q_dec = Q_dec.to(K_enc.dtype) if separate_Q_dec else K_enc
         K_dec = K_dec.to(Q_enc.dtype) if separate_K_dec else Q_enc
 
-    if K_enc.dtype != torch.float32:
-        Q_enc = Q_enc.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1)
-        Q_dec = Q_dec if separate_Q_dec else K_enc
-        K_dec = K_dec.permute(1, 0, 2).unsqueeze(0).expand(B, -1, -1, -1) if separate_K_dec else Q_enc
-        Y = torch.zeros_like(K_enc)
-        for t in range(N):
-            Kt_enc = K_enc[:, :t+1, :, :]
-            Vt_enc = V_enc[:, :t+1, :, :]
-            Qt_dec = Q_dec[:, t:t+1, :, :]
-            Vt_dec = flash_attn_func(Q_enc, Kt_enc, Vt_enc, causal=False, softmax_scale=scale)
-            Yt = flash_attn_func(Qt_dec, K_dec, Vt_dec, causal=False, softmax_scale=scale)
-            Y[:, t, :, :] = Yt.squeeze(1)
-    else:
-        Q_enc = Q_enc.unsqueeze(0).expand(B, -1, -1, -1)
-        K_enc = K_enc.permute(0, 2, 1, 3)
-        V_enc = V_enc.permute(0, 2, 1, 3)
-        Q_dec = Q_dec.permute(0, 2, 1, 3) if separate_Q_dec else K_enc
-        K_dec = K_dec.unsqueeze(0).expand(B, -1, -1, -1) if separate_K_dec else Q_enc
-        Y = torch.zeros_like(K_enc)
-        for t in range(N):
-            Kt_enc = K_enc[:, :, :t+1, :]
-            Vt_enc = V_enc[:, :, :t+1, :]
-            Qt_dec = Q_dec[:, :, t:t+1, :]
-            Vt_dec = F.scaled_dot_product_attention(Q_enc, Kt_enc, Vt_enc, is_causal=False, scale=scale)
-            Yt = F.scaled_dot_product_attention(Qt_dec, K_dec, Vt_dec, is_causal=False, scale=scale)
-            Y[:, :, t] = Yt.squeeze(2)
+    Q_enc = Q_enc.unsqueeze(0).expand(B, -1, -1, -1)
+    K_enc = K_enc.permute(0, 2, 1, 3)
+    V_enc = V_enc.permute(0, 2, 1, 3)
+    Q_dec = Q_dec.permute(0, 2, 1, 3) if separate_Q_dec else K_enc
+    K_dec = K_dec.unsqueeze(0).expand(B, -1, -1, -1) if separate_K_dec else Q_enc
+    Y = torch.zeros_like(K_enc)
+    for t in range(N):
+        Kt_enc = K_enc[:, :, :t+1, :]
+        Vt_enc = V_enc[:, :, :t+1, :]
+        Qt_dec = Q_dec[:, :, t:t+1, :]
+        Vt_dec = F.scaled_dot_product_attention(Q_enc, Kt_enc, Vt_enc, is_causal=False, scale=scale)
+        Yt = F.scaled_dot_product_attention(Qt_dec, K_dec, Vt_dec, is_causal=False, scale=scale)
+        Y[:, :, t] = Yt.squeeze(2)
 
-        Y = Y.permute(0, 2, 1, 3)
+    Y = Y.permute(0, 2, 1, 3)
 
     return Y
 

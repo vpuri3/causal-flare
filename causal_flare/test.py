@@ -3099,7 +3099,7 @@ def main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int = 16, dtype
     device = torch.device('cuda')
     dtype = getattr(torch, dtype)
     try:
-        from .flash_attention2_triton import (
+        from benchmark.implementations.flash_attention2_triton import (
             flash_attention2_triton_bnhd as _flash_attention2_triton_bnhd,
         )
     except Exception as exc:

@@ -3,13 +3,14 @@ import math
 import pytest
 import torch
 
-from causal_flare import RecurrentFLARE, flare_chunk_triton
+from causal_flare import flare_chunk_triton
 from causal_flare.inference import (
     flare_decode_pytorch,
     flare_decode_triton,
     flare_prefill_pytorch,
     flare_prefill_triton,
 )
+from causal_flare.recurrent import RecurrentFLARE
 from causal_flare.torch import (
     flare_causal_chunked,
     flare_recurrent_dense_backward_pytorch,
