@@ -1,0 +1,53 @@
+[project]
+name = "causal-flare"
+version = "0.0.1"
+description = "Experimental standalone Causal FLARE kernels"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "FLA Contributors" }
+]
+license = { text = "MIT" }
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.8,<2.9",
+  "triton>=3.2,<4",
+  "flash-attn>=2.8.0",
+]
+
+[project.optional-dependencies]
+benchmark = [
+  "matplotlib",
+  "pandas",
+]
+test = [
+  "pytest",
+]
+
+[project.urls]
+Homepage = "https://github.com/vedantpu/causal-flare"
+Repository = "https://github.com/vedantpu/causal-flare"
+
+[project.scripts]
+causal-flare = "causal_flare.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["causal_flare*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 127
