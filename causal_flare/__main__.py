@@ -1,6 +1,11 @@
 import argparse
 
-from .test import run_module_main
+try:
+    from testing.test import run_module_main
+except Exception as exc:
+    raise RuntimeError(
+        "Diagnostics moved to testing/test.py. Run from the repo root so the testing package is importable."
+    ) from exc
 
 
 def _build_parser() -> argparse.ArgumentParser:

@@ -1,12 +1,12 @@
-from . import _common as _common_impl
-from . import chunked as _chunked_impl
-from ._common import *
-from .chunked import *
-from .chunked_old import ChunkedFLAREOld
-from .dense import *
-from .inference import *
-from .recurrent import *
-from .torch import *
+import causal_flare._common as _common_impl
+import causal_flare.chunked as _chunked_impl
+from causal_flare._common import *
+from causal_flare.chunked import *
+from causal_flare.chunked_old import ChunkedFLAREOld
+from causal_flare.dense import *
+from causal_flare.inference import *
+from causal_flare.recurrent import *
+from causal_flare.torch import *
 
 
 def _denseflare1_phase_bench(Q, K, V, scale=1.0):
@@ -1979,7 +1979,7 @@ def _long_context_accuracy_suite():
         "FLARE_LONGCTX_CONFIGS",
         "1,8,128,8192,32;1,8,128,16384,32",
     )
-    from .chunked_old import ChunkedFLAREOld
+    from causal_flare.chunked_old import ChunkedFLAREOld
 
     fwd_ref_margin_max = _env_float("FLARE_LONGCTX_FWD_REF_MARGIN_MAX", 5e-4)
     fwd_new_old_max_abs_max = _env_float("FLARE_LONGCTX_FWD_NEW_OLD_MAX_ABS_MAX", 8e-3)
@@ -2128,7 +2128,7 @@ def _trainlike_multistep_parity():
     lr = float(os.environ.get("FLARE_TRAINLIKE_PARITY_LR", "1e-3"))
     qkv_std = float(os.environ.get("FLARE_TRAINLIKE_PARITY_QKV_STD", "1.0"))
     strict = _strict_mode_enabled("FLARE_TRAINLIKE_PARITY_STRICT", default=True)
-    from .chunked_old import ChunkedFLAREOld
+    from causal_flare.chunked_old import ChunkedFLAREOld
     failures: list[str] = []
     loss_delta_max = _env_float("FLARE_TRAINLIKE_PARITY_LOSS_DELTA_MAX", 5e-3)
     grad_cos_min = _env_float("FLARE_TRAINLIKE_PARITY_GRAD_COS_MIN", -1.0)
@@ -3052,7 +3052,7 @@ def _run_cached_impl_test():
 
 
 def main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int = 16, dtype: str = 'bfloat16'):
-    from .chunked_old import ChunkedFLAREOld
+    from causal_flare.chunked_old import ChunkedFLAREOld
 
     if os.environ.get("FLARE_REGRESSION_TEST", "0") == "1":
         _regression_test()
