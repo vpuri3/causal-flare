@@ -267,46 +267,6 @@ def flare_recurrent_dense_backward_pytorch(Q, K, V, dY, scale=None, Q_dec=None, 
 #======================================================================#
 #======================================================================#
 
-def flare_noncausal(Q, K, V, scale=None):
-    assert Q.dim() == 3 and K.dim() == 4 and V.dim() == 4, (
-        "Q, K, V must be 3D and 4D tensors respectively "
-        f"got Q.dim()={Q.dim()}, K.dim()={K.dim()}, V.dim()={V.dim()}"
-    )
-    assert K.size() == V.size(), f"K and V must have the same shape. Got K.shape={K.shape} and V.shape={V.shape}"
-    assert Q.size(0) == K.size(2) and Q.size(2) == K.size(3), (
-        "Expected Q [H, M, D] and K/V [B, N, H, D]. "
-        f"Got Q.shape={Q.shape} and K.shape={K.shape}"
-    )
-    H, M, D = Q.size()
-    B, N, H, D = K.size()
-    scale = _resolve_attn_scale(scale, D)
-
-    Q = Q.unsqueeze(0).expand(B, -1, -1, -1)
-    K = K.permute(0, 2, 1, 3)
-    V = V.permute(0, 2, 1, 3)
-
-    Y = F.scaled_dot_product_attention(Q, K, V, is_causal=False, scale=scale)
-    Z = F.scaled_dot_product_attention(K, Q, Y, is_causal=False, scale=scale)
-
-    return Y
-
-def causal_SDPA(Q, K, V):
-    if Q.dim() != 4 or K.dim() != 4 or V.dim() != 4:
-        raise ValueError(
-            "Causal SDPA expects Q, K, V all as 4D tensors for benchmarking. "
-            f"Got Q.dim()={Q.dim()}, K.dim()={K.dim()}, V.dim()={V.dim()}"
-        )
-    if Q.size() != K.size() or K.size() != V.size():
-        raise ValueError(
-            f"Q, K, V must have the same shape for causal SDPA. Got Q.shape={Q.shape}, K.shape={K.shape}, V.shape={V.shape}"
-        )
-    Q = Q.permute(0, 2, 1, 3)
-    K = K.permute(0, 2, 1, 3)
-    V = V.permute(0, 2, 1, 3)
-    Y = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
-
-    return Y
-
 def flare_causal_reference(Q_enc, K_enc, V_enc, Q_dec=None, K_dec=None, scale=None):
     assert Q_enc.dim() == 3 and K_enc.dim() == 4 and V_enc.dim() == 4, (
         "Q_enc, K_enc, V_enc must be 3D and 4D tensors respectively "

@@ -7,6 +7,7 @@ from causal_flare.dense import *
 from causal_flare.inference import *
 from causal_flare.recurrent import *
 from causal_flare.torch import *
+from benchmark.implementations.reference_ops import causal_SDPA
 
 
 def _denseflare1_phase_bench(Q, K, V, scale=1.0):
