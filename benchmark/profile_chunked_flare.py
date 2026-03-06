@@ -140,6 +140,24 @@ def estimate_occupancy(compiled_kernel, device_props: dict[str, int]) -> tuple[f
     return occupancy * 100.0, active_ctas, limiting
 
 
+def estimate_occupancy_from_resource_dict(resource: dict[str, int], device_props: dict[str, int]) -> tuple[float, int, list[str]]:
+    threads_per_cta = int(resource["num_warps"]) * device_props["warp_size"]
+    regs_per_cta = int(resource["regs_per_thread"]) * threads_per_cta
+    shared_per_cta = int(resource["shared_bytes"])
+    max_warps_per_sm = device_props["max_threads_per_sm"] // device_props["warp_size"]
+    limits = {
+        "arch": 32,
+        "threads": device_props["max_threads_per_sm"] // threads_per_cta,
+        "warps": max_warps_per_sm // int(resource["num_warps"]),
+        "regs": device_props["max_num_regs"] // regs_per_cta if regs_per_cta > 0 else 32,
+        "shared": device_props["max_shared_mem"] // shared_per_cta if shared_per_cta > 0 else 32,
+    }
+    active_ctas = max(1, min(limits.values()))
+    occupancy = active_ctas * int(resource["num_warps"]) / max_warps_per_sm
+    limiting = [name for name, value in limits.items() if value == active_ctas]
+    return occupancy * 100.0, active_ctas, limiting
+
+
 def compile_forward_kernels(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -373,6 +391,32 @@ def collect_kernel_profiles(compiled_kernels: dict[str, object], device_idx: int
     return profiles
 
 
+def collect_recorded_kernel_profiles(recorded_resources: dict[str, dict[str, int]], device_idx: int) -> dict[str, KernelProfile]:
+    triton_props = driver.active.utils.get_device_properties(device_idx)
+    device_props = {
+        "max_shared_mem": int(triton_props["max_shared_mem"]),
+        "max_num_regs": int(triton_props["max_num_regs"]),
+        "warp_size": int(triton_props["warpSize"]),
+        "max_threads_per_sm": int(torch.cuda.get_device_properties(device_idx).max_threads_per_multi_processor),
+    }
+    profiles = {}
+    for name, resource in recorded_resources.items():
+        occupancy_pct, active_ctas, limiting = estimate_occupancy_from_resource_dict(resource, device_props)
+        profiles[name] = KernelProfile(
+            name=name,
+            num_warps=int(resource["num_warps"]),
+            num_stages=int(resource["num_stages"]),
+            regs_per_thread=int(resource["regs_per_thread"]),
+            spills=int(resource["spills"]),
+            shared_bytes=int(resource["shared_bytes"]),
+            threads_per_cta=int(int(resource["num_warps"]) * device_props["warp_size"]),
+            occupancy_pct_est=occupancy_pct,
+            active_ctas_per_sm_est=active_ctas,
+            limiting_factors=limiting,
+        )
+    return profiles
+
+
 def average_profile_timings(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -382,7 +426,7 @@ def average_profile_timings(
     iterations: int,
     input_precision: str | None,
     include_backward: bool,
-) -> tuple[dict[str, float], dict[str, float]]:
+) -> tuple[dict[str, float], dict[str, float], dict[str, dict[str, int]]]:
     def zero_grads() -> None:
         if q.grad is not None:
             q.grad.zero_()
@@ -409,6 +453,7 @@ def average_profile_timings(
 
     forward_totals: dict[str, float] = defaultdict(float)
     backward_totals: dict[str, float] = defaultdict(float)
+    backward_resources: dict[str, dict[str, int]] = {}
     for _ in range(iterations):
         profile = run_once(profile=True)
         assert profile is not None
@@ -416,9 +461,15 @@ def average_profile_timings(
             forward_totals[key] += float(value)
         for key, value in profile["backward"].items():
             backward_totals[key] += float(value)
+        if include_backward:
+            backward_resources = {
+                name: dict(resource)
+                for name, resource in profile.get("backward_resources", {}).items()
+            }
     return (
         {key: value / iterations for key, value in forward_totals.items()},
         {key: value / iterations for key, value in backward_totals.items()},
+        backward_resources,
     )
 
 
@@ -490,7 +541,7 @@ def bench_case(
     with temp_env(env):
         compiled_kernels = compile_forward_kernels(q, k, v, input_precision=input_precision)
         kernel_profiles = collect_kernel_profiles(compiled_kernels, device_idx)
-        avg_forward_timings, avg_backward_timings = average_profile_timings(
+        avg_forward_timings, avg_backward_timings, backward_resources = average_profile_timings(
             q,
             k,
             v,
@@ -509,6 +560,7 @@ def bench_case(
 
     forward_total_ms = sum(avg_forward_timings.values())
     backward_total_ms = sum(avg_backward_timings.values())
+    backward_kernel_profiles = collect_recorded_kernel_profiles(backward_resources, device_idx) if backward_resources else {}
     forward_rows = []
     for name, timing_ms in sorted(avg_forward_timings.items(), key=lambda item: item[1], reverse=True):
         row = {
@@ -522,13 +574,14 @@ def bench_case(
 
     backward_rows = []
     for name, timing_ms in sorted(avg_backward_timings.items(), key=lambda item: item[1], reverse=True):
-        backward_rows.append(
-            {
-                "name": name,
-                "avg_ms": timing_ms,
-                "pct_of_backward_profile": 100.0 * timing_ms / backward_total_ms if backward_total_ms else 0.0,
-            }
-        )
+        row = {
+            "name": name,
+            "avg_ms": timing_ms,
+            "pct_of_backward_profile": 100.0 * timing_ms / backward_total_ms if backward_total_ms else 0.0,
+        }
+        if name in backward_kernel_profiles:
+            row.update(asdict(backward_kernel_profiles[name]))
+        backward_rows.append(row)
 
     return {
         "case": asdict(case),
@@ -596,12 +649,27 @@ def print_summary(results: list[dict]) -> None:
             )
         if result["backward_kernels"]:
             print("backward kernels")
-            print("kernel".ljust(36), "avg_ms".rjust(10), "%bwd".rjust(8))
+            print(
+                "kernel".ljust(36),
+                "avg_ms".rjust(10),
+                "%bwd".rjust(8),
+                "regs".rjust(8),
+                "smem_kb".rjust(10),
+                "occ%".rjust(8),
+                "cta/sm".rjust(8),
+                "limit".rjust(16),
+            )
             for kernel in result["backward_kernels"]:
+                limit = ",".join(kernel.get("limiting_factors", []))
                 print(
                     kernel["name"].ljust(36),
                     f"{kernel['avg_ms']:.3f}".rjust(10),
                     f"{kernel['pct_of_backward_profile']:.1f}".rjust(8),
+                    f"{kernel.get('regs_per_thread', 0)}".rjust(8),
+                    f"{kernel.get('shared_bytes', 0) / 1024:.1f}".rjust(10),
+                    f"{kernel.get('occupancy_pct_est', 0.0):.1f}".rjust(8),
+                    f"{kernel.get('active_ctas_per_sm_est', 0)}".rjust(8),
+                    limit.rjust(16),
                 )
 
 

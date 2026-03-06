@@ -1,10 +1,15 @@
 from ._common import *
 from .chunked import *
 from .chunked import (
+    _block_k_divisor,
     _get_chunked_forward_config,
+    _profiled_call,
+    _refresh_profile_totals,
+    _require_power_of_two_tile,
     _run_chunked_output_phase,
     _run_chunked_prefix_phase,
     _run_chunked_prepare_phase,
+    _snap_block_d_default,
 )
 from .torch import _resolve_flare_causal_decode_inputs as _resolve_inference_decode_inputs
 
@@ -430,7 +435,8 @@ def flare_decode_triton(
     attention_mask: torch.Tensor | None = None,
     Q_dec: torch.Tensor | None = None,
     K_dec: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    profile: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[tuple[torch.Tensor, dict[str, torch.Tensor]], dict[str, object]]:
     if not Q.is_cuda:
         raise RuntimeError(
             "flare_decode requires CUDA tensors. "
@@ -466,58 +472,95 @@ def flare_decode_triton(
     m_state = st["m"].contiguous()
     d_state = st["d"].contiguous()
     u_state = st["u"].contiguous()
+    profile_data = {"forward": {}} if profile else None
+    forward_timings = profile_data["forward"] if profile_data is not None else None
 
-    q = Q.contiguous().float()
-    k = K.contiguous().float()
-    v = V.contiguous().float()
-    if weight_sharing_enc_dec:
-        q_dec_step = k
-        k_dec_latent = q
+    def prepare_decode_io():
+        q = Q.contiguous().float()
+        k = K.contiguous().float()
+        v = V.contiguous().float()
+        if weight_sharing_enc_dec:
+            q_dec_step = k
+            k_dec_latent = q
+        else:
+            q_dec_step = Q_dec_resolve[:, 0, :, :].contiguous().float() if separate_Q_dec else k
+            k_dec_latent = K_dec_resolve.contiguous().float() if separate_K_dec else q
+        y = torch.empty((B, H, D), device=K.device, dtype=torch.float32)
+        return q, k, v, q_dec_step, k_dec_latent, y
+
+    q, k, v, q_dec_step, k_dec_latent, y = _profiled_call(
+        K.device,
+        forward_timings,
+        "decode_prepare_io",
+        prepare_decode_io,
+    )
+
+    block_m_env = os.environ.get("FLARE_DECODE_BLOCK_M", "")
+    if block_m_env:
+        block_m = int(block_m_env)
     else:
-        q_dec_step = Q_dec_resolve[:, 0, :, :].contiguous().float() if separate_Q_dec else k
-        k_dec_latent = K_dec_resolve.contiguous().float() if separate_K_dec else q
-    y = torch.empty((B, H, D), device=K.device, dtype=torch.float32)
-
-    block_m = max(16, triton.next_power_of_2(M))
+        block_m = max(16, triton.next_power_of_2(M))
+    if block_m < M:
+        raise ValueError(f"FLARE_DECODE_BLOCK_M must be >= M. Got M={M}, FLARE_DECODE_BLOCK_M={block_m}.")
+    if block_m % 16 != 0:
+        raise ValueError(f"FLARE_DECODE_BLOCK_M must be divisible by 16. Got FLARE_DECODE_BLOCK_M={block_m}.")
+    _require_power_of_two_tile("FLARE_DECODE_BLOCK_M", block_m)
     block_d_env = os.environ.get("FLARE_DECODE_BLOCK_D", "")
     if block_d_env:
         block_d = int(block_d_env)
+        if block_d > D:
+            raise ValueError(f"FLARE_DECODE_BLOCK_D must be <= D. Got D={D}, FLARE_DECODE_BLOCK_D={block_d}.")
     else:
-        block_d = D if D <= 128 else 64
-    block_d = min(D, block_d)
+        block_d = _snap_block_d_default(D, D if D <= 128 else 64)
+    if block_d % 16 != 0:
+        raise ValueError(f"FLARE_DECODE_BLOCK_D must be divisible by 16. Got FLARE_DECODE_BLOCK_D={block_d}.")
+    _require_power_of_two_tile("FLARE_DECODE_BLOCK_D", block_d)
     block_k_env = os.environ.get("FLARE_DECODE_BLOCK_K", "")
     if block_k_env:
         block_k = int(block_k_env)
     else:
-        block_k = D if block_d == D else 32
-    block_k = min(D, block_k)
+        block_k = _block_k_divisor(D, D if block_d == D else 32)
+    if block_k > D:
+        raise ValueError(f"FLARE_DECODE_BLOCK_K must be <= D. Got D={D}, FLARE_DECODE_BLOCK_K={block_k}.")
+    if block_k % 16 != 0:
+        raise ValueError(f"FLARE_DECODE_BLOCK_K must be divisible by 16. Got FLARE_DECODE_BLOCK_K={block_k}.")
+    if D % block_k != 0:
+        raise ValueError(f"FLARE_DECODE_BLOCK_K must divide D. Got D={D}, FLARE_DECODE_BLOCK_K={block_k}.")
     num_d_blocks = math.ceil(D / block_d)
+    decode_num_warps_env = os.environ.get("FLARE_DECODE_NUM_WARPS", "")
+    decode_num_stages_env = os.environ.get("FLARE_DECODE_NUM_STAGES", "")
+    decode_launch_kwargs = {}
+    if decode_num_warps_env:
+        decode_launch_kwargs["num_warps"] = int(decode_num_warps_env)
+    if decode_num_stages_env:
+        decode_launch_kwargs["num_stages"] = int(decode_num_stages_env)
     grid = (B * H, num_d_blocks)
-    if attention_mask is None:
-        flare_recurrent_step_kernel[grid](
-            q, k, v, q_dec_step, k_dec_latent,
-            m_state, d_state, u_state,
-            y, y,  # dummy mask ptr for HAS_MASK=False
-            q.stride(0), q.stride(1), q.stride(2),
-            k.stride(0), k.stride(1), k.stride(2),
-            v.stride(0), v.stride(1), v.stride(2),
-            q_dec_step.stride(0), q_dec_step.stride(1), q_dec_step.stride(2),
-            k_dec_latent.stride(0), k_dec_latent.stride(1), k_dec_latent.stride(2),
-            m_state.stride(0), m_state.stride(1), m_state.stride(2),
-            d_state.stride(0), d_state.stride(1), d_state.stride(2),
-            u_state.stride(0), u_state.stride(1), u_state.stride(2), u_state.stride(3),
-            y.stride(0), y.stride(1), y.stride(2),
-            0,
-            B, H, M, D, float(scale),
-            HAS_MASK=False,
-            BLOCK_M=block_m,
-            BLOCK_D=block_d,
-            BLOCK_K=block_k,
-            WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
-            NUM_D_BLOCKS=num_d_blocks,
-        )
-    else:
-        flare_recurrent_step_kernel[grid](
+    def launch_decode():
+        if attention_mask is None:
+            return flare_recurrent_step_kernel[grid](
+                q, k, v, q_dec_step, k_dec_latent,
+                m_state, d_state, u_state,
+                y, y,  # dummy mask ptr for HAS_MASK=False
+                q.stride(0), q.stride(1), q.stride(2),
+                k.stride(0), k.stride(1), k.stride(2),
+                v.stride(0), v.stride(1), v.stride(2),
+                q_dec_step.stride(0), q_dec_step.stride(1), q_dec_step.stride(2),
+                k_dec_latent.stride(0), k_dec_latent.stride(1), k_dec_latent.stride(2),
+                m_state.stride(0), m_state.stride(1), m_state.stride(2),
+                d_state.stride(0), d_state.stride(1), d_state.stride(2),
+                u_state.stride(0), u_state.stride(1), u_state.stride(2), u_state.stride(3),
+                y.stride(0), y.stride(1), y.stride(2),
+                0,
+                B, H, M, D, float(scale),
+                HAS_MASK=False,
+                BLOCK_M=block_m,
+                BLOCK_D=block_d,
+                BLOCK_K=block_k,
+                WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
+                NUM_D_BLOCKS=num_d_blocks,
+                **decode_launch_kwargs,
+            )
+        return flare_recurrent_step_kernel[grid](
             q, k, v, q_dec_step, k_dec_latent,
             m_state, d_state, u_state,
             y, attention_mask,
@@ -538,10 +581,17 @@ def flare_decode_triton(
             BLOCK_K=block_k,
             WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
             NUM_D_BLOCKS=num_d_blocks,
+            **decode_launch_kwargs,
         )
 
+    _profiled_call(K.device, forward_timings, "flare_decode_step", launch_decode)
+
     next_state = {"m": m_state, "d": d_state, "u": u_state}
-    return y[:, None, :, :].to(V.dtype), next_state
+    y_out = _profiled_call(K.device, forward_timings, "decode_output_cast", lambda: y[:, None, :, :].to(V.dtype))
+    if profile:
+        _refresh_profile_totals(profile_data)
+        return (y_out, next_state), profile_data
+    return y_out, next_state
 
 
 def flare_prefill_triton(
@@ -554,7 +604,8 @@ def flare_prefill_triton(
     attention_mask: torch.Tensor | None = None,
     Q_dec: torch.Tensor | None = None,
     K_dec: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    profile: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[tuple[torch.Tensor, dict[str, torch.Tensor]], dict[str, object]]:
     if not Q.is_cuda:
         raise RuntimeError("flare_prefill requires CUDA tensors.")
 
@@ -624,6 +675,8 @@ def flare_prefill_triton(
         head_dim=D,
         device=K.device,
     )
+    profile_data = {"forward": {}} if profile else None
+    forward_timings = profile_data["forward"] if profile_data is not None else None
     m0 = st["m"].reshape(B * H, M)
     d0 = st["d"].reshape(B * H, M)
     u0 = st["u"].reshape(B * H, M, D)
@@ -664,6 +717,7 @@ def flare_prefill_triton(
         D=D,
         scale=float(scale),
         config=cfg,
+        kernel_timings=forward_timings,
     )
 
     prefix_max, prefix_den, prefix_num = _run_chunked_prefix_phase(
@@ -671,18 +725,31 @@ def flare_prefill_triton(
         M=M,
         D=D,
         config=cfg,
+        kernel_timings=forward_timings,
     )
 
     m0_expand = m0[:, None, :].expand(-1, cfg["NUM_CHUNKS"], -1)
     d0_expand = d0[:, None, :].expand(-1, cfg["NUM_CHUNKS"], -1)
     u0_expand = u0[:, None, :, :].expand(-1, cfg["NUM_CHUNKS"], -1, -1)
-    prefix_max, prefix_den, prefix_num = _merge_flare_stats(
-        m0_expand, d0_expand, u0_expand,
-        prefix_max, prefix_den, prefix_num,
+    prefix_max, prefix_den, prefix_num = _profiled_call(
+        K.device,
+        forward_timings,
+        "prefill_merge_prefix_state",
+        lambda: _merge_flare_stats(
+            m0_expand, d0_expand, u0_expand,
+            prefix_max, prefix_den, prefix_num,
+        ),
     )
-    prefix_max = prefix_max.contiguous()
-    prefix_den = prefix_den.contiguous()
-    prefix_num = prefix_num.contiguous()
+    prefix_max, prefix_den, prefix_num = _profiled_call(
+        K.device,
+        forward_timings,
+        "prefill_prefix_contiguous",
+        lambda: (
+            prefix_max.contiguous(),
+            prefix_den.contiguous(),
+            prefix_num.contiguous(),
+        ),
+    )
 
     O, _, _ = _run_chunked_output_phase(
         q,
@@ -699,6 +766,7 @@ def flare_prefill_triton(
         config=cfg,
         weight_sharing_enc_dec=weight_sharing_enc_dec,
         output_dtype=torch.float32,
+        kernel_timings=forward_timings,
     )
 
     last_prefix_max = prefix_max[:, -1, :]
@@ -707,9 +775,14 @@ def flare_prefill_triton(
     last_chunk_max = chunk_max[:, -1, :]
     last_chunk_den = chunk_den[:, -1, :]
     last_chunk_num = chunk_num[:, -1, :, :]
-    m_fin, d_fin, u_fin = _merge_flare_stats(
-        last_prefix_max, last_prefix_den, last_prefix_num,
-        last_chunk_max, last_chunk_den, last_chunk_num,
+    m_fin, d_fin, u_fin = _profiled_call(
+        K.device,
+        forward_timings,
+        "prefill_merge_final_state",
+        lambda: _merge_flare_stats(
+            last_prefix_max, last_prefix_den, last_prefix_num,
+            last_chunk_max, last_chunk_den, last_chunk_num,
+        ),
     )
     next_state = {
         "m": m_fin.reshape(B, H, M).contiguous(),
@@ -717,7 +790,11 @@ def flare_prefill_triton(
         "u": u_fin.reshape(B, H, M, D).contiguous(),
     }
 
-    return O.to(V.dtype), next_state
+    O_out = _profiled_call(K.device, forward_timings, "prefill_output_cast", lambda: O.to(V.dtype))
+    if profile:
+        _refresh_profile_totals(profile_data)
+        return (O_out, next_state), profile_data
+    return O_out, next_state
 
 
 def flare_prefill(

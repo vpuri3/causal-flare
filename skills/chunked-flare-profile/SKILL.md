@@ -7,6 +7,13 @@ description: Use when profiling or tuning chunked FLARE launch heuristics after 
 
 Use this skill when the task is to profile chunked FLARE on CUDA, identify forward or backward bottlenecks, or retune launch heuristics for a specific `(B, H, N, M, D, dtype)` case after meaningful kernel changes.
 
+For full-matrix retuning across the supported `D x M x N` space:
+
+- training / chunked forward+backward: [`../../benchmark/chunked_flare_matrix_workflow.md`](../../benchmark/chunked_flare_matrix_workflow.md) and [`../../benchmark/tune_chunked_flare_matrix.py`](../../benchmark/tune_chunked_flare_matrix.py)
+- inference prefill/decode: [`../../benchmark/flare_inference_matrix_workflow.md`](../../benchmark/flare_inference_matrix_workflow.md) and [`../../benchmark/tune_flare_inference_matrix.py`](../../benchmark/tune_flare_inference_matrix.py)
+
+Both runners save raw profiling artifacts automatically so later kernel work can diff per-kernel timing, occupancy, and register pressure.
+
 ## Quick Start
 
 1. Read `TODO.md` and keep benchmark-quality reproducibility in scope.
@@ -38,6 +45,13 @@ Important limitations:
 
 - If `ncu` is unavailable, treat occupancy as an estimate derived from Triton metadata plus device limits.
 - The script currently reports compiled resource metadata for forward kernels only; use backward timings to identify the hot phase, then sweep backward launch knobs directly.
+
+For matrix-wide tuning:
+
+- hold `BH` fixed at one representative multiple of 4 unless you have evidence that a regression depends on `B/H` factorization
+- keep raw artifacts under `results/chunked_flare_matrix/<run-name>/`
+- use `--run-name <name> --resume` so long shard sweeps can be continued safely
+- do not brute-force every knob over the entire matrix in one pass; use the staged process below
 
 ## What To Tune
 
@@ -123,6 +137,85 @@ Then summarize:
 - Which kernel owns the extra milliseconds
 - Whether the regression is from register pressure, shared memory, or duplicated reduction work
 - Whether the tuned default already fixes it or whether more invasive kernel work is needed
+
+## Matrix Workflow
+
+Use [`../../benchmark/tune_chunked_flare_matrix.py`](../../benchmark/tune_chunked_flare_matrix.py) when the job is broader than one shape. The workflow is:
+
+1. Seed width-driven families at one representative `(M, N, BH)` point.
+2. Sweep `M` and `N` to tune `BLOCK_M`, `CHUNK_SIZE`, and token-panel knobs.
+3. Confirm only the promoted config families across the full matrix, then patch the heuristic buckets in `causal_flare/chunked.py`.
+
+Representative stage-1 command:
+
+```bash
+source .venv/bin/activate
+python benchmark/tune_chunked_flare_matrix.py \
+  --run-name d-seed-bh8-m64-n4096 \
+  --d-values 16,32,64,96,128,192,256,384,512 \
+  --m-values 64 \
+  --n-values 4096 \
+  --bh-values 8 \
+  --families core,combined \
+  --mode both
+```
+
+Representative stage-2 command:
+
+```bash
+python benchmark/tune_chunked_flare_matrix.py \
+  --run-name mn-refine-bh8 \
+  --d-values 16,32,64,96,128,192,256,384,512 \
+  --m-values 16,32,64,96,128,192,256,384,512,768,1024,2048 \
+  --n-values 1024,2048,4096,8192,16384,32768,65536,131072 \
+  --bh-values 8 \
+  --families chunk_size,forward_block_m,backward_block_m,backward_block_t_qk,backward_block_t_state,combined \
+  --mode both \
+  --num-shards 8 \
+  --shard-index 0
+```
+
+Important artifacts:
+
+- `runs-shardXXX-of-YYY.jsonl`: raw per-case, per-config profiling records
+- `summary-shardXXX-of-YYY.json`: best-config summary and grouped winners
+- `summary-shardXXX-of-YYY.md`: quick human-readable report
+
+The raw JSONL is the canonical source for later kernel work. It preserves forward per-kernel timing plus forward occupancy/register/shared-memory signals, and backward per-kernel timings.
+
+## Inference Workflow
+
+Use [`../../benchmark/profile_flare_inference.py`](../../benchmark/profile_flare_inference.py) for one-off prefill/decode profiling and [`../../benchmark/tune_flare_inference_matrix.py`](../../benchmark/tune_flare_inference_matrix.py) for matrix sweeps.
+
+Representative prefill seed:
+
+```bash
+source .venv/bin/activate
+python benchmark/tune_flare_inference_matrix.py \
+  --mode prefill \
+  --run-name inference-prefill-seed-bh8-m64-n4096 \
+  --d-values 16,32,64,96,128,192,256,384,512 \
+  --m-values 64 \
+  --n-values 4096 \
+  --bh-values 8 \
+  --families default,chunk_size,prefill_block_d,prefill_block_k,prefill_launch,combined
+```
+
+Representative decode seed:
+
+```bash
+python benchmark/tune_flare_inference_matrix.py \
+  --mode decode \
+  --run-name inference-decode-seed-bh8-m64-n4096 \
+  --d-values 16,32,64,96,128,192,256,384,512 \
+  --m-values 64 \
+  --n-values 4096 \
+  --bh-values 8 \
+  --decode-steps 256 \
+  --families default,decode_block_d,decode_block_k,decode_launch,combined
+```
+
+Inference artifacts are saved under `results/flare_inference_matrix/<run-name>/`.
 
 ## Reporting Guidance
 

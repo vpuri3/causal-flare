@@ -1,17 +1,41 @@
 from ._common import *
 from .torch import _resolve_flare_causal_decode_inputs as _resolve_chunked_decode_inputs
 
+def _maybe_record_kernel_resource(bucket: dict[str, dict[str, int]] | None, key: str, result) -> None:
+    if bucket is None or result is None:
+        return
+    metadata = getattr(result, "metadata", None)
+    n_regs = getattr(result, "n_regs", None)
+    n_spills = getattr(result, "n_spills", None)
+    if metadata is None or n_regs is None or n_spills is None:
+        return
+    bucket[key] = {
+        "num_warps": int(metadata.num_warps),
+        "num_stages": int(metadata.num_stages),
+        "regs_per_thread": int(n_regs),
+        "spills": int(n_spills),
+        "shared_bytes": int(metadata.shared),
+    }
+
 def _profiled_call(device: torch.device, bucket: dict[str, float] | None, key: str, op):
     result, ms = _measure_op_ms(device, bucket is not None, op)
     _accumulate_timing(bucket, key, ms)
     return result
 
-def _profiled_bwd_call(device: torch.device, bucket: dict[str, float] | None, key: str, op):
+def _profiled_bwd_call(
+    device: torch.device,
+    bucket: dict[str, float] | None,
+    key: str,
+    op,
+    *,
+    resource_bucket: dict[str, dict[str, int]] | None = None,
+):
     enabled = bucket is not None or _bwd_profile_enabled()
     result, ms = _measure_op_ms(device, enabled, op)
     _accumulate_timing(bucket, key, ms)
     if ms is not None:
         _record_bwd_timing(key, ms)
+    _maybe_record_kernel_resource(resource_bucket, key, result)
     return result
 
 def _refresh_profile_totals(profile_data: dict[str, object] | None) -> None:
@@ -4464,6 +4488,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
     device = Q.device
     profile_data = dTimings if isinstance(dTimings, dict) else getattr(ctx, "profile_timings", None)
     bwd_timings = profile_data["backward"] if isinstance(profile_data, dict) else None
+    bwd_resources = profile_data.setdefault("backward_resources", {}) if isinstance(profile_data, dict) else None
     BH = B * H
     chunk_size = int(ctx.chunk_size)
     num_chunks = math.ceil(N / chunk_size)
@@ -4683,9 +4708,10 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
     # All temporary tensors below are float32 even when inputs are lower precision. The kernels repeatedly
     # combine exponentials and long prefix/suffix reductions, so keeping the workspaces in fp32 avoids
     # compounding numerical error while we reconstruct the same stabilized algebra used in the forward pass.
-    dO_bnhd = _profiled_bwd_call(
-        device,
-        bwd_timings,
+    def profiled_bwd_call(key: str, op):
+        return _profiled_bwd_call(device, bwd_timings, key, op, resource_bucket=bwd_resources)
+
+    dO_bnhd = profiled_bwd_call(
         "grad_input_cast",
         lambda: dO.contiguous().to(torch.float32),
     )
@@ -4771,9 +4797,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
         a_in,
         vb_part,
         dV_part,
-    ) = _profiled_bwd_call(
-        device,
-        bwd_timings,
+    ) = profiled_bwd_call(
         "alloc_bwd_buffers",
         alloc_bwd_buffers,
     )
@@ -4787,7 +4811,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
     # - a_buf[t, m] = exp(score_t(m) - L_t(m)).
     #
     def launch_bwd_p_part():
-        flare_chunk_bwd_lse_p_part[(BH, num_chunks * num_m_tiles, num_d_part_blocks)](
+        return flare_chunk_bwd_lse_p_part[(BH, num_chunks * num_m_tiles, num_d_part_blocks)](
             Q, K, V, Q_dec_saved, K_dec_saved, prefix_max, prefix_den, prefix_num, LSE_dec, dO_bnhd, p_buf, g_buf, a_buf,
             Q.stride(0), Q.stride(1), Q.stride(2),
             K.stride(0), K.stride(1), K.stride(2), K.stride(3),
@@ -4821,7 +4845,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
             num_stages=replay_num_stages,
         )
 
-    _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_lse_p_part", launch_bwd_p_part)
+    profiled_bwd_call("flare_chunk_bwd_lse_p_part", launch_bwd_p_part)
 
     block_t_gp_env = os.environ.get("FLARE_LSE_BWD_BLOCK_T_GP", "")
     if block_t_gp_env:
@@ -4846,7 +4870,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
     def launch_bwd_gp_reduce():
         # Reduce gp in chunk-tiled token panels to avoid one-program-per-token
         # launch overhead on long contexts.
-        flare_chunk_bwd_lse_gp_reduce[(BH, num_chunks)](
+        return flare_chunk_bwd_lse_gp_reduce[(BH, num_chunks)](
             p_buf,
             g_buf,
             gp_buf,
@@ -4862,7 +4886,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
             num_stages=1,
         )
 
-    _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_lse_gp_reduce", launch_bwd_gp_reduce)
+    profiled_bwd_call("flare_chunk_bwd_lse_gp_reduce", launch_bwd_gp_reduce)
 
     if use_fused_chunk_scan:
         # Experimental path: walk chunks and tokens in one reverse kernel,
@@ -4870,7 +4894,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
         # the old summary + carry-scan + apply phases, but it is opt-in because
         # the larger per-program working set can lose on occupancy-sensitive shapes.
         def launch_bwd_apply_fused():
-            flare_chunk_bwd_lse_scan_apply_fused_single_dv[(BH, num_m_tiles)](
+            return flare_chunk_bwd_lse_scan_apply_fused_single_dv[(BH, num_m_tiles)](
                 V, LSE_enc_ctx, dO_bnhd, p_buf, g_buf, gp_buf, a_buf, dS_enc, dS_dec, dV_part,
                 V.stride(0), V.stride(1), V.stride(2), V.stride(3),
                 LSE_enc_ctx.stride(0), LSE_enc_ctx.stride(1), LSE_enc_ctx.stride(2), LSE_enc_ctx.stride(3),
@@ -4889,14 +4913,14 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                 num_warps=scan_apply_num_warps, num_stages=scan_apply_num_stages,
             )
 
-        _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_lse_scan_apply_fused", launch_bwd_apply_fused)
+        profiled_bwd_call("flare_chunk_bwd_lse_scan_apply_fused", launch_bwd_apply_fused)
     else:
         # Generic path:
         # 2a) summarize each chunk independently in reverse time,
         # 2b) reverse-scan chunk carries,
         # 3a/3b) replay each chunk with the scanned carry to produce dV and dS.
         def launch_bwd_chunk_summary():
-            flare_chunk_bwd_lse_chunk_summary[(BH, num_chunks, num_m_tiles * num_dv_state_tiles)](
+            return flare_chunk_bwd_lse_chunk_summary[(BH, num_chunks, num_m_tiles * num_dv_state_tiles)](
                 LSE_enc_ctx, dO_bnhd, p_buf, g_buf, b_local, a_local, scale_buf,
                 LSE_enc_ctx.stride(0), LSE_enc_ctx.stride(1), LSE_enc_ctx.stride(2), LSE_enc_ctx.stride(3),
                 dO_bnhd.stride(0), dO_bnhd.stride(1), dO_bnhd.stride(2), dO_bnhd.stride(3),
@@ -4915,10 +4939,10 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                 num_stages=state_num_stages,
             )
 
-        _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_lse_chunk_summary", launch_bwd_chunk_summary)
+        profiled_bwd_call("flare_chunk_bwd_lse_chunk_summary", launch_bwd_chunk_summary)
 
         def launch_bwd_carry_scan():
-            flare_chunk_bwd_lse_carry_scan[(BH, num_m_tiles * num_dv_state_tiles)](
+            return flare_chunk_bwd_lse_carry_scan[(BH, num_m_tiles * num_dv_state_tiles)](
                 b_local, a_local, scale_buf, b_in, a_in,
                 b_local.stride(0), b_local.stride(1), b_local.stride(2), b_local.stride(3), b_local.stride(4),
                 a_local.stride(0), a_local.stride(1), a_local.stride(2), a_local.stride(3),
@@ -4931,11 +4955,11 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                 num_warps=state_num_warps, num_stages=state_num_stages,
             )
 
-        _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_lse_carry_scan", launch_bwd_carry_scan)
+        profiled_bwd_call("flare_chunk_bwd_lse_carry_scan", launch_bwd_carry_scan)
 
         if use_fused_single_dv_apply:
             def launch_bwd_apply_fused():
-                flare_chunk_bwd_lse_chunk_apply_fused_single_dv[(BH, num_chunks, num_m_tiles)](
+                return flare_chunk_bwd_lse_chunk_apply_fused_single_dv[(BH, num_chunks, num_m_tiles)](
                     V, LSE_enc_ctx, dO_bnhd, p_buf, g_buf, gp_buf, a_buf, b_in, a_in, dS_enc, dS_dec, dV_part,
                     V.stride(0), V.stride(1), V.stride(2), V.stride(3),
                     LSE_enc_ctx.stride(0), LSE_enc_ctx.stride(1), LSE_enc_ctx.stride(2), LSE_enc_ctx.stride(3),
@@ -4960,10 +4984,10 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                     num_warps=state_num_warps, num_stages=state_num_stages,
                 )
 
-            _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_lse_chunk_apply_fused", launch_bwd_apply_fused)
+            profiled_bwd_call("flare_chunk_bwd_lse_chunk_apply_fused", launch_bwd_apply_fused)
         else:
             def launch_bwd_apply_part():
-                flare_chunk_bwd_lse_chunk_apply_part[(BH, num_chunks, num_m_tiles * num_dv_state_tiles)](
+                return flare_chunk_bwd_lse_chunk_apply_part[(BH, num_chunks, num_m_tiles * num_dv_state_tiles)](
                     V, LSE_enc_ctx, dO_bnhd, g_buf, a_buf, b_in, vb_part, dV_part,
                     V.stride(0), V.stride(1), V.stride(2), V.stride(3),
                     LSE_enc_ctx.stride(0), LSE_enc_ctx.stride(1), LSE_enc_ctx.stride(2), LSE_enc_ctx.stride(3),
@@ -4980,10 +5004,10 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                     num_warps=state_num_warps, num_stages=state_num_stages,
                 )
 
-            _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_lse_chunk_apply_part", launch_bwd_apply_part)
+            profiled_bwd_call("flare_chunk_bwd_lse_chunk_apply_part", launch_bwd_apply_part)
 
             def launch_bwd_apply_finalize():
-                flare_chunk_bwd_lse_chunk_apply_finalize[(BH, num_chunks, num_m_tiles)](
+                return flare_chunk_bwd_lse_chunk_apply_finalize[(BH, num_chunks, num_m_tiles)](
                     LSE_enc_ctx, p_buf, g_buf, gp_buf, a_buf, a_in, vb_part, dS_enc, dS_dec,
                     LSE_enc_ctx.stride(0), LSE_enc_ctx.stride(1), LSE_enc_ctx.stride(2), LSE_enc_ctx.stride(3),
                     p_buf.stride(0), p_buf.stride(1), p_buf.stride(2),
@@ -5001,14 +5025,14 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                     num_warps=state_num_warps, num_stages=state_num_stages,
                 )
 
-            _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_lse_chunk_apply_finalize", launch_bwd_apply_finalize)
+            profiled_bwd_call("flare_chunk_bwd_lse_chunk_apply_finalize", launch_bwd_apply_finalize)
 
     # Phase 3c: reduce the per-M-tile dV partials into the final dV buffer.
     # Each token/dimension location is just a sum over query tiles, so when there is only one M tile
     # we can bypass the reduction kernel and reuse dV_part directly.
     if num_m_tiles > 1:
         def launch_bwd_dv_reduce():
-            flare_chunk_bwd_lse_dv_reduce[(BH, num_chunks, num_d_part_blocks)](
+            return flare_chunk_bwd_lse_dv_reduce[(BH, num_chunks, num_d_part_blocks)](
                 dV_part, dV_bhtd,
                 dV_part.stride(0), dV_part.stride(1), dV_part.stride(2), dV_part.stride(3), dV_part.stride(4),
                 dV_bhtd.stride(0), dV_bhtd.stride(1), dV_bhtd.stride(2),
@@ -5017,11 +5041,9 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                 num_warps=state_num_warps, num_stages=state_num_stages,
             )
 
-        _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_lse_dv_reduce", launch_bwd_dv_reduce)
+        profiled_bwd_call("flare_chunk_bwd_lse_dv_reduce", launch_bwd_dv_reduce)
     else:
-        dV_bhtd = _profiled_bwd_call(
-            device,
-            bwd_timings,
+        dV_bhtd = profiled_bwd_call(
             "flare_chunk_bwd_lse_dv_bypass",
             lambda: dV_part.squeeze(2).reshape(BH, num_chunks * chunk_size, D)[:, :N, :],
         )
@@ -5036,7 +5058,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
     #
     # dQ uses atomic adds because each chunk contributes to the same [H, M, D] tensor.
     def launch_bwd_recurrent_qk():
-        flare_chunk_bwd_recurrent_qk[(BH, num_chunks, num_qk_d_tiles)](
+        return flare_chunk_bwd_recurrent_qk[(BH, num_chunks, num_qk_d_tiles)](
             K, Q,
             dS_enc,
             dQ, dK,
@@ -5056,7 +5078,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
             num_stages=qk_num_stages,
         )
 
-    _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_recurrent_qk", launch_bwd_recurrent_qk)
+    profiled_bwd_call("flare_chunk_bwd_recurrent_qk", launch_bwd_recurrent_qk)
 
     dQ_dec = None
     dK_dec = None
@@ -5065,7 +5087,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
         dQ_dec_target = torch.zeros_like(Q_dec_saved, dtype=torch.float32) if separate_Q_dec else dK
 
         def launch_bwd_recurrent_qk_decode():
-            flare_chunk_bwd_recurrent_qk[(BH, num_chunks, num_qk_d_tiles)](
+            return flare_chunk_bwd_recurrent_qk[(BH, num_chunks, num_qk_d_tiles)](
                 Q_dec_saved,
                 K_dec_saved,
                 dS_dec,
@@ -5087,19 +5109,15 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                 num_stages=qk_num_stages,
             )
 
-        _profiled_bwd_call(device, bwd_timings, "flare_chunk_bwd_recurrent_qk_decode", launch_bwd_recurrent_qk_decode)
+        profiled_bwd_call("flare_chunk_bwd_recurrent_qk_decode", launch_bwd_recurrent_qk_decode)
         dQ_dec = dQ_dec_target if separate_Q_dec else None
         dK_dec = dK_dec_target if separate_K_dec else None
 
-    dV = _profiled_bwd_call(
-        device,
-        bwd_timings,
+    dV = profiled_bwd_call(
         "grad_output_relayout",
         lambda: dV_bhtd.view(B, H, N, D).permute(0, 2, 1, 3).contiguous(),
     )
-    dQ_out, dK_out, dV_out, dQ_dec_out, dK_dec_out = _profiled_bwd_call(
-        device,
-        bwd_timings,
+    dQ_out, dK_out, dV_out, dQ_dec_out, dK_dec_out = profiled_bwd_call(
         "grad_return_casts",
         lambda: (
             dQ.to(Q.dtype),
