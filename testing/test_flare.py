@@ -3,14 +3,13 @@ import math
 import pytest
 import torch
 
-from causal_flare import flare_chunk_triton
+from causal_flare import flare_chunk_triton, flare_recurrent_triton
 from causal_flare.inference import (
     flare_decode_pytorch,
     flare_decode_triton,
     flare_prefill_pytorch,
     flare_prefill_triton,
 )
-from causal_flare.recurrent import RecurrentFLARE
 from causal_flare.torch import (
     flare_causal_chunked,
     flare_recurrent_dense_backward_pytorch,
@@ -26,7 +25,7 @@ def _run_recurrent_impl(impl_name, q, k, v, *, scale, q_dec=None, k_dec=None, bl
     if impl_name == "reference":
         return flare_recurrent_pytorch(q, k, v, scale=scale, Q_dec=q_dec, K_dec=k_dec)
     if impl_name == "recurrent":
-        return RecurrentFLARE.apply(q, k, v, scale, None, None, q_dec, k_dec, block_t)
+        return flare_recurrent_triton(q, k, v, scale=scale, Q_dec=q_dec, K_dec=k_dec, block_t=block_t)
     raise ValueError(f"Unknown implementation: {impl_name}")
 
 
@@ -390,8 +389,8 @@ def test_recurrent_flare_block_t_1_matches_block_t_16_forward():
     k = torch.randn((B, N, H, D), device=device, dtype=dtype)
     v = torch.randn((B, N, H, D), device=device, dtype=dtype)
 
-    y_naive = RecurrentFLARE.apply(q, k, v, scale, None, None, None, None, 1)
-    y_blocked = RecurrentFLARE.apply(q, k, v, scale, None, None, None, None, 16)
+    y_naive = flare_recurrent_triton(q, k, v, scale=scale, block_t=1)
+    y_blocked = flare_recurrent_triton(q, k, v, scale=scale, block_t=16)
     torch.testing.assert_close(y_naive, y_blocked, rtol=1e-4, atol=1e-5)
 
 

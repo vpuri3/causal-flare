@@ -1137,3 +1137,19 @@ def flare_chunk_bwd_recurrent_qk(
         else:
             tl.store(dk_ptr, dK_block, mask=mask_td)
         t0 += BLOCK_T
+
+
+def flare_recurrent_triton(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    scale: float | None = None,
+    *,
+    block_m: int | None = None,
+    block_d: int | None = None,
+    Q_dec: torch.Tensor | None = None,
+    K_dec: torch.Tensor | None = None,
+    block_t: int | None = None,
+):
+    """Public wrapper for the Triton-backed recurrent FLARE autograd path."""
+    return RecurrentFLARE.apply(Q, K, V, scale, block_m, block_d, Q_dec, K_dec, block_t)
