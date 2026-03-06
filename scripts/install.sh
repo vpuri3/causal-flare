@@ -42,7 +42,7 @@ source .venv/bin/activate
 
 # Ensure the lock reflects current pyproject constraints, then sync deps.
 uv lock
-uv sync --extra dev --extra test --extra benchmark
+uv sync --extra dev --extra benchmark
 
 # Install this repo in editable mode for local development.
 uv pip install -e .
@@ -58,3 +58,5 @@ print("flash-attn", importlib.metadata.version("flash-attn"))
 print("torch", torch.__version__)
 print("triton", triton.__version__)
 PY
+
+pytest testing
