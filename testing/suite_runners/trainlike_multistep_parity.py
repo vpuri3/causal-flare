@@ -1,6 +1,6 @@
 """Extracted regression/stress suite implementation."""
 
-from testing.suites.common import *
+from testing.suite_runners.common import *
 
 
 def _trainlike_multistep_parity():
@@ -174,4 +174,3 @@ def _trainlike_multistep_parity():
         extra = "" if len(failures) <= 12 else f"\n- ... and {len(failures) - 12} more"
         raise AssertionError(f"FLARE trainlike parity failed ({len(failures)} issues):\n{summary}{extra}")
     print("[FLARE TRAINLIKE PARITY] all checks passed.")
-

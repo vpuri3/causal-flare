@@ -31,7 +31,7 @@ def _set_regression_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.regression
 def test_correctness_suite(monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest.Config) -> None:
-    from testing.suites.correctness import _run_correctness_suite
+    from testing.suite_runners.correctness import _run_correctness_suite
 
     if not pytestconfig.getoption("--full-matrix"):
         _set_regression_defaults(monkeypatch)
@@ -40,7 +40,7 @@ def test_correctness_suite(monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest
 
 @pytest.mark.regression
 def test_grad_checks_suite(monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest.Config) -> None:
-    from testing.suites.grad_checks import _run_grad_checks_suite
+    from testing.suite_runners.grad_checks import _run_grad_checks_suite
 
     # Always run grad checks in this dedicated suite.
     monkeypatch.setenv("FLARE_CORRECTNESS_GRAD", "1")
@@ -52,7 +52,7 @@ def test_grad_checks_suite(monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest
 
 @pytest.mark.regression
 def test_regression_bundle(monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest.Config) -> None:
-    from testing.suites.regression_bundle import _regression_test
+    from testing.suite_runners.regression_bundle import _regression_test
 
     if not pytestconfig.getoption("--full-matrix"):
         _set_regression_defaults(monkeypatch)
@@ -65,7 +65,7 @@ def test_regression_bundle(monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest
 @pytest.mark.regression
 @pytest.mark.stress
 def test_sharp_softmax_bwd_regression_suite(monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest.Config) -> None:
-    from testing.suites.sharp_softmax_bwd_regression import _sharp_softmax_bwd_regression_suite
+    from testing.suite_runners.sharp_softmax_bwd_regression import _sharp_softmax_bwd_regression_suite
 
     if not pytestconfig.getoption("--full-matrix"):
         monkeypatch.setenv("FLARE_SHARP_BWD_DTYPE", "bfloat16")
@@ -82,7 +82,7 @@ def test_sharp_softmax_bwd_regression_suite(monkeypatch: pytest.MonkeyPatch, pyt
 @pytest.mark.regression
 @pytest.mark.stress
 def test_long_context_accuracy_suite(monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest.Config) -> None:
-    from testing.suites.long_context_accuracy import _long_context_accuracy_suite
+    from testing.suite_runners.long_context_accuracy import _long_context_accuracy_suite
 
     if not pytestconfig.getoption("--full-matrix"):
         monkeypatch.setenv("FLARE_LONGCTX_DTYPE", "bfloat16")
@@ -95,7 +95,7 @@ def test_long_context_accuracy_suite(monkeypatch: pytest.MonkeyPatch, pytestconf
 @pytest.mark.regression
 @pytest.mark.stress
 def test_chunk_size_sensitivity_suite(monkeypatch: pytest.MonkeyPatch, pytestconfig: pytest.Config) -> None:
-    from testing.suites.chunk_size_sensitivity import _chunk_size_sensitivity_suite
+    from testing.suite_runners.chunk_size_sensitivity import _chunk_size_sensitivity_suite
 
     if not pytestconfig.getoption("--full-matrix"):
         monkeypatch.setenv("FLARE_CHUNK_SENS_DTYPE", "bfloat16")

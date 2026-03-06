@@ -1,6 +1,6 @@
 """Extracted regression/stress suite implementation."""
 
-from testing.suites.common import *
+from testing.suite_runners.common import *
 
 
 def _sharp_softmax_bwd_regression_suite():
@@ -272,4 +272,3 @@ def _sharp_softmax_bwd_regression_suite():
         extra = "" if len(failures) <= 12 else f"\n- ... and {len(failures) - 12} more"
         raise AssertionError(f"FLARE sharp backward regression failed ({len(failures)} issues):\n{summary}{extra}")
     print("[FLARE SHARP BWD] all checks passed.")
-

@@ -1,6 +1,6 @@
 """Extracted regression/stress suite implementation."""
 
-from testing.suites.common import *
+from testing.suite_runners.common import *
 
 
 def _run_correctness_suite():
@@ -198,7 +198,7 @@ def _run_correctness_suite():
                     print("[CHECK] per_t max_abs top:", [(int(i), float(v)) for v, i in zip(topk_t.values, topk_t.indices)])
                     print("[CHECK] per_h max_abs top:", [(int(i), float(v)) for v, i in zip(topk_h.values, topk_h.indices)])
 
-                    # Gradient checks were extracted to testing/suites/grad_checks.py.
+                    # Gradient checks were extracted to testing/suite_runners/grad_checks.py.
 
                     # _causality_check("PyTorch Dense", lambda q,k,v,scale: flare_causal_pytorch_dense(q, k, v, scale=scale), Q, K, V, scale, [0, 1, N//2, N-2], atol)
                     # _causality_check("DenseFLARE", lambda q,k,v,scale: DenseFLARE.apply(q, k, v, scale), Q, K, V, scale, [0, 1, N//2, N-2], atol)

@@ -1,6 +1,6 @@
 """Extracted regression/stress suite implementation."""
 
-from testing.suites.common import *
+from testing.suite_runners.common import *
 
 
 def _long_context_accuracy_suite():
@@ -146,4 +146,3 @@ def _long_context_accuracy_suite():
         extra = "" if len(failures) <= 12 else f"\n- ... and {len(failures) - 12} more"
         raise AssertionError(f"FLARE long-context validation failed ({len(failures)} issues):\n{summary}{extra}")
     print("[FLARE LONGCTX] all checks passed.")
-

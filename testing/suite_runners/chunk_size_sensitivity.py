@@ -1,6 +1,6 @@
 """Extracted regression/stress suite implementation."""
 
-from testing.suites.common import *
+from testing.suite_runners.common import *
 
 
 def _chunk_size_sensitivity_suite():
@@ -140,4 +140,3 @@ def _chunk_size_sensitivity_suite():
         extra = "" if len(failures) <= 12 else f"\n- ... and {len(failures) - 12} more"
         raise AssertionError(f"FLARE chunk sensitivity failed ({len(failures)} issues):\n{summary}{extra}")
     print("[FLARE CHUNK SENS] all checks passed.")
-

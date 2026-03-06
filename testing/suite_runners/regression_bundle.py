@@ -1,15 +1,15 @@
 """Extracted regression/stress suite implementation."""
 
-from testing.suites.common import *
+from testing.suite_runners.common import *
 
-from testing.suites.chunk_size_sensitivity import _chunk_size_sensitivity_suite
-from testing.suites.correctness import _run_correctness_suite
-from testing.suites.grad_checks import _run_grad_checks_suite
-from testing.suites.long_context_accuracy import _long_context_accuracy_suite
-from testing.suites.parity import _parity_tests
-from testing.suites.sharp_softmax_bwd_regression import _sharp_softmax_bwd_regression_suite
-from testing.suites.trainlike_multistep_parity import _trainlike_multistep_parity
-from testing.suites.trainlike_sanity import _trainlike_sanity
+from testing.suite_runners.chunk_size_sensitivity import _chunk_size_sensitivity_suite
+from testing.suite_runners.correctness import _run_correctness_suite
+from testing.suite_runners.grad_checks import _run_grad_checks_suite
+from testing.suite_runners.long_context_accuracy import _long_context_accuracy_suite
+from testing.suite_runners.parity import _parity_tests
+from testing.suite_runners.sharp_softmax_bwd_regression import _sharp_softmax_bwd_regression_suite
+from testing.suite_runners.trainlike_multistep_parity import _trainlike_multistep_parity
+from testing.suite_runners.trainlike_sanity import _trainlike_sanity
 
 
 def _regression_test():

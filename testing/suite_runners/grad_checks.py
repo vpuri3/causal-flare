@@ -1,6 +1,6 @@
 """Extracted gradient-check regression/stress suite implementation."""
 
-from testing.suites.common import *
+from testing.suite_runners.common import *
 
 
 def _grad_report(name: str, g_pred: torch.Tensor, g_ref: torch.Tensor, atol: float) -> None:

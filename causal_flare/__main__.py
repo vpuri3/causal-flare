@@ -88,7 +88,7 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
 
     import torch
     import triton
-    from testing.suites.common import (
+    from testing.suite_runners.common import (
         DenseFLARE,
         DenseFLARE1,
         RecurrentFLARE,

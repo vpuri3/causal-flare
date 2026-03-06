@@ -77,7 +77,7 @@ Short vs full:
 - Short (`--run-regression`, optional `--run-stress`): wrapper applies bounded defaults (smaller shapes/configs) for quick gating.
 - Full (`--full-matrix`): wrapper does not apply bounded overrides and enables extended regression coverage; this is the multi-minute heavy run.
 
-Extracted regression/stress suite implementations live in `testing/suites/` (one file per suite, including `grad_checks.py`), plus additional regression-only pytest suites in `testing/test_cached_suites.py`.
+Extracted regression/stress suite implementations live in `testing/suite_runners/` (one file per suite, including `grad_checks.py`), plus additional regression-only pytest suites in `testing/test_cached_suites.py`.
 See `testing/README.md` for the full suite list and coverage summary.
 
 ## Notes

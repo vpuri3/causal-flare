@@ -3,7 +3,7 @@
 This directory has two testing layers:
 
 - Pytest-collected test modules in `testing/test_*.py` (unit/parity/reference/finite-difference plus regression wrappers).
-- Extracted suite implementations in `testing/suites/*.py` used by regression/stress wrappers.
+- Extracted suite implementations in `testing/suite_runners/*.py` used by regression/stress wrappers.
 
 ## Pytest Entry Point and Collection
 
@@ -14,7 +14,7 @@ pytest testing -q
 ```
 
 - Pytest options and markers are configured in `pyproject.toml` (`[tool.pytest.ini_options]`) and `testing/conftest.py`.
-- `testing/suites/*.py` are helper/suite modules; pytest does not collect them directly because they do not define `test_*` functions.
+- `testing/suite_runners/*.py` are helper/suite modules; pytest does not collect them directly because they do not define `test_*` functions.
 - Regression/stress tests are still collected from `testing/test_*.py`, but skipped unless opt-in flags are supplied.
 
 ## Run Commands
@@ -45,18 +45,18 @@ pytest testing --run-regression --run-stress --full-matrix -q
 
 ## Extracted Regression/Stress Suites
 
-The suite implementations below were extracted into `testing/suites/` (one module per suite):
+The suite implementations below were extracted into `testing/suite_runners/` (one module per suite):
 
-- `testing/suites/correctness.py` -> `_run_correctness_suite`
-- `testing/suites/parity.py` -> `_parity_tests`
-- `testing/suites/trainlike_sanity.py` -> `_trainlike_sanity`
-- `testing/suites/trainlike_projected.py` -> `_trainlike_projected`
-- `testing/suites/long_context_accuracy.py` -> `_long_context_accuracy_suite`
-- `testing/suites/trainlike_multistep_parity.py` -> `_trainlike_multistep_parity`
-- `testing/suites/chunk_size_sensitivity.py` -> `_chunk_size_sensitivity_suite`
-- `testing/suites/sharp_softmax_bwd_regression.py` -> `_sharp_softmax_bwd_regression_suite`
-- `testing/suites/grad_checks.py` -> `_run_grad_checks_suite`
-- `testing/suites/regression_bundle.py` -> `_regression_test`
+- `testing/suite_runners/correctness.py` -> `_run_correctness_suite`
+- `testing/suite_runners/parity.py` -> `_parity_tests`
+- `testing/suite_runners/trainlike_sanity.py` -> `_trainlike_sanity`
+- `testing/suite_runners/trainlike_projected.py` -> `_trainlike_projected`
+- `testing/suite_runners/long_context_accuracy.py` -> `_long_context_accuracy_suite`
+- `testing/suite_runners/trainlike_multistep_parity.py` -> `_trainlike_multistep_parity`
+- `testing/suite_runners/chunk_size_sensitivity.py` -> `_chunk_size_sensitivity_suite`
+- `testing/suite_runners/sharp_softmax_bwd_regression.py` -> `_sharp_softmax_bwd_regression_suite`
+- `testing/suite_runners/grad_checks.py` -> `_run_grad_checks_suite`
+- `testing/suite_runners/regression_bundle.py` -> `_regression_test`
 
 Pytest wrappers that currently call these suites:
 
@@ -65,11 +65,11 @@ Pytest wrappers that currently call these suites:
   - stress wrappers: `_sharp_softmax_bwd_regression_suite`, `_long_context_accuracy_suite`, `_chunk_size_sensitivity_suite`
   - note: `_parity_tests`, `_trainlike_sanity`, and `_trainlike_multistep_parity` are run via `_regression_test` (bundle), not direct top-level wrappers.
 - `testing/test_cached_suites.py`:
-  - additional regression-marked pytest module (not in `testing/suites/`)
+  - additional regression-marked pytest module (not in `testing/suite_runners/`)
 
 Suite implementation currently not wired into collected pytest wrappers:
 
-- `testing/suites/trainlike_projected.py` -> `_trainlike_projected`
+- `testing/suite_runners/trainlike_projected.py` -> `_trainlike_projected`
 
 Legacy env-flag entrypoints in `testing/test.py` (`FLARE_DEBUG_*`, `FLARE_RECURRENT_TEST`, `FLARE_CACHED_TEST`) were removed.
 
@@ -101,7 +101,7 @@ Legacy env-flag entrypoints in `testing/test.py` (`FLARE_DEBUG_*`, `FLARE_RECURR
 
 ## Test Matrices (Per Suite)
 
-Below are the key matrix dimensions each suite exercises. Most are configurable via env vars used inside `testing/suites/*`.
+Below are the key matrix dimensions each suite exercises. Most are configurable via env vars used inside `testing/suite_runners/*`.
 
 - `_run_correctness_suite`
   - Dtypes: `FLARE_CORRECTNESS_DTYPES` (default typically `bfloat16,float16`).

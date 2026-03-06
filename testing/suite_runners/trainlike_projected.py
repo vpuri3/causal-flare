@@ -1,6 +1,6 @@
 """Extracted regression/stress suite implementation."""
 
-from testing.suites.common import *
+from testing.suite_runners.common import *
 
 
 def _trainlike_projected():
@@ -88,4 +88,3 @@ def _trainlike_projected():
                     f"V|max={v_max:.3e},norm={v_norm:.3e} "
                     f"grads: d_latent_q={g_lq:.3e} dWk={g_wk:.3e} dWv={g_wv:.3e}"
                 )
-

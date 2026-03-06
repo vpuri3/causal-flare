@@ -1,6 +1,6 @@
 """Extracted regression/stress suite implementation."""
 
-from testing.suites.common import *
+from testing.suite_runners.common import *
 
 
 def _parity_tests():
@@ -211,4 +211,3 @@ def _parity_tests():
         summary = "\n".join(f"- {msg}" for msg in failures[:12])
         extra = "" if len(failures) <= 12 else f"\n- ... and {len(failures) - 12} more"
         raise AssertionError(f"FLARE parity validation failed ({len(failures)} issues):\n{summary}{extra}")
-
