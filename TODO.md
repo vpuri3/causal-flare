@@ -4,6 +4,24 @@
   - masking support
   - optional return of final recurrent cache state `(m, d, u)` in addition to token outputs.
 
+- [ ] Allow different key/value head dimensions instead of threading one global `head_dim` through the entire stack, with:
+  - explicit separation between the score dimension and output dimension in public APIs, internal helpers, and benchmark/config plumbing. `Q` and `K` should still agree on the score inner dimension used for logits, but `V`, `Y`, and recurrent numerator/state storage should be allowed to use a different output inner dimension.
+  - shape-validation updates across prefill/decode canonicalization so we stop requiring `K.shape == V.shape` and instead validate compatible layouts such as `Q:[..., D_k]`, `K:[..., D_k]`, `V:[..., D_v]`, output `Y:[..., D_v]`, and recurrent `u:[..., D_v]`.
+  - a full audit of chunked, recurrent, dense, and torch-reference paths so score reductions, scaling, and log-normalizer math continue to run over `D_k` while numerator accumulation, latent state merges, and output writes tile over `D_v`.
+  - kernel/config work to remove hidden `D_k == D_v` assumptions in Triton launch parameters, temporary buffers, prefix summaries, and workspace sizing, rather than papering over the mismatch at the Python boundary.
+  - targeted tests and benchmarks for mixed-dimension cases so correctness, gradients, and performance are validated for representative shapes (for example `D_k=64, D_v=128`) instead of only equal-dimension baselines.
+  - docs/CLI cleanup so terminology is unambiguous (`score_head_dim` vs `value_head_dim`, or similar) and users can tell which constraints remain fundamental versus which ones were only implementation artifacts.
+
+- [ ] Support different numbers of query heads and KV heads (`H_q != H_kv`) for grouped-query / multi-query style layouts, with:
+  - explicit public shape conventions instead of one shared `H`: `Q:[H_q, M, D]`, `K/V:[B, N, H_kv, D]`, output `Y:[B, N, H_q, D]`, and recurrent state/prefix summaries indexed by query head count because the encoder statistics remain query-head-specific even when KV heads are shared.
+  - well-defined head-routing semantics, including the fundamental constraint that each query head must map to a KV head. If the intended first implementation only supports `H_q % H_kv == 0`, make that divisibility requirement explicit and centralize the `q_head -> kv_head` mapping logic instead of duplicating ad hoc integer division in kernels and Python wrappers.
+  - canonicalization and validation updates across prefill/decode paths so we stop assuming `Q`, `K`, and `V` all expose the same head axis length, while still rejecting ambiguous or unsupported head-group layouts early with precise error messages.
+  - a full audit of chunked, recurrent, dense, inference, and torch-reference paths so score computation loads the correct shared KV head, but running maxima, denominators, numerators, latent states, and outputs continue to live on the query-head axis.
+  - Triton/kernel indexing work to remove hidden `H_q == H_kv` assumptions from launch grids, stride calculations, temporary buffers, prefix workspaces, and backward reductions. The important detail is to preserve correct accumulation when multiple query heads read the same KV head without accidentally aliasing state or gradients.
+  - backward-pass design for grouped KV sharing, especially around `dK`/`dV` accumulation. Multiple query heads contributing to one KV head means the reduction strategy needs to be explicit and tested rather than relying on current one-head-to-one-head assumptions.
+  - targeted correctness tests for representative MQA/GQA shapes (for example `H_q=16, H_kv=4` and `H_q=16, H_kv=1`), plus benchmark coverage so we can quantify whether shared-KV support changes memory traffic, occupancy, or numerical behavior relative to the equal-head baseline.
+  - docs/CLI/benchmark plumbing cleanup so argument names and reporting distinguish `num_query_heads` from `num_kv_heads`, and so remaining unsupported combinations are documented as implementation limits rather than implicit shape accidents.
+
 - [ ] Build publication-quality FLARE vs Transformer systems benchmarks and plots for:
   - decode speed and memory
   - prefill speed and memory
@@ -12,6 +30,24 @@
 
 - [ ] Remove the `ChunkedFLARE` backward `a_buf` workspace again by recomputing `a_t` on the fly from stable quantities
   (not from underflowed `g_t`), with minimal extra compute and without reintroducing sharp-softmax regressions.
+
+- [ ] Low-priority investigation: can backward avoid materializing score-gradient buffers (`dS_enc`, `dS_dec`) and contract directly into `dQ` / `dK` (and decode-side `dQ_dec` / `dK_dec`) instead, with:
+  - a clear baseline inventory of where score-space gradients are currently written and reread in the recurrent/chunked backward paths, including the separate “produce `dS` first, then contract into Q/K” structure in the current chunked implementation.
+  - an explicit fused-backward design sketch for both encoder and decode branches: once the local softmax derivative terms are known, accumulate their contribution into `dQ`/`dK` immediately instead of storing full `[... , T, M]` score-gradient tiles to HBM.
+  - careful accounting for the real tradeoff, because the obvious upside is lower VRAM and less score-buffer traffic, but the downside may be more recompute of Q/K tiles, worse tensor-core utilization, extra atomics/reductions into shared `dQ`/`dK`, or loss of phase separation that currently keeps the kernels simpler and numerically easier to reason about.
+  - a concrete decision on whether the fused path should target only encode-side score grads first, or also decode-side `dS_dec`; the decode branch may have a different cost/benefit profile when weights are shared versus unshared.
+  - special attention to gradient accumulation hazards in the chunked case, where multiple token tiles and/or multiple D tiles may contribute to the same `dQ` or `dK` slice. If direct contraction requires atomics, staged partial buffers, or a different launch decomposition, that should be part of the experiment rather than hidden as an implementation detail.
+  - measurement criteria that treat this as an optimization experiment, not an automatic improvement: compare peak memory, achieved bandwidth, kernel time, end-to-end backward time, and numerical agreement against the current buffered implementation before deciding whether the extra complexity is justified.
+  - a preference to keep this exploratory for now unless the measurements are compelling; this looks worth testing because it could reduce VRAM materially, but it should stay behind higher-priority correctness and feature work until there is data.
+
+- [ ] Low-priority: support internal padding / ragged final chunks in `ChunkedFLARE` so callers no longer need `N` to be an exact multiple of `CHUNK_SIZE`, with:
+  - a clear public contract that the chunked path may pad internally up to `ceil_div(N, CHUNK_SIZE) * CHUNK_SIZE`, but still returns outputs and gradients only for the original `N` tokens.
+  - a forward-path audit covering prepare, prefix, decoder-LSE, and replay kernels so padded tokens are truly inert: no score contribution, no recurrent-state updates, no decode-normalizer contamination, and no accidental writes to visible outputs.
+  - a backward-path audit covering all chunk-local workspaces (`dS_*`, `dV_part`, carry buffers, replay state, etc.) so padded tail positions likewise contribute exactly zero gradient and do not perturb prefix scans, reductions, or final reshapes back to length `N`.
+  - a decision on whether to implement this as explicit pre-padding at the Python boundary or as stricter masked handling inside the existing kernels. The main goal is to remove the external divisibility requirement without exploding code complexity or paying unnecessary extra memory traffic on already-aligned shapes.
+  - attention to the numerics of masked/padded positions, especially around `-inf` score handling, log-sum-exp paths, and recurrent max/denominator updates. The padded region must behave like nonexistent tokens, not just like zero-valued tokens.
+  - targeted tests for non-divisible sequence lengths in both forward and backward paths (for example `N=1000, CHUNK_SIZE=128` and very short tails such as `N=129, CHUNK_SIZE=128`), including parity against the reference implementation and checks that padded tails do not change results for the valid prefix.
+  - a small performance check before enabling this broadly, since internal padding can increase work by up to almost one extra chunk for short tails. This looks worth supporting for ergonomics and integration simplicity, but it should remain low priority until more pressing correctness and feature work lands.
 
 - [ ] Add a PyTorch chunked backward implementation so tests can use a matching chunked backward noise model
   (instead of autograd as a stopgap) when scaling tolerances relative to a PyTorch baseline.

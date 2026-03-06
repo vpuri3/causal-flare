@@ -1,0 +1,4 @@
+interface:
+  display_name: "Chunked FLARE Launch Tuning"
+  short_description: "Profile and tune chunked FLARE forward/backward launch heuristics."
+  default_prompt: "Use $chunked-flare-profile to profile chunked FLARE after major code changes, sweep forward and backward launch heuristics, and recommend or update tuned defaults."
