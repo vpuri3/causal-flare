@@ -31,6 +31,12 @@
 - [ ] Remove the `ChunkedFLARE` backward `a_buf` workspace again by recomputing `a_t` on the fly from stable quantities
   (not from underflowed `g_t`), with minimal extra compute and without reintroducing sharp-softmax regressions.
 
+- [x] Investigate whether chunked FLARE still needs explicit `prefix_max` / `prefix_den` now that forward saves `LSE_ENC`, with:
+  - a derivation of exactly which downstream uses of `prefix_max` and `prefix_den` are already covered by `LSE_ENC = log(sum(exp(...)))` and which, if any, still require the separate max/den split for numerical or kernel-structure reasons.
+  - a clear decision on `prefix_num`: whether the numerator summary still carries irreducible information needed for replay/output/backward, or whether some/all of its current uses can also be rewritten in terms of `LSE_ENC` plus other already-saved state.
+  - an implementation audit across chunked forward, backward, inference, and docs so we can delete redundant prefix summaries rather than carrying both representations out of inertia.
+  - attention to memory-bandwidth and workspace tradeoffs, since removing redundant prefix state may matter as much as the algebraic simplification.
+
 - [ ] Low-priority investigation: can backward avoid materializing score-gradient buffers (`dS_enc`, `dS_dec`) and contract directly into `dQ` / `dK` (and decode-side `dQ_dec` / `dK_dec`) instead, with:
   - a clear baseline inventory of where score-space gradients are currently written and reread in the recurrent/chunked backward paths, including the separate “produce `dS` first, then contract into Q/K” structure in the current chunked implementation.
   - an explicit fused-backward design sketch for both encoder and decode branches: once the local softmax derivative terms are known, accumulate their contribution into `dQ`/`dK` immediately instead of storing full `[... , T, M]` score-gradient tiles to HBM.
