@@ -1,5 +1,22 @@
 # TODO
 
+- [ ] High priority: investigate using Triton's `associative_scan` for forward computations in the recurrent and chunked implementations, with:
+  - an explicit audit of which forward recurrences/prefix-style reductions in `RecurrentFLARE` and `ChunkedFLARE` can be expressed cleanly as an associative combine without contorting the kernel structure or weakening numerics.
+  - a prototype path using `triton.language.associative_scan` for the forward computation where it fits naturally, plus a direct comparison against the current implementation for correctness, numerical stability, and performance.
+  - attention to whether this can simplify launch structure, reduce manual scan logic, or improve maintainability, rather than assuming it is automatically faster.
+  - a follow-up backward-pass investigation: determine whether the same associative-scan formulation can be applied in `bwd`, and if not, document the exact dependency or reduction pattern that blocks it.
+  - prefer Triton autotune for managing launch configuration search wherever it fits cleanly, and treat the current preconfigured launch presets as something to retire rather than expand.
+
+- [ ] Try a new multi-kernel `RecurrentFLARE` implementation by writing new `fwd_impl` / `bwd_impl` methods and wiring them into `RecurrentFLARE` behind env-var selection, with:
+  - steps 1/2: precompute `LSE_ENC` and `LSE_DEC`. `LSE_ENC` may also be usable as a score-saving buffer. Computing `LSE_ENC` will likely require a token loop.
+  - step 3: use dense matrix math to execute the forward pass per block, tiling over `N`, `M`, and `D` for efficiency.
+  - willingness to store a `[BLOCK_M, BLOCK_T, BLOCK_T]` matrix if needed, since this path may be able to use tensor cores efficiently enough to justify it.
+  - a matching backward pass for the new multi-kernel path.
+  - an explicit competitiveness check against the current recurrent approach; if this path is competitive, consider whether the same method should later be applied to chunked.
+  - initial tuning targets of `BH=128`, `N in {64, 128, 256}`, `M in {64, 128}`, `D=32`, `dtype=bf16`.
+  - thorough launch-config tuning rather than a single proof-of-concept kernel configuration.
+  - push launch tuning toward autotuned kernel configs and away from maintaining growing banks of fixed preset configurations by hand.
+
 - [ ] Refactor the FLARE prefill path to remove dedicated prefill-only entry points and use one canonical forward path, with:
   - masking support
   - optional return of final recurrent cache state `(m, d, u)` in addition to token outputs.
@@ -21,12 +38,6 @@
   - backward-pass design for grouped KV sharing, especially around `dK`/`dV` accumulation. Multiple query heads contributing to one KV head means the reduction strategy needs to be explicit and tested rather than relying on current one-head-to-one-head assumptions.
   - targeted correctness tests for representative MQA/GQA shapes (for example `H_q=16, H_kv=4` and `H_q=16, H_kv=1`), plus benchmark coverage so we can quantify whether shared-KV support changes memory traffic, occupancy, or numerical behavior relative to the equal-head baseline.
   - docs/CLI/benchmark plumbing cleanup so argument names and reporting distinguish `num_query_heads` from `num_kv_heads`, and so remaining unsupported combinations are documented as implementation limits rather than implicit shape accidents.
-
-- [ ] Build publication-quality FLARE vs Transformer systems benchmarks and plots for:
-  - decode speed and memory
-  - prefill speed and memory
-  - training speed and memory
-  using standardized experiment settings and reproducible scripts.
 
 - [ ] Remove the `ChunkedFLARE` backward `a_buf` workspace again by recomputing `a_t` on the fly from stable quantities
   (not from underflowed `g_t`), with minimal extra compute and without reintroducing sharp-softmax regressions.

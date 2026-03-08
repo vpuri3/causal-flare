@@ -4,15 +4,24 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
 
 try:
     from .profile_chunked_flare import Case, bench_case, parse_dtype
+    from .tuning_catalog import (
+        CHUNKED_TUNING_FAMILY_GROUPS as FAMILY_GROUPS,
+        CandidateConfig,
+        build_chunked_family_candidates,
+    )
 except ImportError:
     from profile_chunked_flare import Case, bench_case, parse_dtype
+    from tuning_catalog import (
+        CHUNKED_TUNING_FAMILY_GROUPS as FAMILY_GROUPS,
+        CandidateConfig,
+        build_chunked_family_candidates,
+    )
 
 
 DEFAULT_D_VALUES = (16, 32, 64, 96, 128, 192, 256, 384, 512)
@@ -26,40 +35,6 @@ DEFAULT_FORWARD_BLOCK_DS = (16, 32, 64, 128, 256)
 DEFAULT_BACKWARD_BLOCK_DS = (16, 32, 64, 128, 256)
 DEFAULT_BLOCK_TS = (16, 32, 64)
 DEFAULT_SCALAR_APPLY_PANELS = (4, 8, 16)
-
-FAMILY_GROUPS = {
-    "core": (
-        "default",
-        "chunk_size",
-        "forward_block_m",
-        "forward_block_d",
-        "forward_block_k",
-        "forward_launch",
-        "backward_block_m",
-        "backward_block_k",
-        "backward_qk_block_d",
-        "backward_block_t_qk",
-        "backward_launch",
-    ),
-    "extended": (
-        "backward_block_dv",
-        "backward_block_d_part",
-        "backward_block_t_replay",
-        "backward_block_t_state",
-        "backward_block_t_apply",
-        "backward_scalar_apply_panel",
-        "backward_fused_chunk_scan",
-    ),
-}
-FAMILY_GROUPS["all"] = FAMILY_GROUPS["core"] + FAMILY_GROUPS["extended"] + ("combined",)
-
-
-@dataclass(frozen=True)
-class CandidateConfig:
-    family: str
-    name: str
-    env: dict[str, str]
-
 
 def parse_int_list(spec: str | None, *, default: tuple[int, ...]) -> tuple[int, ...]:
     if spec is None:
@@ -108,23 +83,6 @@ def parse_extra_config(spec: str) -> CandidateConfig:
     return CandidateConfig(family="extra", name=name.strip(), env=env)
 
 
-def power_of_two_values(limit: int) -> list[int]:
-    values = []
-    value = 16
-    while value <= limit:
-        values.append(value)
-        value *= 2
-    return values
-
-
-def filter_divisors(values: Iterable[int], dim: int) -> list[int]:
-    return [value for value in values if value <= dim and (dim % value) == 0]
-
-
-def filter_tiles(values: Iterable[int], dim: int) -> list[int]:
-    return [value for value in values if value <= dim]
-
-
 def canonical_case_name(batch_size: int, num_heads: int, seq_len: int, latent_queries: int, head_dim: int) -> str:
     return f"b{batch_size}_h{num_heads}_n{seq_len}_m{latent_queries}_d{head_dim}"
 
@@ -158,308 +116,6 @@ def build_cases(
     return cases
 
 
-def forward_launch_presets() -> tuple[CandidateConfig, ...]:
-    return (
-        CandidateConfig(
-            family="forward_launch",
-            name="forward_launch_legacy_8w3s",
-            env={
-                "FLARE_PREPARE_NUM_WARPS": "8",
-                "FLARE_PREPARE_NUM_STAGES": "3",
-                "FLARE_PREFIX_NUM_WARPS": "8",
-                "FLARE_PREFIX_NUM_STAGES": "3",
-                "FLARE_DECODER_NUM_WARPS": "8",
-                "FLARE_DECODER_NUM_STAGES": "3",
-                "FLARE_FWD_NUM_WARPS": "8",
-                "FLARE_FWD_NUM_STAGES": "3",
-            },
-        ),
-        CandidateConfig(
-            family="forward_launch",
-            name="forward_launch_balanced_4w2s_4w1s",
-            env={
-                "FLARE_PREPARE_NUM_WARPS": "4",
-                "FLARE_PREPARE_NUM_STAGES": "2",
-                "FLARE_PREFIX_NUM_WARPS": "4",
-                "FLARE_PREFIX_NUM_STAGES": "2",
-                "FLARE_DECODER_NUM_WARPS": "4",
-                "FLARE_DECODER_NUM_STAGES": "1",
-                "FLARE_FWD_NUM_WARPS": "4",
-                "FLARE_FWD_NUM_STAGES": "1",
-            },
-        ),
-        CandidateConfig(
-            family="forward_launch",
-            name="forward_launch_light_fwd_2w1s",
-            env={
-                "FLARE_PREPARE_NUM_WARPS": "4",
-                "FLARE_PREPARE_NUM_STAGES": "2",
-                "FLARE_PREFIX_NUM_WARPS": "4",
-                "FLARE_PREFIX_NUM_STAGES": "2",
-                "FLARE_DECODER_NUM_WARPS": "4",
-                "FLARE_DECODER_NUM_STAGES": "1",
-                "FLARE_FWD_NUM_WARPS": "2",
-                "FLARE_FWD_NUM_STAGES": "1",
-            },
-        ),
-        CandidateConfig(
-            family="forward_launch",
-            name="forward_launch_wide_prepare_8w3s",
-            env={
-                "FLARE_PREPARE_NUM_WARPS": "8",
-                "FLARE_PREPARE_NUM_STAGES": "3",
-                "FLARE_PREFIX_NUM_WARPS": "8",
-                "FLARE_PREFIX_NUM_STAGES": "3",
-                "FLARE_DECODER_NUM_WARPS": "4",
-                "FLARE_DECODER_NUM_STAGES": "1",
-                "FLARE_FWD_NUM_WARPS": "4",
-                "FLARE_FWD_NUM_STAGES": "1",
-            },
-        ),
-    )
-
-
-def backward_launch_presets() -> tuple[CandidateConfig, ...]:
-    return (
-        CandidateConfig(
-            family="backward_launch",
-            name="backward_launch_legacy_8w3s",
-            env={
-                "FLARE_LSE_BWD_REPLAY_NUM_WARPS": "8",
-                "FLARE_LSE_BWD_REPLAY_NUM_STAGES": "3",
-                "FLARE_LSE_BWD_STATE_NUM_WARPS": "8",
-                "FLARE_LSE_BWD_STATE_NUM_STAGES": "3",
-                "FLARE_LSE_BWD_QK_NUM_WARPS": "8",
-                "FLARE_LSE_BWD_QK_NUM_STAGES": "3",
-                "FLARE_LSE_BWD_SCAN_APPLY_NUM_WARPS": "8",
-                "FLARE_LSE_BWD_SCAN_APPLY_NUM_STAGES": "3",
-            },
-        ),
-        CandidateConfig(
-            family="backward_launch",
-            name="backward_launch_balanced_4w2s",
-            env={
-                "FLARE_LSE_BWD_REPLAY_NUM_WARPS": "4",
-                "FLARE_LSE_BWD_REPLAY_NUM_STAGES": "2",
-                "FLARE_LSE_BWD_STATE_NUM_WARPS": "4",
-                "FLARE_LSE_BWD_STATE_NUM_STAGES": "2",
-                "FLARE_LSE_BWD_QK_NUM_WARPS": "4",
-                "FLARE_LSE_BWD_QK_NUM_STAGES": "2",
-                "FLARE_LSE_BWD_SCAN_APPLY_NUM_WARPS": "4",
-                "FLARE_LSE_BWD_SCAN_APPLY_NUM_STAGES": "2",
-            },
-        ),
-        CandidateConfig(
-            family="backward_launch",
-            name="backward_launch_light_4w1s",
-            env={
-                "FLARE_LSE_BWD_REPLAY_NUM_WARPS": "4",
-                "FLARE_LSE_BWD_REPLAY_NUM_STAGES": "1",
-                "FLARE_LSE_BWD_STATE_NUM_WARPS": "4",
-                "FLARE_LSE_BWD_STATE_NUM_STAGES": "1",
-                "FLARE_LSE_BWD_QK_NUM_WARPS": "4",
-                "FLARE_LSE_BWD_QK_NUM_STAGES": "1",
-                "FLARE_LSE_BWD_SCAN_APPLY_NUM_WARPS": "4",
-                "FLARE_LSE_BWD_SCAN_APPLY_NUM_STAGES": "1",
-            },
-        ),
-        CandidateConfig(
-            family="backward_launch",
-            name="backward_launch_compact_2w1s",
-            env={
-                "FLARE_LSE_BWD_REPLAY_NUM_WARPS": "2",
-                "FLARE_LSE_BWD_REPLAY_NUM_STAGES": "1",
-                "FLARE_LSE_BWD_STATE_NUM_WARPS": "2",
-                "FLARE_LSE_BWD_STATE_NUM_STAGES": "1",
-                "FLARE_LSE_BWD_QK_NUM_WARPS": "2",
-                "FLARE_LSE_BWD_QK_NUM_STAGES": "1",
-                "FLARE_LSE_BWD_SCAN_APPLY_NUM_WARPS": "2",
-                "FLARE_LSE_BWD_SCAN_APPLY_NUM_STAGES": "1",
-            },
-        ),
-    )
-
-
-def build_family_candidates(
-    case: Case,
-    *,
-    chunk_sizes: tuple[int, ...],
-    forward_block_ks: tuple[int, ...],
-    backward_block_ks: tuple[int, ...],
-    forward_block_ds: tuple[int, ...],
-    backward_block_ds: tuple[int, ...],
-    block_ts: tuple[int, ...],
-    scalar_apply_panels: tuple[int, ...],
-) -> dict[str, list[CandidateConfig]]:
-    d = case.head_dim
-    m = case.latent_queries
-    n = case.seq_len
-    forward_block_m_values = power_of_two_values(m)
-    backward_block_m_values = power_of_two_values(m)
-    valid_forward_block_d = filter_tiles(forward_block_ds, d)
-    valid_backward_block_d = filter_tiles(backward_block_ds, d)
-    valid_forward_block_k = filter_divisors(forward_block_ks, d)
-    valid_backward_block_k = filter_divisors(backward_block_ks, d)
-    valid_chunk_sizes = [value for value in chunk_sizes if value <= n and (value % 16) == 0]
-    valid_block_ts = [value for value in block_ts if value <= min(n, 512) and (value % 16) == 0]
-    valid_scalar_apply_panels = [value for value in scalar_apply_panels if value <= min(128, n)]
-
-    families: dict[str, list[CandidateConfig]] = {"default": [CandidateConfig("default", "default", {})]}
-
-    families["chunk_size"] = [
-        CandidateConfig("chunk_size", f"chunk_size_{chunk_size}", {"FLARE_CHUNK_SIZE": str(chunk_size)})
-        for chunk_size in valid_chunk_sizes
-    ]
-
-    families["forward_block_m"] = [
-        CandidateConfig(
-            "forward_block_m",
-            f"forward_block_m_{block_m}",
-            {
-                "FLARE_BLOCK_M": str(block_m),
-                "FLARE_PREFIX_BLOCK_M": str(block_m),
-            },
-        )
-        for block_m in forward_block_m_values
-    ]
-
-    families["forward_block_d"] = [
-        CandidateConfig(
-            "forward_block_d",
-            f"forward_block_d_{block_d}",
-            {
-                "FLARE_PREPARE_BLOCK_D": str(block_d),
-                "FLARE_PREFIX_BLOCK_D": str(block_d),
-                "FLARE_FWD_BLOCK_D": str(block_d),
-            },
-        )
-        for block_d in valid_forward_block_d
-    ]
-
-    forward_block_k_candidates: list[CandidateConfig] = []
-    for prepare_block_k in valid_forward_block_k:
-        for fwd_block_k in valid_forward_block_k:
-            if prepare_block_k < fwd_block_k:
-                continue
-            forward_block_k_candidates.append(
-                CandidateConfig(
-                    "forward_block_k",
-                    f"forward_block_k_p{prepare_block_k}_f{fwd_block_k}",
-                    {
-                        "FLARE_PREPARE_BLOCK_K": str(prepare_block_k),
-                        "FLARE_FWD_BLOCK_K": str(fwd_block_k),
-                    },
-                )
-            )
-    families["forward_block_k"] = forward_block_k_candidates
-    families["forward_launch"] = list(forward_launch_presets())
-
-    backward_block_m_candidates: list[CandidateConfig] = []
-    for block_m in backward_block_m_values:
-        block_m_replay = min(block_m, 64)
-        backward_block_m_candidates.append(
-            CandidateConfig(
-                "backward_block_m",
-                f"backward_block_m_{block_m}_score_block_m_{block_m_replay}",
-                {
-                    "FLARE_LSE_BWD_BLOCK_M": str(block_m),
-                    "FLARE_LSE_BWD_SCORE_BLOCK_M": str(block_m_replay),
-                },
-            )
-        )
-    families["backward_block_m"] = backward_block_m_candidates
-
-    families["backward_block_dv"] = [
-        CandidateConfig(
-            "backward_block_dv",
-            f"backward_block_dv_{block_dv}",
-            {"FLARE_LSE_BWD_BLOCK_DV": str(block_dv)},
-        )
-        for block_dv in valid_backward_block_d
-    ]
-
-    families["backward_block_k"] = [
-        CandidateConfig(
-            "backward_block_k",
-            f"backward_block_k_{block_k}",
-            {"FLARE_LSE_BWD_BLOCK_K": str(block_k)},
-        )
-        for block_k in valid_backward_block_k
-    ]
-
-    families["backward_block_d_part"] = [
-        CandidateConfig(
-            "backward_block_d_part",
-            f"backward_block_d_part_{block_d_part}",
-            {"FLARE_LSE_BWD_BLOCK_D_PART": str(block_d_part)},
-        )
-        for block_d_part in valid_backward_block_d
-    ]
-
-    families["backward_qk_block_d"] = [
-        CandidateConfig(
-            "backward_qk_block_d",
-            f"backward_qk_block_d_{block_d}",
-            {"FLARE_LSE_BWD_QK_BLOCK_D": str(block_d)},
-        )
-        for block_d in valid_backward_block_d
-    ]
-
-    families["backward_block_t_qk"] = [
-        CandidateConfig(
-            "backward_block_t_qk",
-            f"backward_block_t_qk_{block_t}",
-            {"FLARE_LSE_BWD_BLOCK_T_QK": str(block_t)},
-        )
-        for block_t in valid_block_ts
-    ]
-
-    families["backward_block_t_replay"] = [
-        CandidateConfig(
-            "backward_block_t_replay",
-            f"backward_block_t_replay_{block_t}",
-            {"FLARE_LSE_BWD_BLOCK_T_REPLAY": str(block_t)},
-        )
-        for block_t in valid_block_ts
-    ]
-
-    families["backward_block_t_state"] = [
-        CandidateConfig(
-            "backward_block_t_state",
-            f"backward_block_t_state_{block_t}",
-            {"FLARE_LSE_BWD_BLOCK_T_STATE": str(block_t)},
-        )
-        for block_t in valid_block_ts
-    ]
-
-    families["backward_block_t_apply"] = [
-        CandidateConfig(
-            "backward_block_t_apply",
-            f"backward_block_t_apply_{block_t}",
-            {"FLARE_LSE_BWD_BLOCK_T_APPLY": str(block_t)},
-        )
-        for block_t in valid_block_ts
-    ]
-
-    families["backward_scalar_apply_panel"] = [
-        CandidateConfig(
-            "backward_scalar_apply_panel",
-            f"backward_scalar_apply_panel_{panel}",
-            {"FLARE_LSE_BWD_SCALAR_APPLY_PANEL": str(panel)},
-        )
-        for panel in valid_scalar_apply_panels
-    ]
-
-    families["backward_fused_chunk_scan"] = [
-        CandidateConfig("backward_fused_chunk_scan", "backward_fused_chunk_scan_on", {"FLARE_LSE_BWD_FUSE_CHUNK_SCAN": "1"}),
-        CandidateConfig("backward_fused_chunk_scan", "backward_fused_chunk_scan_off", {"FLARE_LSE_BWD_FUSE_CHUNK_SCAN": "0"}),
-    ]
-
-    families["backward_launch"] = list(backward_launch_presets())
-    families["combined"] = []
-    return families
-
-
 def expand_candidates_for_case(
     case: Case,
     *,
@@ -473,8 +129,10 @@ def expand_candidates_for_case(
     scalar_apply_panels: tuple[int, ...],
     extra_configs: list[CandidateConfig],
 ) -> tuple[list[CandidateConfig], dict[str, list[CandidateConfig]]]:
-    family_candidates = build_family_candidates(
-        case,
+    family_candidates = build_chunked_family_candidates(
+        head_dim=case.head_dim,
+        latent_queries=case.latent_queries,
+        seq_len=case.seq_len,
         chunk_sizes=chunk_sizes,
         forward_block_ks=forward_block_ks,
         backward_block_ks=backward_block_ks,

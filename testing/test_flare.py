@@ -1,3 +1,4 @@
+import os
 import math
 
 import pytest
@@ -26,6 +27,38 @@ def _run_recurrent_impl(impl_name, q, k, v, *, scale, q_dec=None, k_dec=None, bl
         return flare_recurrent_pytorch(q, k, v, scale=scale, Q_dec=q_dec, K_dec=k_dec)
     if impl_name == "recurrent":
         return flare_recurrent_triton(q, k, v, scale=scale, Q_dec=q_dec, K_dec=k_dec, block_t=block_t)
+    if impl_name == "recurrent_assoc":
+        old_impl = os.environ.get("FLARE_RECURRENT_IMPL")
+        old_scan = os.environ.get("FLARE_RECURRENT_ASSOC_SCAN")
+        try:
+            os.environ.pop("FLARE_RECURRENT_IMPL", None)
+            os.environ["FLARE_RECURRENT_ASSOC_SCAN"] = "1"
+            return flare_recurrent_triton(q, k, v, scale=scale, Q_dec=q_dec, K_dec=k_dec, block_t=block_t)
+        finally:
+            if old_impl is None:
+                os.environ.pop("FLARE_RECURRENT_IMPL", None)
+            else:
+                os.environ["FLARE_RECURRENT_IMPL"] = old_impl
+            if old_scan is None:
+                os.environ.pop("FLARE_RECURRENT_ASSOC_SCAN", None)
+            else:
+                os.environ["FLARE_RECURRENT_ASSOC_SCAN"] = old_scan
+    if impl_name == "recurrent_multi":
+        old_impl = os.environ.get("FLARE_RECURRENT_IMPL")
+        old_scan = os.environ.get("FLARE_RECURRENT_ASSOC_SCAN")
+        try:
+            os.environ["FLARE_RECURRENT_IMPL"] = "multi"
+            os.environ.pop("FLARE_RECURRENT_ASSOC_SCAN", None)
+            return flare_recurrent_triton(q, k, v, scale=scale, Q_dec=q_dec, K_dec=k_dec, block_t=block_t)
+        finally:
+            if old_impl is None:
+                os.environ.pop("FLARE_RECURRENT_IMPL", None)
+            else:
+                os.environ["FLARE_RECURRENT_IMPL"] = old_impl
+            if old_scan is None:
+                os.environ.pop("FLARE_RECURRENT_ASSOC_SCAN", None)
+            else:
+                os.environ["FLARE_RECURRENT_ASSOC_SCAN"] = old_scan
     raise ValueError(f"Unknown implementation: {impl_name}")
 
 
@@ -63,6 +96,34 @@ def test_recurrent_flare_decode_variants_match_torch_reference(impl_name: str, b
         for k_dec in k_dec_options:
             y_ref = _run_recurrent_impl("reference", q, k, v, scale=scale, q_dec=q_dec, k_dec=k_dec, block_t=block_t)
             y_impl = _run_recurrent_impl(impl_name, q, k, v, scale=scale, q_dec=q_dec, k_dec=k_dec, block_t=block_t)
+            torch.testing.assert_close(y_impl, y_ref, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("impl_name", ["recurrent_assoc", "recurrent_multi"])
+def test_recurrent_experimental_paths_match_torch_reference(impl_name: str):
+    torch.manual_seed(7123)
+
+    B = 1
+    N = 16
+    H = 2
+    M = 16
+    D = 16
+    scale = 1.0 / math.sqrt(D)
+    dtype = torch.float32
+
+    q = torch.randn((H, M, D), device=device, dtype=dtype)
+    k = torch.randn((B, N, H, D), device=device, dtype=dtype)
+    v = torch.randn((B, N, H, D), device=device, dtype=dtype)
+    q_dec_rand = torch.randn((B, N, H, D), device=device, dtype=dtype)
+    k_dec_rand = torch.randn((H, M, D), device=device, dtype=dtype)
+
+    q_dec_options = (None, k, q_dec_rand)
+    k_dec_options = (None, q, k_dec_rand)
+
+    for q_dec in q_dec_options:
+        for k_dec in k_dec_options:
+            y_ref = _run_recurrent_impl("reference", q, k, v, scale=scale, q_dec=q_dec, k_dec=k_dec, block_t=16)
+            y_impl = _run_recurrent_impl(impl_name, q, k, v, scale=scale, q_dec=q_dec, k_dec=k_dec, block_t=16)
             torch.testing.assert_close(y_impl, y_ref, rtol=1e-4, atol=1e-5)
 
 
@@ -216,7 +277,64 @@ def test_recurrent_flare_decode_variants_backward_match_torch_reference(impl_nam
             torch.testing.assert_close(g_impl["q"], g_ref["q"], rtol=1e-2, atol=1e-3)
             torch.testing.assert_close(g_impl["k"], g_ref["k"], rtol=1e-2, atol=1e-3)
             torch.testing.assert_close(g_impl["v"], g_ref["v"], rtol=1e-2, atol=1e-3)
+            if q_dec_mode == "rand":
+                torch.testing.assert_close(g_impl["q_dec_rand"], g_ref["q_dec_rand"], rtol=1e-2, atol=1e-3)
+            if k_dec_mode == "rand":
+                torch.testing.assert_close(g_impl["k_dec_rand"], g_ref["k_dec_rand"], rtol=1e-2, atol=1e-3)
 
+
+@pytest.mark.parametrize("impl_name", ["recurrent_multi"])
+def test_recurrent_multi_kernel_backward_matches_torch_reference(impl_name: str):
+    torch.manual_seed(7124)
+
+    B = 1
+    N = 16
+    H = 2
+    M = 16
+    D = 16
+    scale = 1.0 / math.sqrt(D)
+    dtype = torch.float32
+
+    q_seed = torch.randn((H, M, D), device=device, dtype=dtype)
+    k_seed = torch.randn((B, N, H, D), device=device, dtype=dtype)
+    v_seed = torch.randn((B, N, H, D), device=device, dtype=dtype)
+    q_dec_rand_seed = torch.randn((B, N, H, D), device=device, dtype=dtype)
+    k_dec_rand_seed = torch.randn((H, M, D), device=device, dtype=dtype)
+    grad_out = torch.randn((B, H, N, D), device=device, dtype=dtype)
+
+    for q_dec_mode in ("none", "k_enc", "rand"):
+        for k_dec_mode in ("none", "q_enc", "rand"):
+            y_ref, g_ref = _run_recurrent_impl_with_grads(
+                "reference",
+                q_seed,
+                k_seed,
+                v_seed,
+                scale=scale,
+                grad_out=grad_out,
+                q_dec_mode=q_dec_mode,
+                k_dec_mode=k_dec_mode,
+                q_dec_rand_seed=q_dec_rand_seed,
+                k_dec_rand_seed=k_dec_rand_seed,
+                block_t=16,
+            )
+            y_impl, g_impl = _run_recurrent_impl_with_grads(
+                impl_name,
+                q_seed,
+                k_seed,
+                v_seed,
+                scale=scale,
+                grad_out=grad_out,
+                q_dec_mode=q_dec_mode,
+                k_dec_mode=k_dec_mode,
+                q_dec_rand_seed=q_dec_rand_seed,
+                k_dec_rand_seed=k_dec_rand_seed,
+                block_t=16,
+            )
+
+            torch.testing.assert_close(y_impl, y_ref, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(g_impl["q"], g_ref["q"], rtol=1e-2, atol=1e-3)
+            torch.testing.assert_close(g_impl["k"], g_ref["k"], rtol=1e-2, atol=1e-3)
+            torch.testing.assert_close(g_impl["v"], g_ref["v"], rtol=1e-2, atol=1e-3)
             if q_dec_mode == "rand":
                 torch.testing.assert_close(g_impl["q_dec_rand"], g_ref["q_dec_rand"], rtol=1e-2, atol=1e-3)
             if k_dec_mode == "rand":
