@@ -2,6 +2,21 @@
 
 ## Session Startup
 - At the start of every session, read `TODO.md` and align ongoing work with current priorities.
+- For complex user queries, consider writing a short task list up front so progress and completion status are clear.
+- Before starting opportunistic refactors or side quests, check whether the request aligns with current `TODO.md` priorities.
+
+## Workflow Expectations
+- For complex tasks, state key assumptions early when behavior, masking semantics, shapes, or numerical expectations are ambiguous.
+- Prefer the smallest safe change that solves the requested problem; avoid incidental refactors unless they are required for correctness, maintainability, or testability.
+- If work is blocked, report exactly what is blocked, what was tried, and what remains unverified.
+- In final summaries for substantial tasks, clearly separate what was completed, what was not completed, and what was not verified.
+- For changes to Triton kernels or other performance-critical paths, call out any shape constraints, workspace/saved-buffer changes, backward-pass implications, and whether performance was measured.
+
+## Interactive Execution Behavior
+- If the user interrupts a running thinking/log stream with `ESC`, do not treat that alone as a reason to terminate any background terminal task.
+- Treat the interruption as new user input to consider while allowing the existing background task or thinking stream to continue when feasible.
+- It is acceptable to stop the background task if there is a concrete reason to do so, but do not close it by default merely because the user said something mid-stream.
+- Prefer handling both in parallel when possible: continue monitoring the ongoing task while responding to the new user input.
 
 ## Project Structure & Module Organization
 - `causal_flare/`: core FLARE implementations (`chunked`, `dense`, `recurrent`, `torch`, inference wiring).
@@ -29,6 +44,9 @@
 - Keep tests close to feature area under `testing/`.
 - Prefer focused kernel/ops tests plus targeted integration tests.
 - Do not loosen tolerances or reduce/skip coverage to force passing tests; fix root causes.
+- Run the most targeted relevant tests first for the touched area before broader suite runs.
+- For numerics-sensitive changes, verify both correctness and tolerance behavior against the strongest available reference instead of masking regressions with threshold changes.
+- For performance-sensitive changes, include before/after benchmark numbers when feasible; if benchmarks were not run, say so explicitly.
 
 ## Local Testing & Logging Workflow
 - Activate the repo venv (`source .venv/bin/activate` or `/vact`) before tests/benchmarks.
