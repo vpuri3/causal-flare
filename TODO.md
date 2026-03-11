@@ -15,7 +15,6 @@
   - a prototype path using `triton.language.associative_scan` for the forward computation where it fits naturally, plus a direct comparison against the current implementation for correctness, numerical stability, and performance.
   - attention to whether this can simplify launch structure, reduce manual scan logic, or improve maintainability, rather than assuming it is automatically faster.
   - a follow-up backward-pass investigation: determine whether the same associative-scan formulation can be applied in `bwd`, and if not, document the exact dependency or reduction pattern that blocks it.
-  - prefer Triton autotune for managing launch configuration search wherever it fits cleanly, and treat the current preconfigured launch presets as something to retire rather than expand.
 
 - [ ] Try a new multi-kernel `RecurrentFLARE` implementation by writing new `fwd_impl` / `bwd_impl` methods and wiring them into `RecurrentFLARE` behind env-var selection, with:
   - steps 1/2: precompute `LSE_ENC` and `LSE_DEC`. `LSE_ENC` may also be usable as a score-saving buffer. Computing `LSE_ENC` will likely require a token loop.
@@ -23,21 +22,10 @@
   - willingness to store a `[BLOCK_M, BLOCK_T, BLOCK_T]` matrix if needed, since this path may be able to use tensor cores efficiently enough to justify it.
   - a matching backward pass for the new multi-kernel path.
   - an explicit competitiveness check against the current recurrent approach; if this path is competitive, consider whether the same method should later be applied to chunked.
-  - initial tuning targets of `BH=128`, `N in {64, 128, 256}`, `M in {64, 128}`, `D=32`, `dtype=bf16`.
-  - thorough launch-config tuning rather than a single proof-of-concept kernel configuration.
-  - push launch tuning toward autotuned kernel configs and away from maintaining growing banks of fixed preset configurations by hand.
 
 - [ ] Refactor the FLARE prefill path to remove dedicated prefill-only entry points and use one canonical forward path, with:
   - masking support
   - optional return of final recurrent cache state `(m, d, u)` in addition to token outputs.
-
-- [ ] Allow different key/value head dimensions instead of threading one global `head_dim` through the entire stack, with:
-  - explicit separation between the score dimension and output dimension in public APIs, internal helpers, and benchmark/config plumbing. `Q` and `K` should still agree on the score inner dimension used for logits, but `V`, `Y`, and recurrent numerator/state storage should be allowed to use a different output inner dimension.
-  - shape-validation updates across prefill/decode canonicalization so we stop requiring `K.shape == V.shape` and instead validate compatible layouts such as `Q:[..., D_k]`, `K:[..., D_k]`, `V:[..., D_v]`, output `Y:[..., D_v]`, and recurrent `u:[..., D_v]`.
-  - a full audit of chunked, recurrent, dense, and torch-reference paths so score reductions, scaling, and log-normalizer math continue to run over `D_k` while numerator accumulation, latent state merges, and output writes tile over `D_v`.
-  - kernel/config work to remove hidden `D_k == D_v` assumptions in Triton launch parameters, temporary buffers, prefix summaries, and workspace sizing, rather than papering over the mismatch at the Python boundary.
-  - targeted tests and benchmarks for mixed-dimension cases so correctness, gradients, and performance are validated for representative shapes (for example `D_k=64, D_v=128`) instead of only equal-dimension baselines.
-  - docs/CLI cleanup so terminology is unambiguous (`score_head_dim` vs `value_head_dim`, or similar) and users can tell which constraints remain fundamental versus which ones were only implementation artifacts.
 
 - [ ] Support different numbers of query heads and KV heads (`H_q != H_kv`) for grouped-query / multi-query style layouts, with:
   - explicit public shape conventions instead of one shared `H`: `Q:[H_q, M, D]`, `K/V:[B, N, H_kv, D]`, output `Y:[B, N, H_q, D]`, and recurrent state/prefix summaries indexed by query head count because the encoder statistics remain query-head-specific even when KV heads are shared.
