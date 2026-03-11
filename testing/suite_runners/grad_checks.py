@@ -133,7 +133,7 @@ def _run_correctness_pytorch2_grads_with_decode(
     }
 
 
-def _run_grad_checks_suite() -> None:
+def _run_grad_checks_suite(*, shard_index: int | None = None, num_shards: int | None = None) -> None:
     if not torch.cuda.is_available():
         print("[FLARE DEBUG] CUDA not available, skipping gradient checks suite.")
         return
@@ -141,6 +141,16 @@ def _run_grad_checks_suite() -> None:
     device = torch.device("cuda")
     strict = _strict_mode_enabled("FLARE_CORRECTNESS_STRICT", default=True)
     decode_modes = _parse_decode_separation_modes("FLARE_CORRECTNESS_DECODE_SEPARATION_MODES")
+    env_num_shards = int(os.environ.get("FLARE_CORRECTNESS_GRAD_NUM_SHARDS", os.environ.get("FLARE_CORRECTNESS_NUM_SHARDS", "1")))
+    env_shard_index = int(os.environ.get("FLARE_CORRECTNESS_GRAD_SHARD_INDEX", os.environ.get("FLARE_CORRECTNESS_SHARD_INDEX", "0")))
+    if num_shards is None:
+        num_shards = env_num_shards
+    if shard_index is None:
+        shard_index = env_shard_index
+    if num_shards <= 0:
+        raise ValueError(f"FLARE_CORRECTNESS_GRAD_NUM_SHARDS must be positive, got {num_shards}.")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError(f"FLARE_CORRECTNESS_GRAD_SHARD_INDEX must be in [0, {num_shards}), got {shard_index}.")
 
     seed_env = os.environ.get("FLARE_CORRECTNESS_SEED", "")
     if seed_env:
@@ -193,6 +203,8 @@ def _run_grad_checks_suite() -> None:
         grad_limit = max(1, len(decode_modes))
 
     grad_count = 0
+    case_index = 0
+    selected_cases = 0
 
     for dtype in dtypes:
         atol = 1e-2 if dtype == torch.bfloat16 else 1e-3
@@ -233,6 +245,12 @@ def _run_grad_checks_suite() -> None:
                 for separate_q_dec, separate_k_dec in decode_modes:
                     if os.environ.get("FLARE_CORRECTNESS_GRAD", "0") != "1" or grad_count >= grad_limit:
                         continue
+                    if case_index % num_shards != shard_index:
+                        case_index += 1
+                        grad_count += 1
+                        continue
+                    case_index += 1
+                    selected_cases += 1
 
                     decode_label = _decode_mode_label(separate_q_dec, separate_k_dec)
                     Q_dec = Q_dec_rand if separate_q_dec else None
@@ -351,7 +369,12 @@ def _run_grad_checks_suite() -> None:
                     print(f"[SUITE GRAD] dtype={dtype} B={B} H={H} N={N} M={M} D={D} scale={scale}")
                     _gradcheck_suite(dtype, B, H, N, M, D, scale=scale, atol=atol)
 
+    print(f"[FLARE GRAD CHECKS] selected_cases={selected_cases} shard={shard_index + 1}/{num_shards}")
     if strict and failures:
         summary = "\n".join(f"- {msg}" for msg in failures[:12])
         extra = "" if len(failures) <= 12 else f"\n- ... and {len(failures) - 12} more"
         raise AssertionError(f"FLARE gradient validation failed ({len(failures)} issues):\n{summary}{extra}")
+
+
+def _run_grad_checks_suite_shard(shard_index: int, num_shards: int) -> None:
+    _run_grad_checks_suite(shard_index=shard_index, num_shards=num_shards)

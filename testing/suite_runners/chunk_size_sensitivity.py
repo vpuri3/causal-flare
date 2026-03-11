@@ -3,7 +3,7 @@
 from testing.suite_runners.common import *
 
 
-def _chunk_size_sensitivity_suite():
+def _chunk_size_sensitivity_suite(*, shard_index: int | None = None, num_shards: int | None = None):
     if not torch.cuda.is_available():
         print("[FLARE CHUNK SENS] CUDA not available, skipping.")
         return
@@ -24,6 +24,18 @@ def _chunk_size_sensitivity_suite():
     fwd_max_abs_max = _env_float("FLARE_CHUNK_SENS_FWD_MAX_ABS_MAX", 8e-3)
     grad_max_abs_max = _env_float("FLARE_CHUNK_SENS_GRAD_MAX_ABS_MAX", 2e-2)
     grad_cos_min = _env_float("FLARE_CHUNK_SENS_GRAD_COS_MIN", 0.999)
+    env_num_shards = int(os.environ.get("FLARE_CHUNK_SENS_NUM_SHARDS", "1"))
+    env_shard_index = int(os.environ.get("FLARE_CHUNK_SENS_SHARD_INDEX", "0"))
+    if num_shards is None:
+        num_shards = env_num_shards
+    if shard_index is None:
+        shard_index = env_shard_index
+    if num_shards <= 0:
+        raise ValueError(f"FLARE_CHUNK_SENS_NUM_SHARDS must be positive, got {num_shards}.")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError(f"FLARE_CHUNK_SENS_SHARD_INDEX must be in [0, {num_shards}), got {shard_index}.")
+    case_index = 0
+    selected_cases = 0
 
     def _run_once(
         q: torch.Tensor,
@@ -51,6 +63,11 @@ def _chunk_size_sensitivity_suite():
                 M = cfg["M"]
                 N = cfg["N"]
                 D = cfg["D"]
+                if case_index % num_shards != shard_index:
+                    case_index += 1
+                    continue
+                case_index += 1
+                selected_cases += 1
                 scale = D ** -0.5
                 torch.manual_seed(seed + B + H + M + N + D)
                 Q = torch.randn(H, M, D, device=device, dtype=dtype)
@@ -135,8 +152,13 @@ def _chunk_size_sensitivity_suite():
                                 ),
                             )
 
+    print(f"[FLARE CHUNK SENS] selected_cases={selected_cases} shard={shard_index + 1}/{num_shards}")
     if strict and failures:
         summary = "\n".join(f"- {msg}" for msg in failures[:12])
         extra = "" if len(failures) <= 12 else f"\n- ... and {len(failures) - 12} more"
         raise AssertionError(f"FLARE chunk sensitivity failed ({len(failures)} issues):\n{summary}{extra}")
     print("[FLARE CHUNK SENS] all checks passed.")
+
+
+def _chunk_size_sensitivity_suite_shard(shard_index: int, num_shards: int) -> None:
+    _chunk_size_sensitivity_suite(shard_index=shard_index, num_shards=num_shards)

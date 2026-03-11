@@ -170,7 +170,8 @@ def _correctness_chunk_config(M: int, N: int, D: int, dtype: torch.dtype) -> tup
     cfg = _chunked_impl._get_chunked_forward_config(
         M=M,
         N=N,
-        D=D,
+        score_head_dim=D,
+        value_head_dim=D,
         dtype=dtype,
         chunk_size=None,
         input_precision=input_precision,

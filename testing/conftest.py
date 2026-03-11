@@ -3,9 +3,6 @@ import os
 import pytest
 
 
-os.environ.setdefault("FLARE_TEST_REDUCE_AUTOTUNE", "1")
-
-
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--run-regression",
@@ -39,3 +36,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(skip_stress)
         if "regression" in item.keywords and not run_regression:
             item.add_marker(skip_regression)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    os.environ.setdefault("FLARE_TEST_REDUCE_AUTOTUNE", "1")

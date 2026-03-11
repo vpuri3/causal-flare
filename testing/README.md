@@ -43,10 +43,34 @@ Run full long-running regression/stress matrices:
 pytest testing --run-regression --run-stress --full-matrix -q
 ```
 
+Run the collected suite across all visible GPUs:
+
+```bash
+python -m testing.distributed_runner -- testing -q
+```
+
+Run distributed regression/stress suites:
+
+```bash
+python -m testing.distributed_runner -- testing --run-regression --run-stress --full-matrix -q
+```
+
+Increase parallelism further by launching multiple independent workers on each visible GPU:
+
+```bash
+python -m testing.distributed_runner --workers-per-gpu 2 -- testing --run-regression --run-stress --full-matrix -q
+```
+
+- The distributed runner pins one subprocess per visible GPU via `CUDA_VISIBLE_DEVICES=<single_gpu>`, so existing tests that use `torch.device("cuda")` stay isolated per shard.
+- `--workers-per-gpu` oversubscribes each visible GPU with multiple pytest workers when the suite is latency-bound rather than memory- or compute-bound.
+- It replaces `test_regression_bundle` with its unique component suites (`parity`, `trainlike_sanity`, and `trainlike_multistep_parity` when `--full-matrix` is enabled) so distributed runs do not duplicate the slower correctness/grad/stress wrappers already collected elsewhere.
+- Per-shard logs default to `/tmp/flare-pytest-shards`; use `--log-dir` to override or `--dry-run` to print the task plan without executing it.
+
 ## Extracted Regression/Stress Suites
 
 The suite implementations below were extracted into `testing/suite_runners/` (one module per suite):
 
+- `testing/suite_runners/autotune_launch_coverage.py` -> `_autotune_launch_coverage_suite`
 - `testing/suite_runners/correctness.py` -> `_run_correctness_suite`
 - `testing/suite_runners/parity.py` -> `_parity_tests`
 - `testing/suite_runners/trainlike_sanity.py` -> `_trainlike_sanity`
@@ -61,7 +85,7 @@ The suite implementations below were extracted into `testing/suite_runners/` (on
 Pytest wrappers that currently call these suites:
 
 - `testing/test_regression_suites.py`:
-  - direct wrappers: `_run_correctness_suite`, `_run_grad_checks_suite`, `_regression_test`
+  - direct wrappers: `_run_correctness_suite`, `_run_grad_checks_suite`, `_autotune_launch_coverage_suite`, `_regression_test`
   - stress wrappers: `_sharp_softmax_bwd_regression_suite`, `_long_context_accuracy_suite`, `_chunk_size_sensitivity_suite`
   - note: `_parity_tests`, `_trainlike_sanity`, and `_trainlike_multistep_parity` are run via `_regression_test` (bundle), not direct top-level wrappers.
 - `testing/test_cached_suites.py`:
@@ -75,9 +99,14 @@ Legacy env-flag entrypoints in `testing/test.py` (`FLARE_DEBUG_*`, `FLARE_RECURR
 
 ## What These Suites Cover
 
+- `_autotune_launch_coverage_suite`
+  - Small representative correctness/gradient suite that forces full autotune search inside the suite.
+  - Intended to catch launch-config-specific correctness bugs without turning the entire regression matrix into a full-autotune run.
+  - Pytest wrapper shards this suite into 4 independent nodeids (`autotune1` ... `autotune4`).
 - `_run_correctness_suite`
   - Broad forward/backward correctness over decode-sharing modes, dtype/shape grids, and precision modes.
   - Compares Triton chunked path vs reference and PyTorch chunked noise model.
+  - Pytest wrapper shards this suite into 8 independent nodeids (`correctness1` ... `correctness8`).
 - `_parity_tests`
   - End-to-end parity checks between Triton chunked and reference baselines (forward + grads).
 - `_trainlike_sanity`
@@ -87,15 +116,18 @@ Legacy env-flag entrypoints in `testing/test.py` (`FLARE_DEBUG_*`, `FLARE_RECURR
   - Not currently invoked by `testing/test_regression_suites.py` or `testing/test_cached_suites.py`.
 - `_long_context_accuracy_suite`
   - Accuracy/gradient behavior at long sequence lengths and precision modes.
+  - Pytest wrapper shards this suite into 8 independent nodeids (`longctx1` ... `longctx8`).
 - `_trainlike_multistep_parity`
   - Multi-step parity under repeated updates (loss/output/gradient agreement).
 - `_chunk_size_sensitivity_suite`
   - Sensitivity to backward chunk-size selection and gradient consistency across chunk settings.
+  - Pytest wrapper shards this suite into 8 independent nodeids (`chunksens1` ... `chunksens8`).
 - `_sharp_softmax_bwd_regression_suite`
   - Sharp-softmax backward stress coverage for non-finite detection and gradient drift bounds.
 - `_run_grad_checks_suite`
   - Dedicated gradient-only validation across decode-separation modes and input-scale sweeps.
   - Includes the historical `_gradcheck_suite` matrix when `FLARE_CORRECTNESS_SUITE_GRAD=1`.
+  - Pytest wrapper shards this suite into 8 independent nodeids (`gradchecks1` ... `gradchecks8`).
 - `_regression_test`
   - Bundle runner that executes core suites with bounded deterministic defaults.
 
@@ -157,6 +189,7 @@ Below are the key matrix dimensions each suite exercises. Most are configurable 
     - standard: `FLARE_SHARP_BWD_QK_STDS` (often `1,2,4,8`)
     - stress: `FLARE_SHARP_BWD_STRESS_QK_STDS` (often high-scale tails)
   - Decode separation matrix: `FLARE_SHARP_BWD_DECODE_SEPARATION_MODES` (`00/10/01/11`).
+  - Pytest wrapper shards this suite into 12 independent nodeids (`sharpness1` ... `sharpness12`) for better multi-GPU scheduling.
 
 - `_run_grad_checks_suite`
   - Dtypes/shapes/std/modes reuse the correctness env grid:
@@ -198,6 +231,7 @@ Below are the key matrix dimensions each suite exercises. Most are configurable 
   - Wrapper does not apply bounded matrix overrides.
   - Regression bundle sets `FLARE_REGRESSION_EXTENDED=1`.
   - Suite-native defaults execute, including large-N long-context and sharp-bwd sweeps.
+  - Autotuning is still reduced during testing; `--full-matrix` expands the test-case matrix, not the autotune search matrix.
 
 ## Notes
 
@@ -206,3 +240,8 @@ Below are the key matrix dimensions each suite exercises. Most are configurable 
   - `--run-stress`
   - `--full-matrix` (disables reduced bounded defaults in wrappers)
 - The wrappers that expose these suites as pytest tests are in `testing/test_regression_suites.py`.
+- Test runs default `FLARE_TEST_REDUCE_AUTOTUNE=1` so the autotune search space stays reduced even for `--full-matrix` coverage runs.
+- For chunked-path numerical debugging, especially sharp-softmax backward regressions, treat
+  `causal-flare @ git+https://github.com/vpuri3/causal-flare.git@72394e2d2a109be2d8464147c17f10b28f423fcc`
+  as a useful oracle/reference point. That upstream commit is a good baseline for checking
+  whether a chunked backward regression is new versus pre-existing.

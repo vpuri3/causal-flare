@@ -171,7 +171,8 @@ def compile_forward_kernels(
     cfg = _get_chunked_forward_config(
         M=m,
         N=n,
-        D=d,
+        score_head_dim=d,
+        value_head_dim=d,
         dtype=k.dtype,
         chunk_size=None,
         input_precision=input_precision,

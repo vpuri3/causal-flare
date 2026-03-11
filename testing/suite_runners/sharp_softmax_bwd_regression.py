@@ -3,7 +3,7 @@
 from testing.suite_runners.common import *
 
 
-def _sharp_softmax_bwd_regression_suite():
+def _sharp_softmax_bwd_regression_suite(*, shard_index: int | None = None, num_shards: int | None = None):
     if not torch.cuda.is_available():
         print("[FLARE SHARP BWD] CUDA not available, skipping.")
         return
@@ -32,6 +32,16 @@ def _sharp_softmax_bwd_regression_suite():
     fwd_max_abs_max = _env_float("FLARE_SHARP_BWD_FWD_MAX_ABS_MAX", 2e-2)
     decode_modes = _parse_decode_separation_modes("FLARE_SHARP_BWD_DECODE_SEPARATION_MODES")
     expect_fail = _strict_mode_enabled("FLARE_SHARP_BWD_EXPECT_FAIL", default=False)
+    env_num_shards = int(os.environ.get("FLARE_SHARP_BWD_NUM_SHARDS", "1"))
+    env_shard_index = int(os.environ.get("FLARE_SHARP_BWD_SHARD_INDEX", "0"))
+    if num_shards is None:
+        num_shards = env_num_shards
+    if shard_index is None:
+        shard_index = env_shard_index
+    if num_shards <= 0:
+        raise ValueError(f"FLARE_SHARP_BWD_NUM_SHARDS must be positive, got {num_shards}.")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError(f"FLARE_SHARP_BWD_SHARD_INDEX must be in [0, {num_shards}), got {shard_index}.")
     failures: list[str] = []
     total_cases = 0
     failed_cases = 0
@@ -41,7 +51,8 @@ def _sharp_softmax_bwd_regression_suite():
     print("=" * 100)
     print(
         f"[FLARE SHARP BWD] kernel_mode={kernel_mode or 'recurrent'} dtype={dtype} "
-        f"qk_stds={qk_stds} configs={len(configs)} decode_modes={decode_modes}"
+        f"qk_stds={qk_stds} configs={len(configs)} decode_modes={decode_modes} "
+        f"shard={shard_index + 1}/{num_shards}"
     )
     print("[FLARE SHARP BWD] baseline=flare_causal_reference (fp32 by default; override via FLARE_REFERENCE_FP32)")
 
@@ -200,58 +211,64 @@ def _sharp_softmax_bwd_regression_suite():
             del Kdn, Kdr
         torch.cuda.empty_cache()
 
+    cases = []
     for precision in precisions:
-        with _temp_env_var("FLARE_INPUT_PRECISION", precision):
-            print(f"[FLARE SHARP BWD] precision={precision}")
-            for cfg in configs:
-                B = cfg["B"]
-                H = cfg["H"]
-                M = cfg["M"]
-                N = cfg["N"]
-                D = cfg["D"]
-                scale = D ** -0.5
-                for qk_std in qk_stds:
-                    for separate_q_dec, separate_k_dec in decode_modes:
-                        _run_one_case(
-                            precision=precision,
-                            B=B,
-                            H=H,
-                            M=M,
-                            N=N,
-                            D=D,
-                            qk_std=qk_std,
-                            scale=scale,
-                            separate_q_dec=separate_q_dec,
-                            separate_k_dec=separate_k_dec,
-                            stress=False,
-                        )
+        for cfg in configs:
+            for qk_std in qk_stds:
+                for separate_q_dec, separate_k_dec in decode_modes:
+                    cases.append(
+                        {
+                            "precision": precision,
+                            "B": cfg["B"],
+                            "H": cfg["H"],
+                            "M": cfg["M"],
+                            "N": cfg["N"],
+                            "D": cfg["D"],
+                            "qk_std": qk_std,
+                            "separate_q_dec": separate_q_dec,
+                            "separate_k_dec": separate_k_dec,
+                            "stress": False,
+                        }
+                    )
+    for precision in precisions:
+        for cfg in stress_configs:
+            for qk_std in stress_qk_stds:
+                for separate_q_dec, separate_k_dec in decode_modes:
+                    cases.append(
+                        {
+                            "precision": precision,
+                            "B": cfg["B"],
+                            "H": cfg["H"],
+                            "M": cfg["M"],
+                            "N": cfg["N"],
+                            "D": cfg["D"],
+                            "qk_std": qk_std,
+                            "separate_q_dec": separate_q_dec,
+                            "separate_k_dec": separate_k_dec,
+                            "stress": True,
+                        }
+                    )
 
-    # Stress-only regression cases:
-    # focus on non-finite detection + bounded drift under sharp long-context.
-    for precision in precisions:
-        with _temp_env_var("FLARE_INPUT_PRECISION", precision):
-            for cfg in stress_configs:
-                B = cfg["B"]
-                H = cfg["H"]
-                M = cfg["M"]
-                N = cfg["N"]
-                D = cfg["D"]
-                scale = D ** -0.5
-                for qk_std in stress_qk_stds:
-                    for separate_q_dec, separate_k_dec in decode_modes:
-                        _run_one_case(
-                            precision=precision,
-                            B=B,
-                            H=H,
-                            M=M,
-                            N=N,
-                            D=D,
-                            qk_std=qk_std,
-                            scale=scale,
-                            separate_q_dec=separate_q_dec,
-                            separate_k_dec=separate_k_dec,
-                            stress=True,
-                        )
+    selected_cases = [case for idx, case in enumerate(cases) if idx % num_shards == shard_index]
+    print(f"[FLARE SHARP BWD] selected_cases={len(selected_cases)}/{len(cases)}")
+
+    for case in selected_cases:
+        with _temp_env_var("FLARE_INPUT_PRECISION", case["precision"]):
+            if not case["stress"]:
+                print(f"[FLARE SHARP BWD] precision={case['precision']}")
+            _run_one_case(
+                precision=case["precision"],
+                B=case["B"],
+                H=case["H"],
+                M=case["M"],
+                N=case["N"],
+                D=case["D"],
+                qk_std=case["qk_std"],
+                scale=case["D"] ** -0.5,
+                separate_q_dec=case["separate_q_dec"],
+                separate_k_dec=case["separate_k_dec"],
+                stress=case["stress"],
+            )
 
     print(
         f"[FLARE SHARP BWD] summary: failed_cases={failed_cases}/{total_cases} "
@@ -272,3 +289,7 @@ def _sharp_softmax_bwd_regression_suite():
         extra = "" if len(failures) <= 12 else f"\n- ... and {len(failures) - 12} more"
         raise AssertionError(f"FLARE sharp backward regression failed ({len(failures)} issues):\n{summary}{extra}")
     print("[FLARE SHARP BWD] all checks passed.")
+
+
+def _sharp_softmax_bwd_regression_suite_shard(shard_index: int, num_shards: int) -> None:
+    _sharp_softmax_bwd_regression_suite(shard_index=shard_index, num_shards=num_shards)

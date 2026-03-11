@@ -879,16 +879,9 @@ class ChunkedFLARE(autograd.Function):
         )
 
         #---------------------------------------------------------------#
-        # Compute z_prefix_unnormalized = prefix_num * exp(prefix_max): the
-        # absolute-scale weighted-V prefix sum at each chunk boundary.  The
-        # backward re-normalises via LSE_enc (z_run_init = z_prefix_unnorm *
-        # exp(-lse_init)), so prefix_max and prefix_den are not saved.
-        z_prefix_unnormalized = prefix_num * prefix_max.exp().unsqueeze(-1)
-
-        #---------------------------------------------------------------#
-        # Save phase-3 per-token logsumexp trajectory (L) and the
-        # absolute-scale prefix weighted-V sum for the LSE backward path.
-        saved_tensors = [Q_comp, K_comp, V_comp, LSE_enc, LSE_dec, z_prefix_unnormalized]
+        # Save phase-3 per-token logsumexp trajectory (L) and chunk-start prefix
+        # state for the LSE backward path.
+        saved_tensors = [Q_comp, K_comp, V_comp, LSE_enc, LSE_dec, prefix_max, prefix_den, prefix_num]
         if separate_Q_dec:
             saved_tensors.append(Q_dec)
         if separate_K_dec:
@@ -2100,8 +2093,9 @@ def flare_chunk_bwd_lse_p_part(
     V_ptr,
     Q_dec_ptr,
     K_dec_ptr,
-    ZPrefixUnnorm_ptr,
-    LSE_enc_ptr,
+    PrefixMax_ptr,
+    PrefixDen_ptr,
+    PrefixNum_ptr,
     LSE_dec_ptr,
     dO_ptr,
     P_ptr,
@@ -2110,8 +2104,9 @@ def flare_chunk_bwd_lse_p_part(
     stride_q_h, stride_q_m, stride_q_d,
     stride_k_b, stride_k_n, stride_k_h, stride_k_d,
     stride_v_b, stride_v_n, stride_v_h, stride_v_d,
-    stride_zpun_bh, stride_zpun_chunk, stride_zpun_m, stride_zpun_d,
-    stride_lse_b, stride_lse_h, stride_lse_n, stride_lse_m,
+    stride_pmax_bh, stride_pmax_chunk, stride_pmax_m,
+    stride_pden_bh, stride_pden_chunk, stride_pden_m,
+    stride_pnum_bh, stride_pnum_chunk, stride_pnum_m, stride_pnum_d,
     stride_qdb, stride_qdt, stride_qdh, stride_qdd,
     stride_kdh, stride_kdm, stride_kdd,
     stride_lsed_bh, stride_lsed_t,
@@ -2153,29 +2148,36 @@ def flare_chunk_bwd_lse_p_part(
     mask_d = d_offsets < D_VALUE
 
     if not USE_SUBTILED_SCORE_REPLAY:
-        z_prefix_unnorm = tl.load(
-            ZPrefixUnnorm_ptr
-            + pid_bh * stride_zpun_bh
-            + chunk_idx * stride_zpun_chunk
-            + m_offsets[:, None] * stride_zpun_m
-            + d_offsets[None, :] * stride_zpun_d,
-            mask=mask_m[:, None] & mask_d[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        # lse_init = LSE_enc at the last token before this chunk (chunk_start-1).
-        # For chunk 0 there is no prefix, so lse_init = -inf and z_run = 0.
         mask_prefix = mask_m & (chunk_start > 0)
-        lse_init = tl.load(
-            LSE_enc_ptr
-            + pid_b * stride_lse_b
-            + pid_h * stride_lse_h
-            + (chunk_start - 1) * stride_lse_n
-            + m_offsets * stride_lse_m,
+        prefix_max = tl.load(
+            PrefixMax_ptr
+            + pid_bh * stride_pmax_bh
+            + chunk_idx * stride_pmax_chunk
+            + m_offsets * stride_pmax_m,
             mask=mask_prefix,
             other=-float("inf"),
         ).to(tl.float32)
-        lse_run = lse_init
-        z_run = tl.where(mask_prefix[:, None], z_prefix_unnorm * tl.exp(-lse_init[:, None]), 0.0)
+        prefix_den = tl.load(
+            PrefixDen_ptr
+            + pid_bh * stride_pden_bh
+            + chunk_idx * stride_pden_chunk
+            + m_offsets * stride_pden_m,
+            mask=mask_prefix,
+            other=0.0,
+        ).to(tl.float32)
+        prefix_num = tl.load(
+            PrefixNum_ptr
+            + pid_bh * stride_pnum_bh
+            + chunk_idx * stride_pnum_chunk
+            + m_offsets[:, None] * stride_pnum_m
+            + d_offsets[None, :] * stride_pnum_d,
+            mask=mask_m[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        m_run = prefix_max
+        d_run = prefix_den
+        inv_prefix_den = 1.0 / tl.maximum(prefix_den, 1e-20)
+        z_run = tl.where(mask_prefix[:, None], prefix_num * inv_prefix_den[:, None], 0.0)
 
     q_base_ptr = Q_ptr + pid_h * stride_q_h
     t = chunk_start
@@ -2211,10 +2213,13 @@ def flare_chunk_bwd_lse_p_part(
                 s_t = tl.sum(tl.where(t_idx[None, :] == j, s_block, 0.0), axis=1)
                 s_t = tl.where(token_valid & mask_m, s_t, -float("inf"))
 
-                lse_m = tl.maximum(lse_run, s_t)
-                lse_new = lse_m + tl.log(tl.exp(lse_run - lse_m) + tl.exp(s_t - lse_m))
-                coeff_old = tl.exp(lse_run - lse_new)
-                coeff_new = tl.exp(s_t - lse_new)
+                m_new = tl.maximum(m_run, s_t)
+                alpha = tl.exp(m_run - m_new)
+                beta = tl.exp(s_t - m_new)
+                d_new = alpha * d_run + beta
+                inv_d = 1.0 / tl.maximum(d_new, 1e-20)
+                coeff_old = alpha * d_run * inv_d
+                coeff_new = beta * inv_d
 
                 v_ptr = V_ptr + pid_b * stride_v_b + (t + j) * stride_v_n + pid_h * stride_v_h + d_offsets * stride_v_d
                 v_t = tl.load(v_ptr, mask=token_valid & mask_d, other=0.0).to(tl.float32)
@@ -2263,7 +2268,8 @@ def flare_chunk_bwd_lse_p_part(
                     a_t,
                     mask=token_valid & mask_m,
                 )
-                lse_run = lse_new
+                m_run = m_new
+                d_run = d_new
 
             t += BLOCK_T
     else:
@@ -2273,100 +2279,136 @@ def flare_chunk_bwd_lse_p_part(
 
             sub_offsets_0 = m_start + tl.arange(0, BLOCK_M_REPLAY)
             mask_m_sub_0 = sub_offsets_0 < tile_m_end
-            z_prefix_unnorm_sub_0 = tl.load(
-                ZPrefixUnnorm_ptr
-                + pid_bh * stride_zpun_bh
-                + chunk_idx * stride_zpun_chunk
-                + sub_offsets_0[:, None] * stride_zpun_m
-                + d_offsets[None, :] * stride_zpun_d,
-                mask=mask_m_sub_0[:, None] & mask_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
             mask_prefix_sub_0 = mask_m_sub_0 & (chunk_start > 0)
-            lse_init_sub_0 = tl.load(
-                LSE_enc_ptr
-                + pid_b * stride_lse_b
-                + pid_h * stride_lse_h
-                + (chunk_start - 1) * stride_lse_n
-                + sub_offsets_0 * stride_lse_m,
+            prefix_max_sub_0 = tl.load(
+                PrefixMax_ptr
+                + pid_bh * stride_pmax_bh
+                + chunk_idx * stride_pmax_chunk
+                + sub_offsets_0 * stride_pmax_m,
                 mask=mask_prefix_sub_0,
                 other=-float("inf"),
             ).to(tl.float32)
-            lse_run_sub_0 = lse_init_sub_0
-            z_run_sub_0 = tl.where(mask_prefix_sub_0[:, None], z_prefix_unnorm_sub_0 * tl.exp(-lse_init_sub_0[:, None]), 0.0)
+            prefix_den_sub_0 = tl.load(
+                PrefixDen_ptr
+                + pid_bh * stride_pden_bh
+                + chunk_idx * stride_pden_chunk
+                + sub_offsets_0 * stride_pden_m,
+                mask=mask_prefix_sub_0,
+                other=0.0,
+            ).to(tl.float32)
+            prefix_num_sub_0 = tl.load(
+                PrefixNum_ptr
+                + pid_bh * stride_pnum_bh
+                + chunk_idx * stride_pnum_chunk
+                + sub_offsets_0[:, None] * stride_pnum_m
+                + d_offsets[None, :] * stride_pnum_d,
+                mask=mask_m_sub_0[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            m_run_sub_0 = prefix_max_sub_0
+            d_run_sub_0 = prefix_den_sub_0
+            inv_prefix_den_sub_0 = 1.0 / tl.maximum(prefix_den_sub_0, 1e-20)
+            z_run_sub_0 = tl.where(mask_prefix_sub_0[:, None], prefix_num_sub_0 * inv_prefix_den_sub_0[:, None], 0.0)
 
             if NUM_REPLAY_TILES > 1:
                 sub_offsets_1 = m_start + BLOCK_M_REPLAY + tl.arange(0, BLOCK_M_REPLAY)
                 mask_m_sub_1 = sub_offsets_1 < tile_m_end
-                z_prefix_unnorm_sub_1 = tl.load(
-                    ZPrefixUnnorm_ptr
-                    + pid_bh * stride_zpun_bh
-                    + chunk_idx * stride_zpun_chunk
-                    + sub_offsets_1[:, None] * stride_zpun_m
-                    + d_offsets[None, :] * stride_zpun_d,
-                    mask=mask_m_sub_1[:, None] & mask_d[None, :],
-                    other=0.0,
-                ).to(tl.float32)
                 mask_prefix_sub_1 = mask_m_sub_1 & (chunk_start > 0)
-                lse_init_sub_1 = tl.load(
-                    LSE_enc_ptr
-                    + pid_b * stride_lse_b
-                    + pid_h * stride_lse_h
-                    + (chunk_start - 1) * stride_lse_n
-                    + sub_offsets_1 * stride_lse_m,
+                prefix_max_sub_1 = tl.load(
+                    PrefixMax_ptr
+                    + pid_bh * stride_pmax_bh
+                    + chunk_idx * stride_pmax_chunk
+                    + sub_offsets_1 * stride_pmax_m,
                     mask=mask_prefix_sub_1,
                     other=-float("inf"),
                 ).to(tl.float32)
-                lse_run_sub_1 = lse_init_sub_1
-                z_run_sub_1 = tl.where(mask_prefix_sub_1[:, None], z_prefix_unnorm_sub_1 * tl.exp(-lse_init_sub_1[:, None]), 0.0)
+                prefix_den_sub_1 = tl.load(
+                    PrefixDen_ptr
+                    + pid_bh * stride_pden_bh
+                    + chunk_idx * stride_pden_chunk
+                    + sub_offsets_1 * stride_pden_m,
+                    mask=mask_prefix_sub_1,
+                    other=0.0,
+                ).to(tl.float32)
+                prefix_num_sub_1 = tl.load(
+                    PrefixNum_ptr
+                    + pid_bh * stride_pnum_bh
+                    + chunk_idx * stride_pnum_chunk
+                    + sub_offsets_1[:, None] * stride_pnum_m
+                    + d_offsets[None, :] * stride_pnum_d,
+                    mask=mask_m_sub_1[:, None] & mask_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                m_run_sub_1 = prefix_max_sub_1
+                d_run_sub_1 = prefix_den_sub_1
+                inv_prefix_den_sub_1 = 1.0 / tl.maximum(prefix_den_sub_1, 1e-20)
+                z_run_sub_1 = tl.where(mask_prefix_sub_1[:, None], prefix_num_sub_1 * inv_prefix_den_sub_1[:, None], 0.0)
             if NUM_REPLAY_TILES > 2:
                 sub_offsets_2 = m_start + 2 * BLOCK_M_REPLAY + tl.arange(0, BLOCK_M_REPLAY)
                 mask_m_sub_2 = sub_offsets_2 < tile_m_end
-                z_prefix_unnorm_sub_2 = tl.load(
-                    ZPrefixUnnorm_ptr
-                    + pid_bh * stride_zpun_bh
-                    + chunk_idx * stride_zpun_chunk
-                    + sub_offsets_2[:, None] * stride_zpun_m
-                    + d_offsets[None, :] * stride_zpun_d,
-                    mask=mask_m_sub_2[:, None] & mask_d[None, :],
-                    other=0.0,
-                ).to(tl.float32)
                 mask_prefix_sub_2 = mask_m_sub_2 & (chunk_start > 0)
-                lse_init_sub_2 = tl.load(
-                    LSE_enc_ptr
-                    + pid_b * stride_lse_b
-                    + pid_h * stride_lse_h
-                    + (chunk_start - 1) * stride_lse_n
-                    + sub_offsets_2 * stride_lse_m,
+                prefix_max_sub_2 = tl.load(
+                    PrefixMax_ptr
+                    + pid_bh * stride_pmax_bh
+                    + chunk_idx * stride_pmax_chunk
+                    + sub_offsets_2 * stride_pmax_m,
                     mask=mask_prefix_sub_2,
                     other=-float("inf"),
                 ).to(tl.float32)
-                lse_run_sub_2 = lse_init_sub_2
-                z_run_sub_2 = tl.where(mask_prefix_sub_2[:, None], z_prefix_unnorm_sub_2 * tl.exp(-lse_init_sub_2[:, None]), 0.0)
+                prefix_den_sub_2 = tl.load(
+                    PrefixDen_ptr
+                    + pid_bh * stride_pden_bh
+                    + chunk_idx * stride_pden_chunk
+                    + sub_offsets_2 * stride_pden_m,
+                    mask=mask_prefix_sub_2,
+                    other=0.0,
+                ).to(tl.float32)
+                prefix_num_sub_2 = tl.load(
+                    PrefixNum_ptr
+                    + pid_bh * stride_pnum_bh
+                    + chunk_idx * stride_pnum_chunk
+                    + sub_offsets_2[:, None] * stride_pnum_m
+                    + d_offsets[None, :] * stride_pnum_d,
+                    mask=mask_m_sub_2[:, None] & mask_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                m_run_sub_2 = prefix_max_sub_2
+                d_run_sub_2 = prefix_den_sub_2
+                inv_prefix_den_sub_2 = 1.0 / tl.maximum(prefix_den_sub_2, 1e-20)
+                z_run_sub_2 = tl.where(mask_prefix_sub_2[:, None], prefix_num_sub_2 * inv_prefix_den_sub_2[:, None], 0.0)
             if NUM_REPLAY_TILES > 3:
                 sub_offsets_3 = m_start + 3 * BLOCK_M_REPLAY + tl.arange(0, BLOCK_M_REPLAY)
                 mask_m_sub_3 = sub_offsets_3 < tile_m_end
-                z_prefix_unnorm_sub_3 = tl.load(
-                    ZPrefixUnnorm_ptr
-                    + pid_bh * stride_zpun_bh
-                    + chunk_idx * stride_zpun_chunk
-                    + sub_offsets_3[:, None] * stride_zpun_m
-                    + d_offsets[None, :] * stride_zpun_d,
-                    mask=mask_m_sub_3[:, None] & mask_d[None, :],
-                    other=0.0,
-                ).to(tl.float32)
                 mask_prefix_sub_3 = mask_m_sub_3 & (chunk_start > 0)
-                lse_init_sub_3 = tl.load(
-                    LSE_enc_ptr
-                    + pid_b * stride_lse_b
-                    + pid_h * stride_lse_h
-                    + (chunk_start - 1) * stride_lse_n
-                    + sub_offsets_3 * stride_lse_m,
+                prefix_max_sub_3 = tl.load(
+                    PrefixMax_ptr
+                    + pid_bh * stride_pmax_bh
+                    + chunk_idx * stride_pmax_chunk
+                    + sub_offsets_3 * stride_pmax_m,
                     mask=mask_prefix_sub_3,
                     other=-float("inf"),
                 ).to(tl.float32)
-                lse_run_sub_3 = lse_init_sub_3
-                z_run_sub_3 = tl.where(mask_prefix_sub_3[:, None], z_prefix_unnorm_sub_3 * tl.exp(-lse_init_sub_3[:, None]), 0.0)
+                prefix_den_sub_3 = tl.load(
+                    PrefixDen_ptr
+                    + pid_bh * stride_pden_bh
+                    + chunk_idx * stride_pden_chunk
+                    + sub_offsets_3 * stride_pden_m,
+                    mask=mask_prefix_sub_3,
+                    other=0.0,
+                ).to(tl.float32)
+                prefix_num_sub_3 = tl.load(
+                    PrefixNum_ptr
+                    + pid_bh * stride_pnum_bh
+                    + chunk_idx * stride_pnum_chunk
+                    + sub_offsets_3[:, None] * stride_pnum_m
+                    + d_offsets[None, :] * stride_pnum_d,
+                    mask=mask_m_sub_3[:, None] & mask_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                m_run_sub_3 = prefix_max_sub_3
+                d_run_sub_3 = prefix_den_sub_3
+                inv_prefix_den_sub_3 = 1.0 / tl.maximum(prefix_den_sub_3, 1e-20)
+                z_run_sub_3 = tl.where(mask_prefix_sub_3[:, None], prefix_num_sub_3 * inv_prefix_den_sub_3[:, None], 0.0)
 
             while t < chunk_end:
                 t_offsets = t + t_local
@@ -2462,10 +2504,13 @@ def flare_chunk_bwd_lse_p_part(
 
                     s_t_0 = tl.sum(tl.where(select_j[None, :], s_block_0, 0.0), axis=1)
                     s_t_0 = tl.where(token_valid & mask_m_sub_0, s_t_0, -float("inf"))
-                    lse_m_0 = tl.maximum(lse_run_sub_0, s_t_0)
-                    lse_new_0 = lse_m_0 + tl.log(tl.exp(lse_run_sub_0 - lse_m_0) + tl.exp(s_t_0 - lse_m_0))
-                    coeff_old_0 = tl.exp(lse_run_sub_0 - lse_new_0)
-                    coeff_new_0 = tl.exp(s_t_0 - lse_new_0)
+                    m_new_0 = tl.maximum(m_run_sub_0, s_t_0)
+                    alpha_0 = tl.exp(m_run_sub_0 - m_new_0)
+                    beta_0 = tl.exp(s_t_0 - m_new_0)
+                    d_new_0 = alpha_0 * d_run_sub_0 + beta_0
+                    inv_d_0 = 1.0 / tl.maximum(d_new_0, 1e-20)
+                    coeff_old_0 = alpha_0 * d_run_sub_0 * inv_d_0
+                    coeff_new_0 = beta_0 * inv_d_0
                     z_new_0 = coeff_old_0[:, None] * z_run_sub_0 + coeff_new_0[:, None] * v_t[None, :]
                     p_part_0 = tl.sum(z_new_0 * u_t[None, :], axis=1)
                     p_ptr_0 = P_ptr + pid_bh * stride_p_bh + token_idx * stride_p_t + sub_offsets_0 * stride_p_m
@@ -2503,16 +2548,20 @@ def flare_chunk_bwd_lse_p_part(
                         a_t_0,
                         mask=token_valid & mask_m_sub_0,
                     )
-                    lse_run_sub_0 = lse_new_0
+                    m_run_sub_0 = m_new_0
+                    d_run_sub_0 = d_new_0
                     z_run_sub_0 = z_new_0
 
                     if NUM_REPLAY_TILES > 1:
                         s_t_1 = tl.sum(tl.where(select_j[None, :], s_block_1, 0.0), axis=1)
                         s_t_1 = tl.where(token_valid & mask_m_sub_1, s_t_1, -float("inf"))
-                        lse_m_1 = tl.maximum(lse_run_sub_1, s_t_1)
-                        lse_new_1 = lse_m_1 + tl.log(tl.exp(lse_run_sub_1 - lse_m_1) + tl.exp(s_t_1 - lse_m_1))
-                        coeff_old_1 = tl.exp(lse_run_sub_1 - lse_new_1)
-                        coeff_new_1 = tl.exp(s_t_1 - lse_new_1)
+                        m_new_1 = tl.maximum(m_run_sub_1, s_t_1)
+                        alpha_1 = tl.exp(m_run_sub_1 - m_new_1)
+                        beta_1 = tl.exp(s_t_1 - m_new_1)
+                        d_new_1 = alpha_1 * d_run_sub_1 + beta_1
+                        inv_d_1 = 1.0 / tl.maximum(d_new_1, 1e-20)
+                        coeff_old_1 = alpha_1 * d_run_sub_1 * inv_d_1
+                        coeff_new_1 = beta_1 * inv_d_1
                         z_new_1 = coeff_old_1[:, None] * z_run_sub_1 + coeff_new_1[:, None] * v_t[None, :]
                         p_part_1 = tl.sum(z_new_1 * u_t[None, :], axis=1)
                         p_ptr_1 = P_ptr + pid_bh * stride_p_bh + token_idx * stride_p_t + sub_offsets_1 * stride_p_m
@@ -2550,15 +2599,19 @@ def flare_chunk_bwd_lse_p_part(
                             a_t_1,
                             mask=token_valid & mask_m_sub_1,
                         )
-                        lse_run_sub_1 = lse_new_1
+                        m_run_sub_1 = m_new_1
+                        d_run_sub_1 = d_new_1
                         z_run_sub_1 = z_new_1
                     if NUM_REPLAY_TILES > 2:
                         s_t_2 = tl.sum(tl.where(select_j[None, :], s_block_2, 0.0), axis=1)
                         s_t_2 = tl.where(token_valid & mask_m_sub_2, s_t_2, -float("inf"))
-                        lse_m_2 = tl.maximum(lse_run_sub_2, s_t_2)
-                        lse_new_2 = lse_m_2 + tl.log(tl.exp(lse_run_sub_2 - lse_m_2) + tl.exp(s_t_2 - lse_m_2))
-                        coeff_old_2 = tl.exp(lse_run_sub_2 - lse_new_2)
-                        coeff_new_2 = tl.exp(s_t_2 - lse_new_2)
+                        m_new_2 = tl.maximum(m_run_sub_2, s_t_2)
+                        alpha_2 = tl.exp(m_run_sub_2 - m_new_2)
+                        beta_2 = tl.exp(s_t_2 - m_new_2)
+                        d_new_2 = alpha_2 * d_run_sub_2 + beta_2
+                        inv_d_2 = 1.0 / tl.maximum(d_new_2, 1e-20)
+                        coeff_old_2 = alpha_2 * d_run_sub_2 * inv_d_2
+                        coeff_new_2 = beta_2 * inv_d_2
                         z_new_2 = coeff_old_2[:, None] * z_run_sub_2 + coeff_new_2[:, None] * v_t[None, :]
                         p_part_2 = tl.sum(z_new_2 * u_t[None, :], axis=1)
                         p_ptr_2 = P_ptr + pid_bh * stride_p_bh + token_idx * stride_p_t + sub_offsets_2 * stride_p_m
@@ -2596,15 +2649,19 @@ def flare_chunk_bwd_lse_p_part(
                             a_t_2,
                             mask=token_valid & mask_m_sub_2,
                         )
-                        lse_run_sub_2 = lse_new_2
+                        m_run_sub_2 = m_new_2
+                        d_run_sub_2 = d_new_2
                         z_run_sub_2 = z_new_2
                     if NUM_REPLAY_TILES > 3:
                         s_t_3 = tl.sum(tl.where(select_j[None, :], s_block_3, 0.0), axis=1)
                         s_t_3 = tl.where(token_valid & mask_m_sub_3, s_t_3, -float("inf"))
-                        lse_m_3 = tl.maximum(lse_run_sub_3, s_t_3)
-                        lse_new_3 = lse_m_3 + tl.log(tl.exp(lse_run_sub_3 - lse_m_3) + tl.exp(s_t_3 - lse_m_3))
-                        coeff_old_3 = tl.exp(lse_run_sub_3 - lse_new_3)
-                        coeff_new_3 = tl.exp(s_t_3 - lse_new_3)
+                        m_new_3 = tl.maximum(m_run_sub_3, s_t_3)
+                        alpha_3 = tl.exp(m_run_sub_3 - m_new_3)
+                        beta_3 = tl.exp(s_t_3 - m_new_3)
+                        d_new_3 = alpha_3 * d_run_sub_3 + beta_3
+                        inv_d_3 = 1.0 / tl.maximum(d_new_3, 1e-20)
+                        coeff_old_3 = alpha_3 * d_run_sub_3 * inv_d_3
+                        coeff_new_3 = beta_3 * inv_d_3
                         z_new_3 = coeff_old_3[:, None] * z_run_sub_3 + coeff_new_3[:, None] * v_t[None, :]
                         p_part_3 = tl.sum(z_new_3 * u_t[None, :], axis=1)
                         p_ptr_3 = P_ptr + pid_bh * stride_p_bh + token_idx * stride_p_t + sub_offsets_3 * stride_p_m
@@ -2642,7 +2699,8 @@ def flare_chunk_bwd_lse_p_part(
                             a_t_3,
                             mask=token_valid & mask_m_sub_3,
                         )
-                        lse_run_sub_3 = lse_new_3
+                        m_run_sub_3 = m_new_3
+                        d_run_sub_3 = d_new_3
                         z_run_sub_3 = z_new_3
 
                 t += BLOCK_T
@@ -2665,10 +2723,13 @@ def flare_chunk_bwd_lse_p_part(
                     s_t += tl.sum(q_tile * k_tile[None, :], axis=1)
                 s_t = tl.where(mask_m, s_t * scale, -float("inf"))
 
-                lse_m = tl.maximum(lse_run, s_t)
-                lse_new = lse_m + tl.log(tl.exp(lse_run - lse_m) + tl.exp(s_t - lse_m))
-                coeff_old = tl.exp(lse_run - lse_new)
-                coeff_new = tl.exp(s_t - lse_new)
+                m_new = tl.maximum(m_run, s_t)
+                alpha = tl.exp(m_run - m_new)
+                beta = tl.exp(s_t - m_new)
+                d_new = alpha * d_run + beta
+                inv_d = 1.0 / tl.maximum(d_new, 1e-20)
+                coeff_old = alpha * d_run * inv_d
+                coeff_new = beta * inv_d
 
                 v_ptr = V_ptr + pid_b * stride_v_b + t * stride_v_n + pid_h * stride_v_h + d_offsets * stride_v_d
                 v_t = tl.load(v_ptr, mask=mask_d, other=0.0).to(tl.float32)
@@ -2702,7 +2763,8 @@ def flare_chunk_bwd_lse_p_part(
                 tl.store(G_ptr + pid_bh * stride_g_bh + t * stride_g_t + m_offsets * stride_g_m, g_t, mask=mask_m)
                 a_t = tl.where(mask_m, coeff_new, 0.0)
                 tl.store(A_ptr + pid_bh * stride_a_bh + t * stride_a_t + m_offsets * stride_a_m, a_t, mask=mask_m)
-                lse_run = lse_new
+                m_run = m_new
+                d_run = d_new
                 t += 1
 
 
@@ -4350,15 +4412,15 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
     separate_K_dec = getattr(ctx, "separate_K_dec", False)
     weight_sharing_enc_dec = getattr(ctx, "weight_sharing_enc_dec", True)
     saved = ctx.saved_tensors
-    expected_len = 6 + int(separate_Q_dec) + int(separate_K_dec)
+    expected_len = 8 + int(separate_Q_dec) + int(separate_K_dec)
     if len(saved) != expected_len:
         raise RuntimeError(
             f"ChunkedFLARE backward expected {expected_len} saved tensors "
-            f"(6 base + separate_Q_dec={separate_Q_dec} + separate_K_dec={separate_K_dec}), got {len(saved)}."
+            f"(8 base + separate_Q_dec={separate_Q_dec} + separate_K_dec={separate_K_dec}), got {len(saved)}."
         )
 
-    Q, K, V, LSE_enc_ctx, LSE_dec, z_prefix_unnormalized = saved[:6]
-    idx = 6
+    Q, K, V, LSE_enc_ctx, LSE_dec, prefix_max, prefix_den, prefix_num = saved[:8]
+    idx = 8
     if separate_Q_dec:
         Q_dec_saved = saved[idx]
         idx += 1
@@ -4551,12 +4613,13 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
         return flare_chunk_bwd_lse_p_part[
             lambda meta: (BH, num_chunks * num_m_tiles, triton.cdiv(Dv, meta["BLOCK_D"]))
         ](
-            Q, K, V, Q_dec_saved, K_dec_saved, z_prefix_unnormalized, LSE_enc_ctx, LSE_dec, dO_bnhd, p_buf, g_buf, a_buf,
+            Q, K, V, Q_dec_saved, K_dec_saved, prefix_max, prefix_den, prefix_num, LSE_dec, dO_bnhd, p_buf, g_buf, a_buf,
             Q.stride(0), Q.stride(1), Q.stride(2),
             K.stride(0), K.stride(1), K.stride(2), K.stride(3),
             V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-            z_prefix_unnormalized.stride(0), z_prefix_unnormalized.stride(1), z_prefix_unnormalized.stride(2), z_prefix_unnormalized.stride(3),
-            LSE_enc_ctx.stride(0), LSE_enc_ctx.stride(1), LSE_enc_ctx.stride(2), LSE_enc_ctx.stride(3),
+            prefix_max.stride(0), prefix_max.stride(1), prefix_max.stride(2),
+            prefix_den.stride(0), prefix_den.stride(1), prefix_den.stride(2),
+            prefix_num.stride(0), prefix_num.stride(1), prefix_num.stride(2), prefix_num.stride(3),
             Q_dec_saved.stride(0), Q_dec_saved.stride(1), Q_dec_saved.stride(2), Q_dec_saved.stride(3),
             K_dec_saved.stride(0), K_dec_saved.stride(1), K_dec_saved.stride(2),
             LSE_dec.stride(0), LSE_dec.stride(1),
