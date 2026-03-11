@@ -2,11 +2,11 @@
 
 ## Session Startup
 - At the start of every session, read `TODO.md` and align ongoing work with current priorities.
-- For complex user queries, consider writing a short task list up front so progress and completion status are clear.
 - Before starting opportunistic refactors or side quests, check whether the request aligns with current `TODO.md` priorities.
 
 ## Workflow Expectations
 - For complex tasks, state key assumptions early when behavior, masking semantics, shapes, or numerical expectations are ambiguous.
+- For complex user queries, consider writing a short task list up front so progress and completion status are clear.
 - Prefer the smallest safe change that solves the requested problem; avoid incidental refactors unless they are required for correctness, maintainability, or testability.
 - If work is blocked, report exactly what is blocked, what was tried, and what remains unverified.
 - In final summaries for substantial tasks, clearly separate what was completed, what was not completed, and what was not verified.
@@ -54,7 +54,7 @@
 - After runs, scan logs for NaN/Inf, unstable gradients, or major perf regressions and summarize findings.
 
 ## Commit & Pull Request Guidelines
-- Use short, imperative commit subjects.
+- Use detailed, imperative commit messages.
 - In PRs, summarize behavior changes, list tests run (or why not), and include perf notes for kernel changes.
 
 ## Security & Configuration Tips
