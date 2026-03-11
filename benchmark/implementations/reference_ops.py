@@ -7,19 +7,19 @@ from causal_flare._common import _resolve_attn_scale
 def flare_noncausal(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, scale: float | None = None) -> torch.Tensor:
     if Q.dim() != 3 or K.dim() != 4 or V.dim() != 4:
         raise ValueError(
-            "flare_noncausal expects Q [H, M, D] and K/V [B, N, H, D]. "
+            "flare_noncausal expects Q [H, M, D_k] and K/V [B, N, H, D]. "
             f"Got Q.dim={Q.dim()}, K.dim={K.dim()}, V.dim={V.dim()}"
         )
-    if K.size() != V.size():
-        raise ValueError(f"K and V must have the same shape. Got K={tuple(K.shape)}, V={tuple(V.shape)}")
+    if K.shape[:3] != V.shape[:3]:
+        raise ValueError(f"K and V must agree on [B, N, H]. Got K={tuple(K.shape)}, V={tuple(V.shape)}")
     if Q.size(0) != K.size(2) or Q.size(2) != K.size(3):
         raise ValueError(
-            "Expected Q [H, M, D] and K/V [B, N, H, D] with matching H,D. "
+            "Expected Q [H, M, D_k] and K [B, N, H, D_k] with matching H,D_k. "
             f"Got Q={tuple(Q.shape)}, K={tuple(K.shape)}"
         )
 
-    B, _, _, D = K.size()
-    scale = _resolve_attn_scale(scale, D)
+    B, _, _, D_score = K.size()
+    scale = _resolve_attn_scale(scale, D_score)
     Q = Q.unsqueeze(0).expand(B, -1, -1, -1)
     K = K.permute(0, 2, 1, 3)
     V = V.permute(0, 2, 1, 3)

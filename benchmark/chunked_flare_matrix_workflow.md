@@ -6,7 +6,8 @@ Current source of truth for which knobs are still structural versus autotuned:
 
 This workflow turns launch-config tuning into a repeatable sweep over the expected deployment matrix:
 
-- `D = 16, 32, 64, 96, 128, 192, 256, 384, 512`
+- `D_k = 16, 32, 64, 96, 128, 192, 256, 384, 512`
+- `D_v = D_k` for baseline sweeps, plus targeted mixed-dimension confirmations such as `D_k=64, D_v=128`
 - `M = 16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048`
 - `N = 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072`
 - `BH = multiples of 4`
@@ -66,7 +67,7 @@ python benchmark/tune_chunked_flare_matrix.py \
 Goal:
 
 - identify width-driven winners for:
-  - forward `BLOCK_D`, `BLOCK_K`, and per-phase launches
+  - forward `BLOCK_D` over `D_v`, `BLOCK_K` over `D_k`, and per-phase launches
   - backward replay/QK launches and wide-D replay tile choices
 
 Promote only patterns that win consistently across neighboring `D` buckets.

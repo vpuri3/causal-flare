@@ -86,20 +86,33 @@ def _case_key(
     m: int | None,
     batch_size: int,
     num_heads: int,
-    head_dim: int,
+    score_head_dim: int,
+    value_head_dim: int,
     dtype: str,
 ) -> tuple[Any, ...]:
-    return (provider, int(n), None if m is None else int(m), int(batch_size), int(num_heads), int(head_dim), dtype)
+    return (
+        provider,
+        int(n),
+        None if m is None else int(m),
+        int(batch_size),
+        int(num_heads),
+        int(score_head_dim),
+        int(value_head_dim),
+        dtype,
+    )
 
 
 def _case_key_from_row(row: dict[str, Any]) -> tuple[Any, ...]:
+    score_head_dim = int(row.get("score_head_dim", row.get("head_dim")))
+    value_head_dim = int(row.get("value_head_dim", score_head_dim))
     return _case_key(
         provider=str(row["provider"]),
         n=int(row["N"]),
         m=None if row.get("M") is None else int(row["M"]),
         batch_size=int(row["batch_size"]),
         num_heads=int(row["num_heads"]),
-        head_dim=int(row["head_dim"]),
+        score_head_dim=score_head_dim,
+        value_head_dim=value_head_dim,
         dtype=str(row["dtype"]),
     )
 
@@ -127,7 +140,15 @@ def summarize_latest(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         by_key[_case_key_from_row(row)] = row
     data = list(by_key.values())
-    data.sort(key=lambda r: (r["provider"], float("inf") if r["M"] is None else int(r["M"]), int(r["N"])))
+    data.sort(
+        key=lambda r: (
+            r["provider"],
+            float("inf") if r["M"] is None else int(r["M"]),
+            int(r["N"]),
+            int(r.get("score_head_dim", r.get("head_dim"))),
+            int(r.get("value_head_dim", r.get("score_head_dim", r.get("head_dim")))),
+        )
+    )
     return data
 
 
@@ -158,16 +179,17 @@ def _build_flare_step_fn(
     h: int,
     n: int,
     m: int,
-    d: int,
+    d_score: int,
+    d_value: int,
     dtype: torch.dtype,
     device: torch.device,
     scale: float,
     flare_chunk_size: int | None,
     flare_input_precision: str | None,
 ):
-    q = torch.randn(h, m, d, device=device, dtype=dtype, requires_grad=True)
-    k = torch.randn(b, n, h, d, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(b, n, h, d, device=device, dtype=dtype, requires_grad=True)
+    q = torch.randn(h, m, d_score, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(b, n, h, d_score, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(b, n, h, d_value, device=device, dtype=dtype, requires_grad=True)
     tensors = [q, k, v]
 
     def run_step() -> None:
@@ -225,7 +247,8 @@ def benchmark_one_case(
     case: BenchCase,
     batch_size: int,
     num_heads: int,
-    head_dim: int,
+    score_head_dim: int,
+    value_head_dim: int,
     dtype: torch.dtype,
     dtype_name: str,
     device: torch.device,
@@ -238,7 +261,7 @@ def benchmark_one_case(
     run_tag: str,
     device_name: str,
 ) -> dict[str, Any]:
-    scale = head_dim ** -0.5 if head_dim > 8 else 1.0
+    scale = score_head_dim ** -0.5 if score_head_dim > 8 else 1.0
     t0 = time.time()
     base_row: dict[str, Any] = {
         "run_tag": run_tag,
@@ -248,7 +271,8 @@ def benchmark_one_case(
         "M": case.m,
         "batch_size": batch_size,
         "num_heads": num_heads,
-        "head_dim": head_dim,
+        "score_head_dim": score_head_dim,
+        "value_head_dim": value_head_dim,
         "dtype": dtype_name,
         "device": str(device),
         "device_name": device_name,
@@ -276,7 +300,8 @@ def benchmark_one_case(
                 h=num_heads,
                 n=case.n,
                 m=case.m,
-                d=head_dim,
+                d_score=score_head_dim,
+                d_value=value_head_dim,
                 dtype=dtype,
                 device=device,
                 scale=scale,
@@ -288,7 +313,7 @@ def benchmark_one_case(
                 b=batch_size,
                 h=num_heads,
                 n=case.n,
-                d=head_dim,
+                d=score_head_dim,
                 dtype=dtype,
                 device=device,
                 scale=scale,
@@ -368,20 +393,28 @@ def run_benchmark(args: argparse.Namespace, output_dir: Path) -> pd.DataFrame:
             m=case.m,
             batch_size=args.batch_size,
             num_heads=args.num_heads,
-            head_dim=args.head_dim,
+            score_head_dim=args.score_head_dim,
+            value_head_dim=args.value_head_dim,
             dtype=args.dtype,
         )
         if (not args.rerun_existing) and key in existing_keys:
             skipped += 1
-            print(f"[{idx:02d}/{len(cases)}] skip existing: provider={case.provider} N={case.n} M={case.m}")
+            print(
+                f"[{idx:02d}/{len(cases)}] skip existing: provider={case.provider} N={case.n} M={case.m} "
+                f"Dk={args.score_head_dim} Dv={args.value_head_dim}"
+            )
             continue
 
-        print(f"[{idx:02d}/{len(cases)}] run: provider={case.provider} N={case.n} M={case.m}")
+        print(
+            f"[{idx:02d}/{len(cases)}] run: provider={case.provider} N={case.n} M={case.m} "
+            f"Dk={args.score_head_dim} Dv={args.value_head_dim}"
+        )
         row = benchmark_one_case(
             case=case,
             batch_size=args.batch_size,
             num_heads=args.num_heads,
-            head_dim=args.head_dim,
+            score_head_dim=args.score_head_dim,
+            value_head_dim=args.value_head_dim,
             dtype=dtype,
             dtype_name=args.dtype,
             device=device,
@@ -488,14 +521,24 @@ def run_plot(args: argparse.Namespace, output_dir: Path) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Benchmark FLARE chunk Triton vs FA2 Triton train-step times across sequence lengths."
+        description=(
+            "Benchmark FLARE chunk Triton vs FA2 Triton train-step times across sequence lengths. "
+            "FLARE supports score/value head-dimension splits; FA2 requires equal score/value dims."
+        )
     )
     parser.add_argument("--mode", choices=["benchmark", "plot", "both"], default="benchmark")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-heads", type=int, default=16)
-    parser.add_argument("--head-dim", type=int, default=32)
+    parser.add_argument("--score-head-dim", type=int, default=32, help="Score/logit head dimension D_k used by Q and K.")
+    parser.add_argument(
+        "--value-head-dim",
+        type=int,
+        default=None,
+        help="Value/output head dimension D_v used by V and Y. Default matches --score-head-dim.",
+    )
+    parser.add_argument("--head-dim", dest="score_head_dim", type=int, help=argparse.SUPPRESS)
     parser.add_argument(
         "--seq-lengths",
         nargs="+",
@@ -512,7 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rep", type=int, default=5, help="Timed repetitions for triton.testing.do_bench")
     parser.add_argument("--no-precompile", action="store_true", help="Disable one compile warmup step before timing")
     parser.add_argument("--rerun-existing", action="store_true", help="Rerun cases even if already present in raw JSONL")
-    parser.add_argument("--skip-fa2", action="store_true")
+    parser.add_argument("--skip-fa2", action="store_true", help="Skip FlashAttention2 runs. Required for mixed D_k/D_v benchmarks.")
     parser.add_argument("--skip-flare", action="store_true")
     parser.add_argument("--flare-chunk-size", type=int, default=None)
     parser.add_argument(
@@ -543,9 +586,11 @@ def main() -> None:
 
     args.seq_lengths = parse_tokens_list(args.seq_lengths) if args.seq_lengths is not None else list(DEFAULT_SEQ_LENGTHS)
     args.flare_m = parse_tokens_list(args.flare_m) if args.flare_m is not None else list(DEFAULT_FLARE_M)
+    if args.value_head_dim is None:
+        args.value_head_dim = args.score_head_dim
 
-    if args.num_heads <= 0 or args.head_dim <= 0:
-        raise ValueError("num-heads and head-dim must be > 0.")
+    if args.num_heads <= 0 or args.score_head_dim <= 0 or args.value_head_dim <= 0:
+        raise ValueError("num-heads, score-head-dim, and value-head-dim must be > 0.")
     if any(n <= 0 for n in args.seq_lengths):
         raise ValueError(f"All sequence lengths must be > 0, got {args.seq_lengths}")
     if any(m <= 0 for m in args.flare_m):
@@ -556,8 +601,16 @@ def main() -> None:
         raise ValueError(f"All sequence lengths must be multiples of 128 for FA2 Triton backward: {args.seq_lengths}")
     if any((m % 16) != 0 for m in args.flare_m):
         raise ValueError(f"All FLARE M values must be multiples of 16: {args.flare_m}")
-    if args.head_dim not in {16, 32, 64, 128, 256}:
-        raise ValueError(f"FA2 Triton expects head_dim in {{16, 32, 64, 128, 256}}; got {args.head_dim}")
+    if not args.skip_fa2:
+        if args.score_head_dim != args.value_head_dim:
+            raise ValueError(
+                "FA2 benchmarking fundamentally requires score_head_dim == value_head_dim. "
+                "Use --skip-fa2 for mixed-dimension FLARE-only train-step benchmarks."
+            )
+        if args.score_head_dim not in {16, 32, 64, 128, 256}:
+            raise ValueError(
+                f"FA2 Triton expects score_head_dim in {{16, 32, 64, 128, 256}}; got {args.score_head_dim}"
+            )
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True

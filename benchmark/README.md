@@ -14,6 +14,7 @@ Runtime entry point:
 
 Benchmark tools:
 
+- [`benchmark_prefill_decode.py`](./benchmark_prefill_decode.py)
 - [`profile_chunked_flare.py`](./profile_chunked_flare.py)
 - [`tune_chunked_flare_matrix.py`](./tune_chunked_flare_matrix.py)
 - [`chunked_flare_matrix_workflow.md`](./chunked_flare_matrix_workflow.md)
@@ -42,6 +43,8 @@ Runtime entry point:
 
 Benchmark tools:
 
+- [`benchmark_prefill_decode.py`](./benchmark_prefill_decode.py)
+- [`benchmark_train_step.py`](./benchmark_train_step.py)
 - [`profile_flare_inference.py`](./profile_flare_inference.py)
 - [`tune_flare_inference_matrix.py`](./tune_flare_inference_matrix.py)
 - [`flare_inference_matrix_workflow.md`](./flare_inference_matrix_workflow.md)
@@ -58,6 +61,13 @@ Inference is split into prefill and decode:
 Practical implication:
 
 - Decode benchmarking should compare end-to-end latency and per-kernel profile totals, not try to brute-force runtime launch envs that no longer exist.
+
+### Head-Dimension Terminology
+
+- `score_head_dim` / `D_k`: the inner dimension used by `Q` and `K` for score/logit reductions and attention scaling.
+- `value_head_dim` / `D_v`: the inner dimension used by `V`, outputs `Y`, and recurrent numerator/state storage.
+- FLARE inference and chunked training benchmarks can exercise mixed-dimension cases such as `D_k=64, D_v=128`.
+- FlashAttention2 comparison paths still fundamentally require `D_k == D_v`.
 
 ## What To Sweep
 
@@ -89,6 +99,24 @@ Decode:
 
 - no runtime launch env sweep
 - measure the runtime autotuned path directly
+
+Example mixed-dimension benchmark:
+
+```bash
+python benchmark/benchmark_prefill_decode.py \
+  --score-head-dim 64 \
+  --value-head-dim 128 \
+  --bench-modes prefill decode
+```
+
+Example mixed-dimension train-step benchmark:
+
+```bash
+python benchmark/benchmark_train_step.py \
+  --score-head-dim 64 \
+  --value-head-dim 128 \
+  --skip-fa2
+```
 
 ## Notes
 

@@ -1,4 +1,9 @@
+import os
+
 import pytest
+
+
+os.environ.setdefault("FLARE_TEST_REDUCE_AUTOTUNE", "1")
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

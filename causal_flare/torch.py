@@ -1,6 +1,26 @@
 from ._common import *
 
 
+def _validate_flare_qkv_layouts(Q, K, V, *, name: str):
+    if Q.dim() != 3 or K.dim() != 4 or V.dim() != 4:
+        raise ValueError(
+            f"{name} expects Q [H, M, D_k] and K/V [B, N, H, D]. "
+            f"Got Q.dim()={Q.dim()}, K.dim()={K.dim()}, V.dim()={V.dim()}"
+        )
+    if K.shape[:3] != V.shape[:3]:
+        raise ValueError(
+            f"{name} expects K and V to agree on [B, N, H]. Got K.shape={K.shape} and V.shape={V.shape}"
+        )
+    if Q.size(0) != K.size(2) or Q.size(2) != K.size(3):
+        raise ValueError(
+            f"{name} expects Q [H, M, D_k] and K [B, N, H, D_k] with matching H,D_k. "
+            f"Got Q.shape={Q.shape} and K.shape={K.shape}"
+        )
+    H, M, D_score = Q.shape
+    B, N, _, D_value = V.shape
+    return B, N, H, M, D_score, D_value
+
+
 def _resolve_flare_causal_decode_inputs(Q_enc, K_enc, Q_dec=None, K_dec=None):
     separate_Q_dec = Q_dec is not None
     separate_K_dec = K_dec is not None
@@ -38,22 +58,8 @@ def _resolve_flare_causal_decode_inputs(Q_enc, K_enc, Q_dec=None, K_dec=None):
 
 
 def flare_recurrent_pytorch(Q, K, V, scale=None, Q_dec=None, K_dec=None):
-    if Q.dim() != 3 or K.dim() != 4 or V.dim() != 4:
-        raise ValueError(
-            "Recurrent FLARE expects Q [H, M, D] and K/V [B, N, H, D]. "
-            f"Got Q.dim()={Q.dim()}, K.dim()={K.dim()}, V.dim()={V.dim()}"
-        )
-    if K.size() != V.size():
-        raise ValueError(f"K and V must have the same shape. Got K.shape={K.shape} and V.shape={V.shape}")
-    if Q.size(0) != K.size(2) or Q.size(2) != K.size(3):
-        raise ValueError(
-            "Expected Q [H, M, D] and K/V [B, N, H, D] with matching H,D. "
-            f"Got Q.shape={Q.shape} and K.shape={K.shape}"
-        )
-
-    B, T, _, _ = K.size()
-    H, M, D = Q.size()
-    scale = _resolve_attn_scale(scale, D)
+    B, T, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q, K, V, name="Recurrent FLARE")
+    scale = _resolve_attn_scale(scale, D_score)
     Q_dec, K_dec, separate_Q_dec, separate_K_dec, weight_sharing_enc_dec = _resolve_flare_causal_decode_inputs(
         Q, K, Q_dec, K_dec
     )
@@ -66,10 +72,10 @@ def flare_recurrent_pytorch(Q, K, V, scale=None, Q_dec=None, K_dec=None):
     Q_dec_f = Q_dec.float().permute(0, 2, 1, 3).contiguous() if separate_Q_dec else K_f
     K_dec_f = K_dec.float().unsqueeze(0).expand(B, -1, -1, -1) if separate_K_dec else Q_f
 
-    U = torch.zeros((B, H, M, D), device=device, dtype=torch.float32)
+    U = torch.zeros((B, H, M, D_value), device=device, dtype=torch.float32)
     d = torch.zeros((B, H, M), device=device, dtype=torch.float32)
     m = torch.full((B, H, M), -float("inf"), device=device, dtype=torch.float32)
-    Y = torch.empty((B, H, T, D), device=device, dtype=out_dtype)
+    Y = torch.empty((B, H, T, D_value), device=device, dtype=out_dtype)
 
     for t in range(T):
         k_t = K_f[:, :, t, :]
@@ -95,22 +101,8 @@ def flare_recurrent_pytorch(Q, K, V, scale=None, Q_dec=None, K_dec=None):
 
 
 def _flare_recurrent_dense_lse_forward_state(Q, K, V, scale=None, Q_dec=None, K_dec=None):
-    if Q.dim() != 3 or K.dim() != 4 or V.dim() != 4:
-        raise ValueError(
-            "Recurrent FLARE expects Q [H, M, D] and K/V [B, N, H, D]. "
-            f"Got Q.dim()={Q.dim()}, K.dim()={K.dim()}, V.dim()={V.dim()}"
-        )
-    if K.size() != V.size():
-        raise ValueError(f"K and V must have the same shape. Got K.shape={K.shape} and V.shape={V.shape}")
-    if Q.size(0) != K.size(2) or Q.size(2) != K.size(3):
-        raise ValueError(
-            "Expected Q [H, M, D] and K/V [B, N, H, D] with matching H,D. "
-            f"Got Q.shape={Q.shape} and K.shape={K.shape}"
-        )
-
-    B, T, _, _ = K.size()
-    H, M, D = Q.size()
-    scale = _resolve_attn_scale(scale, D)
+    B, T, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q, K, V, name="Recurrent FLARE")
+    scale = _resolve_attn_scale(scale, D_score)
     Q_dec, K_dec, separate_Q_dec, separate_K_dec, weight_sharing_enc_dec = _resolve_flare_causal_decode_inputs(
         Q, K, Q_dec, K_dec
     )
@@ -133,8 +125,8 @@ def _flare_recurrent_dense_lse_forward_state(Q, K, V, scale=None, Q_dec=None, K_
 
     m_state = torch.full((B, H, M), -float("inf"), device=Q.device, dtype=torch.float32)
     d_state = torch.zeros((B, H, M), device=Q.device, dtype=torch.float32)
-    u_state = torch.zeros((B, H, M, D), device=Q.device, dtype=torch.float32)
-    Z = torch.empty((B, H, T, M, D), device=Q.device, dtype=torch.float32)
+    u_state = torch.zeros((B, H, M, D_value), device=Q.device, dtype=torch.float32)
+    Z = torch.empty((B, H, T, M, D_value), device=Q.device, dtype=torch.float32)
     for t in range(T):
         s_t = S_enc[:, :, t, :]
         m_new = torch.maximum(m_state, s_t)
@@ -214,10 +206,10 @@ def flare_recurrent_dense_backward_pytorch(Q, K, V, dY, scale=None, Q_dec=None, 
     separate_K_dec = state["separate_K_dec"]  # bool
     weight_sharing_enc_dec = state["weight_sharing_enc_dec"]  # bool
 
-    if dY.dim() != 4 or dY.size(0) != K.size(0) or dY.size(1) != K.size(2) or dY.size(2) != K.size(1) or dY.size(3) != K.size(3):
+    if dY.dim() != 4 or dY.size(0) != K.size(0) or dY.size(1) != K.size(2) or dY.size(2) != K.size(1) or dY.size(3) != V.size(3):
         raise ValueError(
             "Expected dY [B, H, T, D] matching recurrent output layout. "
-            f"Got dY.shape={tuple(dY.shape)} for K.shape={tuple(K.shape)}"
+            f"Got dY.shape={tuple(dY.shape)} for K.shape={tuple(K.shape)} and V.shape={tuple(V.shape)}"
         )
     dY_f = dY.float()  # [B, H, T, D]
 
@@ -268,18 +260,8 @@ def flare_recurrent_dense_backward_pytorch(Q, K, V, dY, scale=None, Q_dec=None, 
 #======================================================================#
 
 def flare_causal_reference(Q_enc, K_enc, V_enc, Q_dec=None, K_dec=None, scale=None):
-    assert Q_enc.dim() == 3 and K_enc.dim() == 4 and V_enc.dim() == 4, (
-        "Q_enc, K_enc, V_enc must be 3D and 4D tensors respectively "
-        f"got Q_enc.dim()={Q_enc.dim()}, K_enc.dim()={K_enc.dim()}, V_enc.dim()={V_enc.dim()}"
-    )
-    assert K_enc.size() == V_enc.size(), f"K_enc and V_enc must have the same shape. Got K_enc.shape={K_enc.shape} and V_enc.shape={V_enc.shape}"
-    assert Q_enc.size(0) == K_enc.size(2) and Q_enc.size(2) == K_enc.size(3), (
-        "Expected Q_enc [H, M, D] and K_enc/V_enc [B, N, H, D]. "
-        f"Got Q_enc.shape={Q_enc.shape} and K_enc.shape={K_enc.shape}"
-    )
-    H, M, D = Q_enc.size()
-    B, N, H, D = K_enc.size()
-    scale = _resolve_attn_scale(scale, D)
+    B, N, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q_enc, K_enc, V_enc, name="FLARE reference")
+    scale = _resolve_attn_scale(scale, D_score)
 
     Q_dec, K_dec, separate_Q_dec, separate_K_dec, _ = _resolve_flare_causal_decode_inputs(Q_enc, K_enc, Q_dec, K_dec)
 
@@ -298,7 +280,7 @@ def flare_causal_reference(Q_enc, K_enc, V_enc, Q_dec=None, K_dec=None, scale=No
     V_enc = V_enc.permute(0, 2, 1, 3)
     Q_dec = Q_dec.permute(0, 2, 1, 3) if separate_Q_dec else K_enc
     K_dec = K_dec.unsqueeze(0).expand(B, -1, -1, -1) if separate_K_dec else Q_enc
-    Y = torch.zeros_like(K_enc)
+    Y = torch.zeros((B, H, N, D_value), device=K_enc.device, dtype=V_enc.dtype)
     for t in range(N):
         Kt_enc = K_enc[:, :, :t+1, :]
         Vt_enc = V_enc[:, :, :t+1, :]
@@ -321,19 +303,8 @@ def flare_causal_perceiver_ar(Q, K, V, scale=None):
       y_t = Attn(K_t, Q, z_t)
     but computes all timesteps in one batched SDPA call per stage.
     """
-    assert Q.dim() == 3 and K.dim() == 4 and V.dim() == 4, (
-        "Q, K, V must be 3D and 4D tensors respectively "
-        f"got Q.dim()={Q.dim()}, K.dim()={K.dim()}, V.dim()={V.dim()}"
-    )
-    assert K.size() == V.size(), f"K and V must have the same shape. Got K.shape={K.shape} and V.shape={V.shape}"
-    assert Q.size(0) == K.size(2) and Q.size(2) == K.size(3), (
-        "Expected Q [H, M, D] and K/V [B, N, H, D]. "
-        f"Got Q.shape={Q.shape} and K.shape={K.shape}"
-    )
-    H, M, D = Q.size()
-    B, N, Hk, Dk = K.size()
-    scale = _resolve_attn_scale(scale, D)
-    assert H == Hk and D == Dk, "Incompatible Q/K/V dimensions"
+    B, N, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q, K, V, name="Perceiver-AR FLARE reference")
+    scale = _resolve_attn_scale(scale, D_score)
 
     if os.environ.get("FLARE_REFERENCE_FP32", "1") == "1":
         Q = Q.float()
@@ -349,9 +320,9 @@ def flare_causal_perceiver_ar(Q, K, V, scale=None):
 
     # Encode all timesteps in parallel:
     # q_enc[b, t] = Q, k_enc[b, t] = K[b], masked to prefix <= t.
-    q_enc = Q_bhmd.unsqueeze(1).expand(B, N, H, M, D).reshape(BN, H, M, D)
-    k_enc = K_bhnd.unsqueeze(1).expand(B, N, H, N, D).reshape(BN, H, N, D)
-    v_enc = V_bhnd.unsqueeze(1).expand(B, N, H, N, D).reshape(BN, H, N, D)
+    q_enc = Q_bhmd.unsqueeze(1).expand(B, N, H, M, D_score).reshape(BN, H, M, D_score)
+    k_enc = K_bhnd.unsqueeze(1).expand(B, N, H, N, D_score).reshape(BN, H, N, D_score)
+    v_enc = V_bhnd.unsqueeze(1).expand(B, N, H, N, D_value).reshape(BN, H, N, D_value)
 
     i = torch.arange(N, device=K.device)[:, None]
     j = torch.arange(N, device=K.device)[None, :]
@@ -370,8 +341,8 @@ def flare_causal_perceiver_ar(Q, K, V, scale=None):
 
     # Decode all timesteps in parallel:
     # y_t = Attn(k_t, Q, z_t)
-    q_dec = K_bhnd.permute(0, 2, 1, 3).reshape(BN, H, 1, D)  # [BN, H, 1, D]
-    k_dec = Q_bhmd.unsqueeze(1).expand(B, N, H, M, D).reshape(BN, H, M, D)
+    q_dec = K_bhnd.permute(0, 2, 1, 3).reshape(BN, H, 1, D_score)  # [BN, H, 1, D_k]
+    k_dec = Q_bhmd.unsqueeze(1).expand(B, N, H, M, D_score).reshape(BN, H, M, D_score)
     v_dec = Z
 
     Y = F.scaled_dot_product_attention(
@@ -384,7 +355,7 @@ def flare_causal_perceiver_ar(Q, K, V, scale=None):
         scale=scale,
     )  # [BN, H, 1, D]
 
-    Y = Y.reshape(B, N, H, D)
+    Y = Y.reshape(B, N, H, D_value)
     return Y
 
 
@@ -397,19 +368,8 @@ def flare_causal_perciever_ar(Q, K, V, scale=None):
 #------------------------------------------------------------------------------#
 
 def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, chunk_size=None, Q_dec=None, K_dec=None):
-    assert Q.dim() == 3 and K.dim() == 4 and V.dim() == 4, (
-        "Q, K, V must be 3D and 4D tensors respectively "
-        f"got Q.dim()={Q.dim()}, K.dim()={K.dim()}, V.dim()={V.dim()}"
-    )
-    assert K.size() == V.size(), f"K and V must have the same shape. Got K.shape={K.shape} and V.shape={V.shape}"
-    assert Q.size(0) == K.size(2) and Q.size(2) == K.size(3), (
-        "Expected Q [H, M, D] and K/V [B, N, H, D]. "
-        f"Got Q.shape={Q.shape} and K.shape={K.shape}"
-    )
-    H, M, D = Q.size()
-    B, N, Hk, Dk = K.size()
-    scale = _resolve_attn_scale(scale, D)
-    assert H == Hk and D == Dk, "Incompatible K/V dimensions"
+    B, N, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q, K, V, name="Chunked FLARE")
+    scale = _resolve_attn_scale(scale, D_score)
     Q_dec, K_dec, separate_Q_dec, separate_K_dec, weight_sharing_enc_dec = _resolve_flare_causal_decode_inputs(
         Q, K, Q_dec, K_dec
     )
@@ -445,16 +405,15 @@ def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, c
     PAD = PADDED_LEN - N
 
     if PAD > 0:
-        pad_val = torch.zeros((B, PAD, H, D), device=device, dtype=compute_dtype)
-        K_f = torch.cat([K_f, pad_val], dim=1)
-        V_f = torch.cat([V_f, pad_val], dim=1)
+        K_f = torch.cat([K_f, torch.zeros((B, PAD, H, D_score), device=device, dtype=compute_dtype)], dim=1)
+        V_f = torch.cat([V_f, torch.zeros((B, PAD, H, D_value), device=device, dtype=compute_dtype)], dim=1)
 
     ###
     # CHUNKING
     ###
 
-    Kc = K_f.reshape(B, NC, C, H, D).permute(0, 3, 1, 2, 4).contiguous()
-    Vc = V_f.reshape(B, NC, C, H, D).permute(0, 3, 1, 2, 4).contiguous()
+    Kc = K_f.reshape(B, NC, C, H, D_score).permute(0, 3, 1, 2, 4).contiguous()
+    Vc = V_f.reshape(B, NC, C, H, D_value).permute(0, 3, 1, 2, 4).contiguous()
 
     #---------------------------------------------------------------#
     # Phase 0: Compute scores
@@ -490,8 +449,8 @@ def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, c
     score_chunk_den = score_chunk_exp.sum(dim=3)                                  # [B, H, NC, M]
     BHNC = B * H * NC
     exp_b = score_chunk_exp.reshape(BHNC, C, M)
-    V_b = Vc.reshape(BHNC, C, D)
-    score_chunk_num = torch.bmm(exp_b.transpose(1, 2), V_b).reshape(B, H, NC, M, D)
+    V_b = Vc.reshape(BHNC, C, D_value)
+    score_chunk_num = torch.bmm(exp_b.transpose(1, 2), V_b).reshape(B, H, NC, M, D_value)
 
     if profile and torch.cuda.is_available():
         phase1_end.record()
@@ -506,12 +465,12 @@ def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, c
     # Score suffix (prev) statistics needed for phase 3
     score_prev_max = torch.empty(B, H, NC, M, device=device, dtype=compute_dtype)
     score_prev_den = torch.zeros(B, H, NC, M, device=device, dtype=compute_dtype)
-    score_prev_num = torch.zeros(B, H, NC, M, D, device=device, dtype=compute_dtype)
+    score_prev_num = torch.zeros(B, H, NC, M, D_value, device=device, dtype=compute_dtype)
 
     # temporary variables for prefix statistics
     max_curr = torch.full((B, H, M), -float("inf"), device=device, dtype=compute_dtype)
     den_curr = torch.zeros((B, H, M), device=device, dtype=compute_dtype)
-    num_curr = torch.zeros((B, H, M, D), device=device, dtype=compute_dtype)
+    num_curr = torch.zeros((B, H, M, D_value), device=device, dtype=compute_dtype)
 
     for chunk_idx in range(NC):
         score_prev_max[:, :, chunk_idx, :] = max_curr
@@ -548,7 +507,7 @@ def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, c
     # RETURNS: Yc
     #---------------------------------------------------------------#
     S = score_chunk  # [B, H, NC, C, M]
-    Yc = torch.empty((B, H, NC, C, D), device=device, dtype=compute_dtype)
+    Yc = torch.empty((B, H, NC, C, D_value), device=device, dtype=compute_dtype)
     for chunk_idx in range(NC):
         max_curr = score_prev_max[:, :, chunk_idx, :]
         den_curr = score_prev_den[:, :, chunk_idx, :]
@@ -584,7 +543,7 @@ def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, c
     # Return output
     #---------------------------------------------------------------#
 
-    Y = Yc.reshape(B, H, PADDED_LEN, D)[:, :, :N, :].permute(0, 2, 1, 3).to(out_dtype)
+    Y = Yc.reshape(B, H, PADDED_LEN, D_value)[:, :, :N, :].permute(0, 2, 1, 3).to(out_dtype)
     _check_finite("flare_causal_chunked.Y", Y)
     if profile and torch.cuda.is_available():
         phase3_end.record()

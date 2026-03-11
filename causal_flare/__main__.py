@@ -26,7 +26,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--H", type=int, default=16, help="Number of attention heads.")
     parser.add_argument("--M", type=int, default=64, help="Latent/query length per head.")
     parser.add_argument("--N", type=int, default=2048, help="Context/sequence length.")
-    parser.add_argument("--D", type=int, default=32, help="Head dimension.")
+    parser.add_argument(
+        "--D",
+        type=int,
+        default=32,
+        help="Score head dimension D_k. This diagnostics CLI still assumes value_head_dim == score_head_dim.",
+    )
     parser.add_argument(
         "--dtype",
         default="bfloat16",

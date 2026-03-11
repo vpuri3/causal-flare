@@ -342,23 +342,23 @@ def test_recurrent_multi_kernel_backward_matches_torch_reference(impl_name: str)
 
 
 @pytest.mark.parametrize("impl_name", ["chunked"])
-def test_chunked_flare_decode_separate_flags_forward_match_torch_reference(impl_name: str):
+@pytest.mark.parametrize("d_score,d_value", [(16, 16), (64, 128)])
+def test_chunked_flare_decode_separate_flags_forward_match_torch_reference(impl_name: str, d_score: int, d_value: int):
     torch.manual_seed(2028)
 
     B = 1
     N = 16
     H = 2
     M = 16
-    D = 16
-    scale = 1.0 / math.sqrt(D)
+    scale = 1.0 / math.sqrt(d_score)
     dtype = torch.float32
     chunk_size = 16
 
-    q = torch.randn((H, M, D), device=device, dtype=dtype)
-    k = torch.randn((B, N, H, D), device=device, dtype=dtype)
-    v = torch.randn((B, N, H, D), device=device, dtype=dtype)
-    q_dec_rand = torch.randn((B, N, H, D), device=device, dtype=dtype)
-    k_dec_rand = torch.randn((H, M, D), device=device, dtype=dtype)
+    q = torch.randn((H, M, d_score), device=device, dtype=dtype)
+    k = torch.randn((B, N, H, d_score), device=device, dtype=dtype)
+    v = torch.randn((B, N, H, d_value), device=device, dtype=dtype)
+    q_dec_rand = torch.randn((B, N, H, d_score), device=device, dtype=dtype)
+    k_dec_rand = torch.randn((H, M, d_score), device=device, dtype=dtype)
 
     for separate_q_dec in (False, True):
         for separate_k_dec in (False, True):
@@ -370,24 +370,24 @@ def test_chunked_flare_decode_separate_flags_forward_match_torch_reference(impl_
 
 
 @pytest.mark.parametrize("impl_name", ["chunked"])
-def test_chunked_flare_decode_separate_flags_backward_match_torch_reference(impl_name: str):
+@pytest.mark.parametrize("d_score,d_value", [(16, 16), (64, 128)])
+def test_chunked_flare_decode_separate_flags_backward_match_torch_reference(impl_name: str, d_score: int, d_value: int):
     torch.manual_seed(2029)
 
     B = 1
     N = 16
     H = 2
     M = 16
-    D = 16
-    scale = 1.0 / math.sqrt(D)
+    scale = 1.0 / math.sqrt(d_score)
     dtype = torch.float32
     chunk_size = 16
 
-    q_seed = torch.randn((H, M, D), device=device, dtype=dtype)
-    k_seed = torch.randn((B, N, H, D), device=device, dtype=dtype)
-    v_seed = torch.randn((B, N, H, D), device=device, dtype=dtype)
-    q_dec_rand_seed = torch.randn((B, N, H, D), device=device, dtype=dtype)
-    k_dec_rand_seed = torch.randn((H, M, D), device=device, dtype=dtype)
-    grad_out = torch.randn((B, N, H, D), device=device, dtype=dtype)
+    q_seed = torch.randn((H, M, d_score), device=device, dtype=dtype)
+    k_seed = torch.randn((B, N, H, d_score), device=device, dtype=dtype)
+    v_seed = torch.randn((B, N, H, d_value), device=device, dtype=dtype)
+    q_dec_rand_seed = torch.randn((B, N, H, d_score), device=device, dtype=dtype)
+    k_dec_rand_seed = torch.randn((H, M, d_score), device=device, dtype=dtype)
+    grad_out = torch.randn((B, N, H, d_value), device=device, dtype=dtype)
 
     for separate_q_dec in (False, True):
         for separate_k_dec in (False, True):
@@ -431,22 +431,22 @@ def test_chunked_flare_decode_separate_flags_backward_match_torch_reference(impl
 
 @pytest.mark.parametrize("q_dec_mode", ["none", "k_enc", "rand"])
 @pytest.mark.parametrize("k_dec_mode", ["none", "q_enc", "rand"])
-def test_inference_prefill_decode_variants_match_pytorch(q_dec_mode: str, k_dec_mode: str):
+@pytest.mark.parametrize("d_score,d_value", [(16, 16), (64, 128)])
+def test_inference_prefill_decode_variants_match_pytorch(q_dec_mode: str, k_dec_mode: str, d_score: int, d_value: int):
     torch.manual_seed(1337)
 
     B = 1
     N = 16
     H = 2
     M = 16
-    D = 16
-    scale = 1.0 / math.sqrt(D)
+    scale = 1.0 / math.sqrt(d_score)
     dtype = torch.float32
 
-    q = torch.randn((H, M, D), device=device, dtype=dtype)
-    k = torch.randn((B, N, H, D), device=device, dtype=dtype)
-    v = torch.randn((B, N, H, D), device=device, dtype=dtype)
-    q_dec_rand = torch.randn((B, N, H, D), device=device, dtype=dtype)
-    k_dec_rand = torch.randn((H, M, D), device=device, dtype=dtype)
+    q = torch.randn((H, M, d_score), device=device, dtype=dtype)
+    k = torch.randn((B, N, H, d_score), device=device, dtype=dtype)
+    v = torch.randn((B, N, H, d_value), device=device, dtype=dtype)
+    q_dec_rand = torch.randn((B, N, H, d_score), device=device, dtype=dtype)
+    k_dec_rand = torch.randn((H, M, d_score), device=device, dtype=dtype)
 
     if q_dec_mode == "none":
         q_dec = None
@@ -473,9 +473,9 @@ def test_inference_prefill_decode_variants_match_pytorch(q_dec_mode: str, k_dec_
     torch.testing.assert_close(s_tr["d"], s_py["d"], rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(s_tr["u"], s_py["u"], rtol=1e-4, atol=1e-5)
 
-    k_next = torch.randn((B, 1, H, D), device=device, dtype=dtype)
-    v_next = torch.randn((B, 1, H, D), device=device, dtype=dtype)
-    q_dec_next_rand = torch.randn((B, 1, H, D), device=device, dtype=dtype)
+    k_next = torch.randn((B, 1, H, d_score), device=device, dtype=dtype)
+    v_next = torch.randn((B, 1, H, d_value), device=device, dtype=dtype)
+    q_dec_next_rand = torch.randn((B, 1, H, d_score), device=device, dtype=dtype)
     if q_dec_mode == "none":
         q_dec_next = None
     elif q_dec_mode == "k_enc":
@@ -490,6 +490,33 @@ def test_inference_prefill_decode_variants_match_pytorch(q_dec_mode: str, k_dec_
         Q=q, K=k_next, V=v_next, state=s_tr, Q_dec=q_dec_next, K_dec=k_dec, scale=scale
     )
     torch.testing.assert_close(y_dec_tr, y_dec_py, rtol=1e-4, atol=1e-5)
+
+
+def test_inference_decode_shape_validation_rejects_wrong_score_dims():
+    torch.manual_seed(20260311)
+
+    B = 1
+    N = 4
+    H = 2
+    M = 16
+    d_score = 64
+    d_value = 128
+    dtype = torch.float32
+
+    q = torch.randn((H, M, d_score), device=device, dtype=dtype)
+    k = torch.randn((B, N, H, d_score), device=device, dtype=dtype)
+    v = torch.randn((B, N, H, d_value), device=device, dtype=dtype)
+    _, state = flare_prefill_pytorch(Q=q, K=k, V=v, scale=1.0 / math.sqrt(d_score))
+
+    bad_q_dec = torch.randn((B, 1, H, d_score + 16), device=device, dtype=dtype)
+    bad_k_dec = torch.randn((H, M, d_score + 16), device=device, dtype=dtype)
+    k_next = torch.randn((B, 1, H, d_score), device=device, dtype=dtype)
+    v_next = torch.randn((B, 1, H, d_value), device=device, dtype=dtype)
+
+    with pytest.raises(ValueError, match="Decode Q_dec"):
+        flare_decode_pytorch(Q=q, K=k_next, V=v_next, state=state, Q_dec=bad_q_dec)
+    with pytest.raises(ValueError, match="K_dec and Q_enc must have the same shape"):
+        flare_prefill_pytorch(Q=q, K=k, V=v, K_dec=bad_k_dec)
 
 
 def test_recurrent_flare_block_t_1_matches_block_t_16_forward():

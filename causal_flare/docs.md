@@ -12,10 +12,10 @@ but parallelizes most work by splitting the sequence into chunks.
 
 `ChunkedFLARE` uses the external layout directly:
 
-- `Q`: `[H, M, D]`
-- `K`: `[B, N, H, D]`
-- `V`: `[B, N, H, D]`
-- output `Y`: `[B, N, H, D]`
+- `Q`: `[H, M, D_k]`
+- `K`: `[B, N, H, D_k]`
+- `V`: `[B, N, H, D_v]`
+- output `Y`: `[B, N, H, D_v]`
 
 Where:
 
@@ -23,7 +23,8 @@ Where:
 - `H` = number of heads
 - `N` = sequence length
 - `M` = number of latent queries
-- `D` = head dimension
+- `D_k` = score/logit head dimension used by `Q` and `K`
+- `D_v` = value/output head dimension used by `V`, `Y`, and recurrent numerators
 
 The implementation does not permute inputs into a different public layout.
 
@@ -39,6 +40,8 @@ latent rows `m = 0..M-1`:
 These are the usual online-softmax statistics for the scores
 
 `score_t(m) = scale * <q_m, k_t>`.
+
+`scale` is resolved from `D_k`, while the numerator/state vectors live over `D_v`.
 
 The normalized latent state is:
 
@@ -109,7 +112,7 @@ state without serializing over all `N` tokens.
 
 `_run_chunked_output_phase` allocates:
 
-- `O[B, N, H, D]`: outputs
+- `O[B, N, H, D_v]`: outputs
 - `L[B, H, N, M]`: per-token/per-row encoder log-normalizers
 - `LSE_M[B*H, N]`: per-token decode log-sum-exp over latent rows
 

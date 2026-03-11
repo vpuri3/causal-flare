@@ -3,6 +3,7 @@ from .chunked import *
 from .chunked import (
     _autotune_arg,
     _get_chunked_forward_config,
+    _maybe_limit_autotune_configs_for_tests,
     _profiled_call,
     _refresh_profile_totals,
     _run_chunked_output_phase,
@@ -14,16 +15,27 @@ from .torch import _resolve_flare_causal_decode_inputs as _resolve_inference_dec
 
 def _prune_decode_step_autotune_configs(configs, named_args, **kwargs):
     m = int(_autotune_arg(named_args, kwargs, "M"))
-    d = int(_autotune_arg(named_args, kwargs, "D"))
+    d_value = int(_autotune_arg(named_args, kwargs, "D_VALUE"))
+    d_score = int(_autotune_arg(named_args, kwargs, "D_SCORE"))
     keep = []
     for cfg in configs:
         block_m = int(cfg.kwargs["BLOCK_M"])
         block_d = int(cfg.kwargs["BLOCK_D"])
         block_k = int(cfg.kwargs["BLOCK_K"])
-        if block_m < m or block_d > d or block_k > d:
+        if block_m < m or block_d > d_value or block_k > d_score:
             continue
         keep.append(cfg)
-    return keep
+    return _maybe_limit_autotune_configs_for_tests(
+        keep,
+        score_fn=lambda cfg: (
+            int(cfg.kwargs["BLOCK_M"]),
+            -int(cfg.kwargs["BLOCK_D"]),
+            -int(cfg.kwargs["BLOCK_K"]),
+            int(cfg.num_warps),
+            int(cfg.num_stages),
+        ),
+        reverse=False,
+    )
 
 
 _INFERENCE_DECODE_AUTOTUNE_CONFIGS = [
@@ -46,13 +58,13 @@ def _init_flare_recurrent_state(
     batch_size: int,
     num_heads: int,
     num_latents: int,
-    head_dim: int,
+    value_head_dim: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> dict[str, torch.Tensor]:
 
     SHAPE_D = (batch_size, num_heads, num_latents)
-    SHAPE_U = (batch_size, num_heads, num_latents, head_dim)
+    SHAPE_U = (batch_size, num_heads, num_latents, value_head_dim)
 
     return {
         "m": torch.full( SHAPE_D, -torch.inf, device=device, dtype=dtype),
@@ -65,7 +77,7 @@ def _canonicalize_flare_state(
     batch_size: int,
     num_heads: int,
     num_latents: int,
-    head_dim: int,
+    value_head_dim: int,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
     if state is None:
@@ -73,7 +85,7 @@ def _canonicalize_flare_state(
             batch_size=batch_size,
             num_heads=num_heads,
             num_latents=num_latents,
-            head_dim=head_dim,
+            value_head_dim=value_head_dim,
             device=device,
             dtype=torch.float32,
         )
@@ -87,6 +99,14 @@ def _canonicalize_flare_state(
     m = state["m"].to(device=device, dtype=torch.float32)
     d = state["d"].to(device=device, dtype=torch.float32)
     u = state["u"].to(device=device, dtype=torch.float32)
+    expected_scalar_shape = (batch_size, num_heads, num_latents)
+    expected_u_shape = (batch_size, num_heads, num_latents, value_head_dim)
+    if tuple(m.shape) != expected_scalar_shape or tuple(d.shape) != expected_scalar_shape or tuple(u.shape) != expected_u_shape:
+        raise ValueError(
+            "Invalid FLARE recurrent state shapes. "
+            f"Expected m/d={expected_scalar_shape}, u={expected_u_shape}; "
+            f"got m={tuple(m.shape)}, d={tuple(d.shape)}, u={tuple(u.shape)}"
+        )
 
     return {"m": m, "d": d, "u": u}
 
@@ -97,8 +117,11 @@ def _canonicalize_kv_for_prefill(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if K.dim() != 4 or V.dim() != 4:
         raise ValueError(f"Prefill expects K/V to be [B, T, H, D]. Got K={tuple(K.shape)}, V={tuple(V.shape)}")
-    if K.shape != V.shape:
-        raise ValueError(f"Prefill expects K and V to have same shape. Got K={tuple(K.shape)}, V={tuple(V.shape)}")
+    if K.shape[:3] != V.shape[:3]:
+        raise ValueError(
+            "Prefill expects K and V to agree on [B, T, H]. "
+            f"Got K={tuple(K.shape)}, V={tuple(V.shape)}"
+        )
     return K, V
 
 
@@ -112,8 +135,11 @@ def _canonicalize_kv_for_decode(
         V = V[:, 0]
     if K.dim() != 3 or V.dim() != 3:
         raise ValueError(f"Decode expects K/V as [B, H, D] or [B, 1, H, D]. Got K={tuple(K.shape)}, V={tuple(V.shape)}")
-    if K.shape != V.shape:
-        raise ValueError(f"K and V must have same shape. Got K={tuple(K.shape)}, V={tuple(V.shape)}")
+    if K.shape[:2] != V.shape[:2]:
+        raise ValueError(
+            "Decode expects K and V to agree on [B, H]. "
+            f"Got K={tuple(K.shape)}, V={tuple(V.shape)}"
+        )
     return K, V
 
 
@@ -206,9 +232,10 @@ def flare_prefill_pytorch(
     K, V = _canonicalize_kv_for_prefill(K, V)
     if Q.dim() != 3:
         raise ValueError(f"Q must be [H, M, D]. Got Q={tuple(Q.shape)}")
-    B, T, H, D = K.shape
+    B, T, H, D_score = K.shape
+    D_value = V.shape[-1]
     Hq, M, Dq = Q.shape
-    if Hq != H or Dq != D:
+    if Hq != H or Dq != D_score:
         raise ValueError(f"Incompatible Q/K shapes. Q={tuple(Q.shape)}, K={tuple(K.shape)}")
     if attention_mask is not None and attention_mask.shape != (B, T):
         raise ValueError(f"attention_mask must be [B, T]. Got {tuple(attention_mask.shape)}")
@@ -228,14 +255,14 @@ def flare_prefill_pytorch(
         batch_size=B,
         num_heads=H,
         num_latents=M,
-        head_dim=D,
+        value_head_dim=D_value,
         device=K.device,
     )
     m = st["m"]
     d = st["d"]
     u = st["u"]
 
-    Y = torch.empty((B, H, T, D), device=K.device, dtype=torch.float32)
+    Y = torch.empty((B, H, T, D_value), device=K.device, dtype=torch.float32)
     for t in range(T):
         k_t = K_f[:, :, t, :]
         v_t = V_f[:, :, t, :]
@@ -321,7 +348,7 @@ def flare_decode_pytorch(
 
 @triton.autotune(
     configs=_INFERENCE_DECODE_AUTOTUNE_CONFIGS,
-    key=["M", "D", "HAS_MASK"],
+    key=["M", "D_SCORE", "D_VALUE", "HAS_MASK"],
     prune_configs_by={"early_config_prune": _prune_decode_step_autotune_configs},
     reset_to_zero=["Y_ptr"],
     restore_value=["M_ptr", "D_ptr", "U_ptr"],
@@ -341,7 +368,7 @@ def flare_recurrent_step_kernel(
     stride_ub, stride_uh, stride_um, stride_ud,
     stride_yb, stride_yh, stride_yd,
     stride_mask_b,
-    B, H, M, D: tl.constexpr, scale,
+    B, H, M, D_SCORE: tl.constexpr, D_VALUE: tl.constexpr, scale,
     HAS_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -359,7 +386,7 @@ def flare_recurrent_step_kernel(
     m_offsets = tl.arange(0, BLOCK_M)
     d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_m = m_offsets < M
-    mask_d = d_offsets < D
+    mask_d = d_offsets < D_VALUE
     mask_md = mask_m[:, None] & mask_d[None, :]
 
     valid_t = tl.full((), True, tl.int1)
@@ -392,9 +419,9 @@ def flare_recurrent_step_kernel(
     # reduction locally across BLOCK_K slices and only let d_block=0 write the
     # shared m/d scalars to avoid races.
     s_raw = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    for k0 in tl.static_range(0, D, BLOCK_K):
+    for k0 in tl.static_range(0, D_SCORE, BLOCK_K):
         d_offsets_k = k0 + tl.arange(0, BLOCK_K)
-        mask_d_k = d_offsets_k < D
+        mask_d_k = d_offsets_k < D_SCORE
         q_k = tl.load(
             q_base + m_offsets[:, None] * stride_qm + d_offsets_k[None, :] * stride_qd,
             mask=mask_m[:, None] & mask_d_k[None, :],
@@ -427,9 +454,9 @@ def flare_recurrent_step_kernel(
         a_raw = s_raw
     else:
         a_raw = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        for k0 in tl.static_range(0, D, BLOCK_K):
+        for k0 in tl.static_range(0, D_SCORE, BLOCK_K):
             d_offsets_k = k0 + tl.arange(0, BLOCK_K)
-            mask_d_k = d_offsets_k < D
+            mask_d_k = d_offsets_k < D_SCORE
             q_dec_k = tl.load(q_dec_base + d_offsets_k * stride_qdd, mask=mask_d_k, other=0.0).to(tl.float32)
             k_dec_k = tl.load(
                 k_dec_base + m_offsets[:, None] * stride_kdm_dec + d_offsets_k[None, :] * stride_kdd_dec,
@@ -480,9 +507,10 @@ def flare_decode_triton(
     K_input = K
     K, V = _canonicalize_kv_for_decode(K, V)
     _ = _normalize_input_precision(input_precision, None)
-    B, H, D = K.shape
+    B, H, D_score = K.shape
+    D_value = V.shape[-1]
     Hq, M, Dq = Q.shape
-    if Hq != H or Dq != D:
+    if Hq != H or Dq != D_score:
         raise ValueError(f"Incompatible Q/K shapes. Q={tuple(Q.shape)}, K={tuple(K.shape)}")
     K_resolve = K[:, None, :, :]
     Q_dec_resolve = _canonicalize_q_dec_for_decode(Q_dec, K, K_input=K_input, K_prefill=K_resolve)
@@ -501,7 +529,7 @@ def flare_decode_triton(
         batch_size=B,
         num_heads=H,
         num_latents=M,
-        head_dim=D,
+        value_head_dim=D_value,
         device=K.device,
     )
     m_state = st["m"].contiguous()
@@ -520,7 +548,7 @@ def flare_decode_triton(
         else:
             q_dec_step = Q_dec_resolve[:, 0, :, :].contiguous().float() if separate_Q_dec else k
             k_dec_latent = K_dec_resolve.contiguous().float() if separate_K_dec else q
-        y = torch.empty((B, H, D), device=K.device, dtype=torch.float32)
+        y = torch.empty((B, H, D_value), device=K.device, dtype=torch.float32)
         return q, k, v, q_dec_step, k_dec_latent, y
 
     q, k, v, q_dec_step, k_dec_latent, y = _profiled_call(
@@ -530,7 +558,7 @@ def flare_decode_triton(
         prepare_decode_io,
     )
 
-    grid = lambda meta: (B * H, triton.cdiv(D, meta["BLOCK_D"]))
+    grid = lambda meta: (B * H, triton.cdiv(D_value, meta["BLOCK_D"]))
     def launch_decode():
         if attention_mask is None:
             return flare_recurrent_step_kernel[grid](
@@ -547,7 +575,7 @@ def flare_decode_triton(
                 u_state.stride(0), u_state.stride(1), u_state.stride(2), u_state.stride(3),
                 y.stride(0), y.stride(1), y.stride(2),
                 0,
-                B, H, M, D, float(scale),
+                B, H, M, D_score, D_value, float(scale),
                 HAS_MASK=False,
                 WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
             )
@@ -565,7 +593,7 @@ def flare_decode_triton(
             u_state.stride(0), u_state.stride(1), u_state.stride(2), u_state.stride(3),
             y.stride(0), y.stride(1), y.stride(2),
             attention_mask.stride(0),
-            B, H, M, D, float(scale),
+            B, H, M, D_score, D_value, float(scale),
             HAS_MASK=True,
             WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
         )
@@ -596,11 +624,12 @@ def flare_prefill_triton(
         raise RuntimeError("flare_prefill requires CUDA tensors.")
 
     K, V = _canonicalize_kv_for_prefill(K, V)
-    B, T, H, D = K.shape
+    B, T, H, D_score = K.shape
+    D_value = V.shape[-1]
     if Q.dim() != 3:
         raise ValueError(f"Q must be [H, M, D]. Got Q={tuple(Q.shape)}")
     Hq, M, Dq = Q.shape
-    if Hq != H or Dq != D:
+    if Hq != H or Dq != D_score:
         raise ValueError(f"Incompatible Q/K shapes. Q={tuple(Q.shape)}, K={tuple(K.shape)}")
     if attention_mask is not None and attention_mask.shape != (B, T):
         raise ValueError(f"attention_mask must be [B, T]. Got {tuple(attention_mask.shape)}")
@@ -613,10 +642,10 @@ def flare_prefill_triton(
             batch_size=B,
             num_heads=H,
             num_latents=M,
-            head_dim=D,
+            value_head_dim=D_value,
             device=K.device,
         )
-        return torch.empty((B, 0, H, D), device=K.device, dtype=V.dtype), st
+        return torch.empty((B, 0, H, D_value), device=K.device, dtype=V.dtype), st
 
     if attention_mask is not None:
         # Keep masked prefill semantics identical to recurrent decode while avoiding any PyTorch fallback.
@@ -627,7 +656,7 @@ def flare_prefill_triton(
                 batch_size=B,
                 num_heads=H,
                 num_latents=M,
-                head_dim=D,
+                value_head_dim=D_value,
                 device=K.device,
             )
             y_steps = []
@@ -658,20 +687,21 @@ def flare_prefill_triton(
         batch_size=B,
         num_heads=H,
         num_latents=M,
-        head_dim=D,
+        value_head_dim=D_value,
         device=K.device,
     )
     profile_data = {"forward": {}} if profile else None
     forward_timings = profile_data["forward"] if profile_data is not None else None
     m0 = st["m"].reshape(B * H, M)
     d0 = st["d"].reshape(B * H, M)
-    u0 = st["u"].reshape(B * H, M, D)
+    u0 = st["u"].reshape(B * H, M, D_value)
 
     dtype = K.dtype
     cfg = _get_chunked_forward_config(
         M=M,
         N=T,
-        D=D,
+        score_head_dim=D_score,
+        value_head_dim=D_value,
         dtype=dtype,
         input_precision=input_precision,
     )
@@ -692,7 +722,8 @@ def flare_prefill_triton(
         H=H,
         M=M,
         N=T,
-        D=D,
+        D_score=D_score,
+        D_value=D_value,
         scale=float(scale),
         config=cfg,
         kernel_timings=forward_timings,
@@ -701,7 +732,7 @@ def flare_prefill_triton(
     prefix_max, prefix_den, prefix_num = _run_chunked_prefix_phase(
         chunk_max, chunk_den, chunk_num,
         M=M,
-        D=D,
+        D_value=D_value,
         config=cfg,
         kernel_timings=forward_timings,
     )
@@ -739,7 +770,8 @@ def flare_prefill_triton(
         H=H,
         M=M,
         N=T,
-        D=D,
+        D_score=D_score,
+        D_value=D_value,
         scale=float(scale),
         config=cfg,
         weight_sharing_enc_dec=weight_sharing_enc_dec,
@@ -765,7 +797,7 @@ def flare_prefill_triton(
     next_state = {
         "m": m_fin.reshape(B, H, M).contiguous(),
         "d": d_fin.reshape(B, H, M).contiguous(),
-        "u": u_fin.reshape(B, H, M, D).contiguous(),
+        "u": u_fin.reshape(B, H, M, D_value).contiguous(),
     }
 
     O_out = _profiled_call(K.device, forward_timings, "prefill_output_cast", lambda: O.to(V.dtype))
