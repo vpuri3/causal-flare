@@ -21,25 +21,16 @@ DEFAULT_M_VALUES = (16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048)
 DEFAULT_N_VALUES = (1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072)
 DEFAULT_BH_VALUES = (8,)
 DEFAULT_CHUNK_SIZES = (64, 128, 256, 512)
-DEFAULT_BLOCK_VALUES = (16, 32, 64, 128, 256, 512)
 
 FAMILY_GROUPS = {
     "prefill": (
         "default",
         "chunk_size",
         "prefill_block_m",
-        "prefill_block_d",
-        "prefill_block_k",
-        "prefill_launch",
         "combined",
     ),
     "decode": (
         "default",
-        "decode_block_m",
-        "decode_block_d",
-        "decode_block_k",
-        "decode_launch",
-        "combined",
     ),
 }
 
@@ -102,12 +93,7 @@ def power_of_two_values(limit: int) -> list[int]:
     return out
 
 
-def divisor_values(limit: int, candidates: tuple[int, ...]) -> list[int]:
-    return [value for value in candidates if value <= limit and (limit % value) == 0]
-
-
-def build_candidates(case: Case, *, mode: str, chunk_sizes: tuple[int, ...], block_values: tuple[int, ...]) -> list[CandidateConfig]:
-    d = case.head_dim
+def build_candidates(case: Case, *, mode: str, chunk_sizes: tuple[int, ...]) -> list[CandidateConfig]:
     m = case.latent_queries
     n = case.seq_len
     candidates = [CandidateConfig("default", "default", {})]
@@ -121,134 +107,9 @@ def build_candidates(case: Case, *, mode: str, chunk_sizes: tuple[int, ...], blo
             CandidateConfig(
                 "prefill_block_m",
                 f"prefill_block_m_{block_m}",
-                {"FLARE_BLOCK_M": str(block_m), "FLARE_PREFIX_BLOCK_M": str(block_m)},
+                {"FLARE_BLOCK_M": str(block_m)},
             )
             for block_m in power_of_two_values(m)
-        )
-        candidates.extend(
-            CandidateConfig(
-                "prefill_block_d",
-                f"prefill_block_d_{block_d}",
-                {
-                    "FLARE_PREPARE_BLOCK_D": str(block_d),
-                    "FLARE_PREFIX_BLOCK_D": str(block_d),
-                    "FLARE_FWD_BLOCK_D": str(block_d),
-                },
-            )
-            for block_d in block_values
-            if block_d <= d
-        )
-        for prepare_block_k in divisor_values(d, block_values):
-            for fwd_block_k in divisor_values(d, block_values):
-                if prepare_block_k < fwd_block_k:
-                    continue
-                candidates.append(
-                    CandidateConfig(
-                        "prefill_block_k",
-                        f"prefill_block_k_p{prepare_block_k}_f{fwd_block_k}",
-                        {
-                            "FLARE_PREPARE_BLOCK_K": str(prepare_block_k),
-                            "FLARE_FWD_BLOCK_K": str(fwd_block_k),
-                        },
-                    )
-                )
-        candidates.extend(
-            (
-                CandidateConfig(
-                    "prefill_launch",
-                    "prefill_launch_legacy_8w3s",
-                    {
-                        "FLARE_PREPARE_NUM_WARPS": "8",
-                        "FLARE_PREPARE_NUM_STAGES": "3",
-                        "FLARE_PREFIX_NUM_WARPS": "8",
-                        "FLARE_PREFIX_NUM_STAGES": "3",
-                        "FLARE_DECODER_NUM_WARPS": "8",
-                        "FLARE_DECODER_NUM_STAGES": "3",
-                        "FLARE_FWD_NUM_WARPS": "8",
-                        "FLARE_FWD_NUM_STAGES": "3",
-                    },
-                ),
-                CandidateConfig(
-                    "prefill_launch",
-                    "prefill_launch_balanced_4w2s_4w1s",
-                    {
-                        "FLARE_PREPARE_NUM_WARPS": "4",
-                        "FLARE_PREPARE_NUM_STAGES": "2",
-                        "FLARE_PREFIX_NUM_WARPS": "4",
-                        "FLARE_PREFIX_NUM_STAGES": "2",
-                        "FLARE_DECODER_NUM_WARPS": "4",
-                        "FLARE_DECODER_NUM_STAGES": "1",
-                        "FLARE_FWD_NUM_WARPS": "4",
-                        "FLARE_FWD_NUM_STAGES": "1",
-                    },
-                ),
-                CandidateConfig(
-                    "prefill_launch",
-                    "prefill_launch_light_fwd_2w1s",
-                    {
-                        "FLARE_PREPARE_NUM_WARPS": "4",
-                        "FLARE_PREPARE_NUM_STAGES": "2",
-                        "FLARE_PREFIX_NUM_WARPS": "4",
-                        "FLARE_PREFIX_NUM_STAGES": "2",
-                        "FLARE_DECODER_NUM_WARPS": "4",
-                        "FLARE_DECODER_NUM_STAGES": "1",
-                        "FLARE_FWD_NUM_WARPS": "2",
-                        "FLARE_FWD_NUM_STAGES": "1",
-                    },
-                ),
-            )
-        )
-    else:
-        candidates.extend(
-            CandidateConfig(
-                "decode_block_m",
-                f"decode_block_m_{block_m}",
-                {"FLARE_DECODE_BLOCK_M": str(block_m)},
-            )
-            for block_m in power_of_two_values(max(m, 16))
-            if block_m >= m
-        )
-        candidates.extend(
-            CandidateConfig(
-                "decode_block_d",
-                f"decode_block_d_{block_d}",
-                {"FLARE_DECODE_BLOCK_D": str(block_d)},
-            )
-            for block_d in block_values
-            if block_d <= d
-        )
-        candidates.extend(
-            CandidateConfig(
-                "decode_block_k",
-                f"decode_block_k_{block_k}",
-                {"FLARE_DECODE_BLOCK_K": str(block_k)},
-            )
-            for block_k in divisor_values(d, block_values)
-        )
-        candidates.extend(
-            (
-                CandidateConfig("decode_launch", "decode_launch_default", {}),
-                CandidateConfig(
-                    "decode_launch",
-                    "decode_launch_2w1s",
-                    {"FLARE_DECODE_NUM_WARPS": "2", "FLARE_DECODE_NUM_STAGES": "1"},
-                ),
-                CandidateConfig(
-                    "decode_launch",
-                    "decode_launch_4w1s",
-                    {"FLARE_DECODE_NUM_WARPS": "4", "FLARE_DECODE_NUM_STAGES": "1"},
-                ),
-                CandidateConfig(
-                    "decode_launch",
-                    "decode_launch_4w2s",
-                    {"FLARE_DECODE_NUM_WARPS": "4", "FLARE_DECODE_NUM_STAGES": "2"},
-                ),
-                CandidateConfig(
-                    "decode_launch",
-                    "decode_launch_8w2s",
-                    {"FLARE_DECODE_NUM_WARPS": "8", "FLARE_DECODE_NUM_STAGES": "2"},
-                ),
-            )
         )
 
     deduped = []
@@ -480,7 +341,7 @@ def format_summary_markdown(summary: dict[str, object]) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run repeatable FLARE prefill/decode launch-config sweeps over a D/M/N/BH matrix.")
+    parser = argparse.ArgumentParser(description="Run repeatable FLARE prefill/decode structural-config sweeps over a D/M/N/BH matrix.")
     parser.add_argument("--mode", choices=("prefill", "decode"), required=True)
     parser.add_argument("--d-values", default=None)
     parser.add_argument("--m-values", default=None)
@@ -488,7 +349,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bh-values", default=None)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--chunk-sizes", default="64,128,256,512")
-    parser.add_argument("--block-values", default="16,32,64,128,256,512")
     parser.add_argument("--families", default=None, help="Comma-separated family list for the selected mode. Default uses the mode preset.")
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--input-precision", default=None)
@@ -517,7 +377,6 @@ def main() -> None:
     n_values = parse_int_list(args.n_values, DEFAULT_N_VALUES)
     bh_values = parse_int_list(args.bh_values, DEFAULT_BH_VALUES)
     chunk_sizes = parse_int_list(args.chunk_sizes, DEFAULT_CHUNK_SIZES)
-    block_values = parse_int_list(args.block_values, DEFAULT_BLOCK_VALUES)
     families = select_families(args.mode, args.families)
     cases = build_cases(
         d_values=d_values,
@@ -548,7 +407,7 @@ def main() -> None:
     for case in cases:
         candidates = [
             candidate
-            for candidate in build_candidates(case, mode=args.mode, chunk_sizes=chunk_sizes, block_values=block_values)
+            for candidate in build_candidates(case, mode=args.mode, chunk_sizes=chunk_sizes)
             if candidate.family in families and candidate.family != "combined"
         ]
         case_rows: list[dict] = []

@@ -1,3 +1,5 @@
+import itertools
+
 from ._common import *
 from .torch import _resolve_flare_causal_decode_inputs as _resolve_chunked_decode_inputs
 
@@ -50,34 +52,6 @@ def _refresh_profile_totals(profile_data: dict[str, object] | None) -> None:
     profile_data["total_ms"] = forward_total + backward_total
 
 
-def _resolve_forward_launch(
-    phase: str,
-    *,
-    default_num_warps: int,
-    default_num_stages: int,
-) -> tuple[int, int]:
-    phase_key = phase.upper()
-    env_warps = os.environ.get(f"FLARE_{phase_key}_NUM_WARPS", "") or os.environ.get("FLARE_NUM_WARPS", "")
-    env_stages = os.environ.get(f"FLARE_{phase_key}_NUM_STAGES", "") or os.environ.get("FLARE_NUM_STAGES", "")
-    num_warps = int(env_warps) if env_warps else default_num_warps
-    num_stages = int(env_stages) if env_stages else default_num_stages
-    return num_warps, num_stages
-
-
-def _resolve_backward_launch(
-    phase: str,
-    *,
-    default_num_warps: int,
-    default_num_stages: int,
-) -> tuple[int, int]:
-    phase_key = phase.upper()
-    env_warps = os.environ.get(f"FLARE_LSE_BWD_{phase_key}_NUM_WARPS", "") or os.environ.get("FLARE_LSE_BWD_NUM_WARPS", "")
-    env_stages = os.environ.get(f"FLARE_LSE_BWD_{phase_key}_NUM_STAGES", "") or os.environ.get("FLARE_LSE_BWD_NUM_STAGES", "")
-    num_warps = int(env_warps) if env_warps else default_num_warps
-    num_stages = int(env_stages) if env_stages else default_num_stages
-    return num_warps, num_stages
-
-
 def _is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
 
@@ -112,6 +86,173 @@ def _require_power_of_two_tile(name: str, value: int) -> None:
         raise ValueError(f"{name} must be a power of two. Got {name}={value}.")
 
 
+_AUTOTUNE_STAGES = (1,) if torch.version.hip is not None else (1, 2, 3)
+
+
+def _make_autotune_configs(
+    meta_space: dict[str, tuple[int, ...]],
+    *,
+    num_warps_options: tuple[int, ...],
+    num_stages_options: tuple[int, ...] = _AUTOTUNE_STAGES,
+) -> list[triton.Config]:
+    keys = tuple(meta_space.keys())
+    value_sets = [meta_space[key] for key in keys]
+    configs: list[triton.Config] = []
+    for values in itertools.product(*value_sets) if value_sets else [()]:
+        kwargs = {key: value for key, value in zip(keys, values)}
+        for num_warps in num_warps_options:
+            for num_stages in num_stages_options:
+                configs.append(triton.Config(kwargs, num_warps=num_warps, num_stages=num_stages))
+    return configs
+
+
+def _autotune_arg(named_args, kwargs, name: str):
+    if name in kwargs:
+        return kwargs[name]
+    return named_args[name]
+
+
+def _prune_prepare_autotune_configs(configs, named_args, **kwargs):
+    d = int(_autotune_arg(named_args, kwargs, "D"))
+    return [cfg for cfg in configs if cfg.kwargs["BLOCK_D"] <= d and cfg.kwargs["BLOCK_K"] <= d and d % cfg.kwargs["BLOCK_K"] == 0]
+
+
+def _prune_prefix_autotune_configs(configs, named_args, **kwargs):
+    d = int(_autotune_arg(named_args, kwargs, "D"))
+    return [cfg for cfg in configs if cfg.kwargs["BLOCK_D"] <= d]
+
+
+def _prune_decoder_autotune_configs(configs, named_args, **kwargs):
+    d = int(_autotune_arg(named_args, kwargs, "D"))
+    chunk_size = int(_autotune_arg(named_args, kwargs, "CHUNK_SIZE"))
+    return [
+        cfg
+        for cfg in configs
+        if cfg.kwargs["BLOCK_K"] <= d and d % cfg.kwargs["BLOCK_K"] == 0 and cfg.kwargs["BLOCK_T"] <= chunk_size
+    ]
+
+
+def _prune_fwd_autotune_configs(configs, named_args, **kwargs):
+    d = int(_autotune_arg(named_args, kwargs, "D"))
+    chunk_size = int(_autotune_arg(named_args, kwargs, "CHUNK_SIZE"))
+    return [
+        cfg
+        for cfg in configs
+        if cfg.kwargs["BLOCK_D"] <= d
+        and cfg.kwargs["BLOCK_K"] <= d
+        and d % cfg.kwargs["BLOCK_K"] == 0
+        and cfg.kwargs["BLOCK_T"] <= chunk_size
+    ]
+
+
+def _prune_p_part_autotune_configs(configs, named_args, **kwargs):
+    d = int(_autotune_arg(named_args, kwargs, "D"))
+    chunk_size = int(_autotune_arg(named_args, kwargs, "CHUNK_SIZE"))
+    keep = []
+    for cfg in configs:
+        block_d = int(cfg.kwargs["BLOCK_D"])
+        block_k = int(cfg.kwargs["BLOCK_K"])
+        block_t = int(cfg.kwargs["BLOCK_T"])
+        if block_d > d or block_k > d or d % block_k != 0 or block_t > chunk_size:
+            continue
+        keep.append(cfg)
+    return keep
+
+
+def _prune_gp_reduce_autotune_configs(configs, named_args, **kwargs):
+    m = int(_autotune_arg(named_args, kwargs, "M"))
+    chunk_size = int(_autotune_arg(named_args, kwargs, "CHUNK_SIZE"))
+    return [cfg for cfg in configs if cfg.kwargs["BLOCK_M"] <= m and cfg.kwargs["BLOCK_T"] <= chunk_size]
+
+
+def _prune_chunk_summary_autotune_configs(configs, named_args, **kwargs):
+    chunk_size = int(_autotune_arg(named_args, kwargs, "CHUNK_SIZE"))
+    return [cfg for cfg in configs if cfg.kwargs["BLOCK_T"] <= chunk_size]
+
+
+def _prune_apply_autotune_configs(configs, named_args, **kwargs):
+    chunk_size = int(_autotune_arg(named_args, kwargs, "CHUNK_SIZE"))
+    use_blocked_apply = bool(_autotune_arg(named_args, kwargs, "USE_BLOCKED_APPLY"))
+    use_scalar_panel_apply = bool(kwargs.get("USE_SCALAR_PANEL_APPLY", False))
+    keep = []
+    for cfg in configs:
+        block_t = int(cfg.kwargs["BLOCK_T"])
+        scalar_panel_t = int(cfg.kwargs.get("SCALAR_PANEL_T", 4))
+        if use_blocked_apply:
+            if block_t > chunk_size:
+                continue
+        else:
+            if block_t != 16:
+                continue
+        if use_scalar_panel_apply:
+            if scalar_panel_t > chunk_size:
+                continue
+        elif scalar_panel_t != 4:
+            continue
+        keep.append(cfg)
+    return keep
+
+
+def _prune_dv_reduce_autotune_configs(configs, named_args, **kwargs):
+    d = int(_autotune_arg(named_args, kwargs, "D"))
+    return [cfg for cfg in configs if cfg.kwargs["BLOCK_D"] <= d]
+
+
+_CHUNK_PREPARE_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {"BLOCK_D": (16, 32, 64, 128), "BLOCK_K": (16, 32, 64)},
+    num_warps_options=(4, 8),
+)
+_CHUNK_PREFIX_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {"BLOCK_D": (16, 32, 64, 128)},
+    num_warps_options=(4, 8),
+)
+_CHUNK_DECODER_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {"BLOCK_K": (16, 32, 64), "BLOCK_T": (16, 32, 64)},
+    num_warps_options=(2, 4, 8),
+    num_stages_options=(1, 2),
+)
+_CHUNK_FWD_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {"BLOCK_D": (16, 32, 64, 128), "BLOCK_K": (16, 32, 64), "BLOCK_T": (16, 32, 64)},
+    num_warps_options=(2, 4, 8),
+    num_stages_options=(1, 2),
+)
+_CHUNK_BWD_P_PART_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {"BLOCK_D": (16, 32, 64, 128), "BLOCK_K": (16, 32, 64), "BLOCK_T": (16, 32, 64)},
+    num_warps_options=(2, 4, 8),
+    num_stages_options=(1, 2),
+)
+_CHUNK_BWD_GP_REDUCE_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {"BLOCK_M": (16, 32, 64, 128), "BLOCK_T": (16, 32, 64)},
+    num_warps_options=(1, 2, 4),
+    num_stages_options=(1,),
+)
+_CHUNK_BWD_CHUNK_SUMMARY_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {"BLOCK_T": (16, 32, 64)},
+    num_warps_options=(2, 4, 8),
+    num_stages_options=(1, 2),
+)
+_CHUNK_BWD_CARRY_SCAN_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {},
+    num_warps_options=(2, 4, 8),
+    num_stages_options=(1, 2),
+)
+_CHUNK_BWD_CHUNK_APPLY_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {"BLOCK_T": (16, 32, 64), "SCALAR_PANEL_T": (4, 8)},
+    num_warps_options=(2, 4, 8),
+    num_stages_options=(1, 2),
+)
+_CHUNK_BWD_SCAN_APPLY_FUSED_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {},
+    num_warps_options=(2, 4, 8),
+    num_stages_options=(1, 2),
+)
+_CHUNK_BWD_DV_REDUCE_AUTOTUNE_CONFIGS = _make_autotune_configs(
+    {"BLOCK_D": (16, 32, 64, 128)},
+    num_warps_options=(2, 4),
+    num_stages_options=(1, 2),
+)
+
+
 def _get_chunked_forward_bucket(D: int) -> int:
     """Return the profiled forward bucket for the current head dimension.
 
@@ -129,144 +270,13 @@ def _get_chunked_forward_bucket(D: int) -> int:
     return 512
 
 
-def _get_chunked_forward_bucket_defaults(D: int) -> dict[str, object]:
-    """Return H100-profiled forward defaults for the nearest supported D bucket.
-
-    The tile sizes below are *preferred* values. For non-power-of-two D (for example D=96)
-    we later snap BLOCK_D to the largest power-of-two tile that fits and BLOCK_K to a divisor
-    of D so the Triton kernels keep using valid `tl.arange` ranges.
-    """
-    bucket = _get_chunked_forward_bucket(D)
-    if bucket == 16:
-        return {
-            "prepare_block_d": 16,
-            "prepare_block_k": 16,
-            "prefix_block_d": 16,
-            "fwd_block_d": 16,
-            "fwd_block_k": 16,
-            "prepare_launch": (4, 2),
-            "prefix_launch": (4, 2),
-            "decoder_launch": (4, 2),
-            "fwd_launch": (4, 2),
-        }
-    if bucket == 32:
-        return {
-            "prepare_block_d": 32,
-            "prepare_block_k": 32,
-            "prefix_block_d": 32,
-            "fwd_block_d": 32,
-            "fwd_block_k": 32,
-            "prepare_launch": (4, 2),
-            "prefix_launch": (4, 2),
-            "decoder_launch": (4, 1),
-            "fwd_launch": (4, 1),
-        }
-    if bucket == 64:
-        return {
-            "prepare_block_d": 64,
-            "prepare_block_k": 64,
-            "prefix_block_d": 64,
-            "fwd_block_d": 64,
-            "fwd_block_k": 64,
-            "prepare_launch": (4, 2),
-            "prefix_launch": (4, 2),
-            "decoder_launch": (4, 1),
-            "fwd_launch": (4, 1),
-        }
-    if bucket == 96:
-        return {
-            "prepare_block_d": 64,
-            "prepare_block_k": 32,
-            "prefix_block_d": 64,
-            "fwd_block_d": 64,
-            "fwd_block_k": 32,
-            "prepare_launch": (8, 3),
-            "prefix_launch": (8, 3),
-            "decoder_launch": (4, 1),
-            "fwd_launch": (2, 1),
-        }
-    if bucket == 128:
-        return {
-            "prepare_block_d": 128,
-            "prepare_block_k": 64,
-            "prefix_block_d": 128,
-            "fwd_block_d": 128,
-            "fwd_block_k": 32,
-            "prepare_launch": (8, 3),
-            "prefix_launch": (8, 3),
-            "decoder_launch": (4, 1),
-            "fwd_launch": (4, 1),
-        }
-    if bucket == 192:
-        return {
-            "prepare_block_d": 128,
-            "prepare_block_k": 64,
-            "prefix_block_d": 128,
-            "fwd_block_d": 128,
-            "fwd_block_k": 32,
-            "prepare_launch": (8, 3),
-            "prefix_launch": (8, 3),
-            "decoder_launch": (4, 1),
-            "fwd_launch": (2, 1),
-        }
-    if bucket == 256:
-        return {
-            "prepare_block_d": 128,
-            "prepare_block_k": 64,
-            "prefix_block_d": 128,
-            "fwd_block_d": 128,
-            "fwd_block_k": 32,
-            "prepare_launch": (8, 3),
-            "prefix_launch": (8, 3),
-            "decoder_launch": (4, 1),
-            "fwd_launch": (4, 1),
-        }
-    if bucket == 384:
-        return {
-            "prepare_block_d": 128,
-            "prepare_block_k": 64,
-            "prefix_block_d": 128,
-            "fwd_block_d": 128,
-            "fwd_block_k": 32,
-            "prepare_launch": (8, 3),
-            "prefix_launch": (8, 3),
-            "decoder_launch": (4, 1),
-            "fwd_launch": (4, 1),
-        }
-    return {
-        "prepare_block_d": 128,
-        "prepare_block_k": 64,
-        "prefix_block_d": 128,
-        "fwd_block_d": 128,
-        "fwd_block_k": 64,
-        "prepare_launch": (8, 3),
-        "prefix_launch": (8, 3),
-        "decoder_launch": (4, 1),
-        "fwd_launch": (4, 1),
-    }
-
-
 def _get_chunked_backward_bucket(D: int) -> int:
     """Return the backward launch bucket for the current head dimension."""
     return _get_chunked_forward_bucket(D)
 
 
 def _get_chunked_backward_bucket_defaults(M: int, D: int) -> dict[str, object]:
-    """Return H100-profiled backward defaults for the nearest supported D bucket.
-
-    The active backward hot spot is `flare_chunk_bwd_lse_p_part`. On the target
-    bf16 training shape (`B=8, H=4, N=4096, M=64`) the old wider-D replay
-    family (`BLOCK_M=32`, `BLOCK_K=64`, `8 warps`) was the dominant bottleneck.
-    A single 64-wide M tile with a 32-wide reduction tile and 4 replay warps
-    roughly halved end-to-end backward time from D=96 upward:
-    - D=96:  12.62 ->  6.18 ms
-    - D=128: 12.35 ->  6.38 ms
-    - D=192: 19.93 -> 10.10 ms
-    - D=256: 26.78 -> 13.80 ms
-    - D=384: 44.15 -> 22.55 ms
-    - D=512: 64.07 -> 32.98 ms
-    The smaller buckets do not want that change: D=64 regressed with BLOCK_K=32.
-    """
+    """Return structural backward defaults for the nearest supported D bucket."""
     bucket = _get_chunked_backward_bucket(D)
     wide_m_tile = _snap_block_m_default(M, 64)
     narrow_m_tile = _snap_block_m_default(M, 32 if M < 64 else 64)
@@ -274,34 +284,16 @@ def _get_chunked_backward_bucket_defaults(M: int, D: int) -> dict[str, object]:
         return {
             "block_m": narrow_m_tile,
             "block_dv_state": 16,
-            "block_k": 16,
-            "block_d_part": 16,
-            "qk_block_d": 16,
-            "replay_launch": (4, 2),
-            "state_launch": (4, 2),
-            "qk_launch": (4, 2),
         }
     if bucket == 32:
         return {
             "block_m": wide_m_tile,
             "block_dv_state": 32,
-            "block_k": 32,
-            "block_d_part": 32,
-            "qk_block_d": 32,
-            "replay_launch": (4, 2),
-            "state_launch": (4, 2),
-            "qk_launch": (4, 2),
         }
     if bucket == 64:
         return {
             "block_m": wide_m_tile,
             "block_dv_state": 32,
-            "block_k": 64,
-            "block_d_part": 64,
-            "qk_block_d": 64,
-            "replay_launch": (4, 2),
-            "state_launch": (4, 2),
-            "qk_launch": (4, 2),
         }
     # All wider profiled buckets converged on the same replay family. Keeping
     # the branches explicit makes it obvious that we validated each width even
@@ -310,69 +302,48 @@ def _get_chunked_backward_bucket_defaults(M: int, D: int) -> dict[str, object]:
         return {
             "block_m": wide_m_tile,
             "block_dv_state": 64,
-            "block_k": 32,
-            "block_d_part": 64,
-            "qk_block_d": 64,
-            "replay_launch": (4, 2),
-            "state_launch": (4, 2),
-            "qk_launch": (4, 2),
         }
     if bucket == 128:
         return {
             "block_m": wide_m_tile,
             "block_dv_state": 64,
-            "block_k": 32,
-            "block_d_part": 64,
-            "qk_block_d": 64,
-            "replay_launch": (4, 2),
-            "state_launch": (4, 2),
-            "qk_launch": (4, 2),
         }
     if bucket == 192:
         return {
             "block_m": wide_m_tile,
             "block_dv_state": 64,
-            "block_k": 32,
-            "block_d_part": 64,
-            "qk_block_d": 64,
-            "replay_launch": (4, 2),
-            "state_launch": (4, 2),
-            "qk_launch": (4, 2),
         }
     if bucket == 256:
         return {
             "block_m": wide_m_tile,
             "block_dv_state": 64,
-            "block_k": 32,
-            "block_d_part": 64,
-            "qk_block_d": 64,
-            "replay_launch": (4, 2),
-            "state_launch": (4, 2),
-            "qk_launch": (4, 2),
         }
     if bucket == 384:
         return {
             "block_m": wide_m_tile,
             "block_dv_state": 64,
-            "block_k": 32,
-            "block_d_part": 64,
-            "qk_block_d": 64,
-            "replay_launch": (4, 2),
-            "state_launch": (4, 2),
-            "qk_launch": (4, 2),
         }
     if bucket == 512:
         return {
             "block_m": wide_m_tile,
             "block_dv_state": 64,
-            "block_k": 32,
-            "block_d_part": 64,
-            "qk_block_d": 64,
-            "replay_launch": (4, 2),
-            "state_launch": (4, 2),
-            "qk_launch": (4, 2),
         }
     raise ValueError(f"Unsupported chunked backward bucket for D={D}: bucket={bucket}")
+
+
+def _select_chunked_bwd_qk_launch(M: int, D: int, chunk_size: int) -> tuple[int, int, int, int]:
+    if D <= 32 and M <= 128 and chunk_size >= 64:
+        block_t = 64
+    else:
+        block_t = 16 if chunk_size <= 32 else 32
+    block_t = min(block_t, chunk_size)
+    if (block_t % 16) != 0:
+        raise ValueError(f"ChunkedFLARE LSE backward requires BLOCK_T_QK be a multiple of 16. Got BLOCK_T_QK={block_t}")
+    preferred_block_d = 64 if D >= 64 else D
+    block_d = _snap_block_d_default(D, preferred_block_d)
+    if (block_d % 16) != 0:
+        raise ValueError(f"ChunkedFLARE LSE backward requires QK_BLOCK_D be a multiple of 16. Got BLOCK_D={block_d}")
+    return block_t, block_d, 4, 2
 
 
 def _get_chunked_forward_config(
@@ -429,147 +400,11 @@ def _get_chunked_forward_config(
         _DEBUG_PREFIX_STATS["block_m"] = block_m
         _DEBUG_PREFIX_STATS["chunk_size"] = chunk_size
 
-    bucket_defaults = _get_chunked_forward_bucket_defaults(D)
-
-    prepare_block_d_env = os.environ.get("FLARE_PREPARE_BLOCK_D", "")
-    if prepare_block_d_env:
-        prepare_block_d = int(prepare_block_d_env)
-    else:
-        # The D bucket table encodes the measured H100 launch family for each
-        # profiled head-width regime. We still snap to a power-of-two tile so
-        # Triton `tl.arange(0, BLOCK_D)` remains valid for odd widths like D=96.
-        prepare_block_d = _snap_block_d_default(D, int(bucket_defaults["prepare_block_d"]))
-    if prepare_block_d > D:
-        raise ValueError(
-            f"FLARE_PREPARE_BLOCK_D must be <= D. Got D={D}, FLARE_PREPARE_BLOCK_D={prepare_block_d}."
-        )
-    assert prepare_block_d % 16 == 0, (
-        f"FLARE_PREPARE_BLOCK_D must be divisible by 16. Got FLARE_PREPARE_BLOCK_D={prepare_block_d}."
-    )
-    _require_power_of_two_tile("FLARE_PREPARE_BLOCK_D", prepare_block_d)
-
-    prepare_block_k_env = os.environ.get("FLARE_PREPARE_BLOCK_K", "")
-    if prepare_block_k_env:
-        prepare_block_k = int(prepare_block_k_env)
-    else:
-        prepare_block_k = _block_k_divisor(D, int(bucket_defaults["prepare_block_k"]))
-    if prepare_block_k > D:
-        prepare_block_k = D
-    assert prepare_block_k % 16 == 0, (
-        f"FLARE_PREPARE_BLOCK_K must be divisible by 16. Got FLARE_PREPARE_BLOCK_K={prepare_block_k}."
-    )
-    assert D % prepare_block_k == 0, (
-        f"FLARE_PREPARE_BLOCK_K must divide D. Got D={D}, FLARE_PREPARE_BLOCK_K={prepare_block_k}."
-    )
-
-    prefix_block_m_env = os.environ.get("FLARE_PREFIX_BLOCK_M", "")
-    if prefix_block_m_env:
-        prefix_block_m = int(prefix_block_m_env)
-    else:
-        prefix_block_m = block_m
-    if prefix_block_m > M:
-        raise ValueError(f"FLARE_PREFIX_BLOCK_M must be <= M. Got M={M}, FLARE_PREFIX_BLOCK_M={prefix_block_m}.")
-    assert prefix_block_m % 16 == 0, (
-        f"FLARE_PREFIX_BLOCK_M must be divisible by 16. Got FLARE_PREFIX_BLOCK_M={prefix_block_m}."
-    )
-    _require_power_of_two_tile("FLARE_PREFIX_BLOCK_M", prefix_block_m)
-
-    prefix_block_d_env = os.environ.get("FLARE_PREFIX_BLOCK_D", "")
-    if prefix_block_d_env:
-        prefix_block_d = int(prefix_block_d_env)
-    else:
-        prefix_block_d = _snap_block_d_default(D, int(bucket_defaults["prefix_block_d"]))
-    if prefix_block_d > D:
-        raise ValueError(
-            f"FLARE_PREFIX_BLOCK_D must be <= D. Got D={D}, FLARE_PREFIX_BLOCK_D={prefix_block_d}."
-        )
-    assert prefix_block_d % 16 == 0, (
-        f"FLARE_PREFIX_BLOCK_D must be divisible by 16. Got FLARE_PREFIX_BLOCK_D={prefix_block_d}."
-    )
-    _require_power_of_two_tile("FLARE_PREFIX_BLOCK_D", prefix_block_d)
-
-    fwd_block_d_env = os.environ.get("FLARE_FWD_BLOCK_D", "")
-    if fwd_block_d_env:
-        fwd_block_d = int(fwd_block_d_env)
-    else:
-        fwd_block_d = _snap_block_d_default(D, int(bucket_defaults["fwd_block_d"]))
-    if fwd_block_d > D:
-        raise ValueError(
-            f"FLARE_FWD_BLOCK_D must be <= D. Got D={D}, FLARE_FWD_BLOCK_D={fwd_block_d}."
-        )
-    assert fwd_block_d % 16 == 0, (
-        f"FLARE_FWD_BLOCK_D must be divisible by 16. Got FLARE_FWD_BLOCK_D={fwd_block_d}."
-    )
-    _require_power_of_two_tile("FLARE_FWD_BLOCK_D", fwd_block_d)
-
-    fwd_block_k_env = os.environ.get("FLARE_FWD_BLOCK_K", "")
-    if fwd_block_k_env:
-        fwd_block_k = int(fwd_block_k_env)
-    else:
-        fwd_block_k = _block_k_divisor(D, int(bucket_defaults["fwd_block_k"]))
-    if fwd_block_k > D:
-        fwd_block_k = D
-    assert fwd_block_k % 16 == 0, (
-        f"FLARE_FWD_BLOCK_K must be divisible by 16. Got FLARE_FWD_BLOCK_K={fwd_block_k}."
-    )
-    assert D % fwd_block_k == 0, (
-        f"FLARE_FWD_BLOCK_K must divide D. Got D={D}, FLARE_FWD_BLOCK_K={fwd_block_k}."
-    )
-
-    block_t_env = os.environ.get("FLARE_BLOCK_T", "")
-    if block_t_env:
-        block_t = int(block_t_env)
-    else:
-        block_t = 16 if chunk_size >= 16 else chunk_size
-    if block_t > chunk_size:
-        block_t = chunk_size
-    assert block_t > 0, f"BLOCK_T must be > 0. Got BLOCK_T={block_t}."
-
-    # Launch defaults follow the same explicit D buckets as the tile sizes.
-    # The table is profiled per phase because the hot kernels do not scale
-    # uniformly with D: decoder/fwd prefer lighter launches than prepare/prefix,
-    # and D=96/D=192 are the two buckets where 2-warps replay beat 4-warps.
-    prepare_defaults = bucket_defaults["prepare_launch"]
-    prefix_defaults = bucket_defaults["prefix_launch"]
-    decoder_defaults = bucket_defaults["decoder_launch"]
-    fwd_defaults = bucket_defaults["fwd_launch"]
-    prepare_num_warps, prepare_num_stages = _resolve_forward_launch(
-        "prepare",
-        default_num_warps=prepare_defaults[0],
-        default_num_stages=prepare_defaults[1],
-    )
-    prefix_num_warps, prefix_num_stages = _resolve_forward_launch(
-        "prefix",
-        default_num_warps=prefix_defaults[0],
-        default_num_stages=prefix_defaults[1],
-    )
-    decoder_num_warps, decoder_num_stages = _resolve_forward_launch(
-        "decoder",
-        default_num_warps=decoder_defaults[0],
-        default_num_stages=decoder_defaults[1],
-    )
-    fwd_num_warps, fwd_num_stages = _resolve_forward_launch(
-        "fwd",
-        default_num_warps=fwd_defaults[0],
-        default_num_stages=fwd_defaults[1],
-    )
-
     return {
         "CHUNK_SIZE": chunk_size,
         "BLOCK_M": block_m,
-        "PREPARE_BLOCK_D": prepare_block_d,
-        "PREPARE_BLOCK_K": prepare_block_k,
-        "PREFIX_BLOCK_M": prefix_block_m,
-        "PREFIX_BLOCK_D": prefix_block_d,
-        "FWD_BLOCK_D": fwd_block_d,
-        "FWD_BLOCK_K": fwd_block_k,
-        "BLOCK_T": block_t,
         "NUM_CHUNKS": math.ceil(N / chunk_size),
         "NUM_M_BLOCKS": math.ceil(M / block_m),
-        "NUM_PREPARE_D_BLOCKS": math.ceil(D / prepare_block_d),
-        "NUM_PREFIX_M_BLOCKS": math.ceil(M / prefix_block_m),
-        "NUM_PREFIX_D_BLOCKS": math.ceil(D / prefix_block_d),
-        "NUM_FWD_D_BLOCKS": math.ceil(D / fwd_block_d),
         "use_fp16": use_fp16,
         "use_bf16": use_bf16,
         "compute_dtype": compute_dtype,
@@ -578,14 +413,6 @@ def _get_chunked_forward_config(
         "eps": _get_eps_for_dtype(dtype),
         "clamp_max": _get_exp_clamp_for_dtype(dtype),
         "input_precision": _normalize_input_precision(input_precision, None),
-        "prepare_num_warps": prepare_num_warps,
-        "prepare_num_stages": prepare_num_stages,
-        "prefix_num_warps": prefix_num_warps,
-        "prefix_num_stages": prefix_num_stages,
-        "decoder_num_warps": decoder_num_warps,
-        "decoder_num_stages": decoder_num_stages,
-        "fwd_num_warps": fwd_num_warps,
-        "fwd_num_stages": fwd_num_stages,
     }
 
 
@@ -626,10 +453,13 @@ def _run_chunked_prepare_phase(
 
     # Phase 1 uses the third grid dimension as a flattened (m_block, d_block)
     # space because Triton only gives us 3 launch dimensions. Each program owns
-    # one [BLOCK_M, PREPARE_BLOCK_D] numerator tile and recomputes the shared
+    # one [BLOCK_M, BLOCK_D] numerator tile and recomputes the shared
     # score/max/den recurrence locally for that m_block.
+    def prepare_grid(meta):
+        return (BH, config["NUM_CHUNKS"], config["NUM_M_BLOCKS"] * triton.cdiv(D, meta["BLOCK_D"]))
+
     def launch_prepare():
-        flare_chunk_prepare[(BH, config["NUM_CHUNKS"], config["NUM_M_BLOCKS"] * config["NUM_PREPARE_D_BLOCKS"])](
+        flare_chunk_prepare[prepare_grid](
             K_comp, Q_comp, V_comp,
             chunk_max, chunk_den, chunk_num,
             K_stride[0], K_stride[1], K_stride[2], K_stride[3],
@@ -641,16 +471,11 @@ def _run_chunked_prepare_phase(
             BH, M, N, D, scale,
             CHUNK_SIZE=config["CHUNK_SIZE"],
             BLOCK_M=config["BLOCK_M"],
-            BLOCK_D=config["PREPARE_BLOCK_D"],
-            BLOCK_K=config["PREPARE_BLOCK_K"],
-            NUM_D_BLOCKS=config["NUM_PREPARE_D_BLOCKS"],
             USE_FP16=config["use_fp16"],
             USE_BF16=config["use_bf16"],
             USE_FP32_STATS=config["stats_fp32"],
             INPUT_PRECISION=config["input_precision"],
             H=H,
-            num_warps=config["prepare_num_warps"],
-            num_stages=config["prepare_num_stages"],
         )
 
     _profiled_call(device, kernel_timings, "flare_chunk_prepare", launch_prepare)
@@ -685,8 +510,11 @@ def _run_chunked_prefix_phase(
         alloc_prefix_stats,
     )
 
+    def prefix_grid(meta):
+        return (BH, config["NUM_M_BLOCKS"], triton.cdiv(D, meta["BLOCK_D"]))
+
     def launch_prefix():
-        flare_chunk_prefix[(BH, config["NUM_PREFIX_M_BLOCKS"], config["NUM_PREFIX_D_BLOCKS"])](
+        flare_chunk_prefix[prefix_grid](
             chunk_max, chunk_den, chunk_num,
             prefix_max, prefix_den, prefix_num,
             *chunk_max.stride(),
@@ -696,13 +524,10 @@ def _run_chunked_prefix_phase(
             *prefix_den.stride(),
             *prefix_num.stride(),
             BH, M, D, config["NUM_CHUNKS"],
-            BLOCK_M=config["PREFIX_BLOCK_M"],
-            BLOCK_D=config["PREFIX_BLOCK_D"],
+            BLOCK_M=config["BLOCK_M"],
             USE_FP16=config["use_fp16"],
             USE_BF16=config["use_bf16"],
             USE_FP32_STATS=config["stats_fp32"],
-            num_warps=config["prefix_num_warps"],
-            num_stages=config["prefix_num_stages"],
         )
 
     _profiled_call(device, kernel_timings, "flare_chunk_prefix", launch_prefix)
@@ -733,16 +558,11 @@ def _run_chunked_output_phase(
     B = K_comp.size(0)
     device = K_comp.device
     num_fwd_m_tiles = triton.cdiv(M, config["BLOCK_M"])
-    single_writer_output = num_fwd_m_tiles == 1 and config["NUM_FWD_D_BLOCKS"] == 1
 
     def alloc_output_buffers():
-        # The output buffer only needs zero-init when multiple programs accumulate
-        # into the same token/dim location. For the common M=BLOCK_M, D=BLOCK_D
-        # case there is a single writer, so `tl.store` can write directly.
-        if zero_fill_output or not single_writer_output:
-            O = torch.zeros((B, N, H, D), device=device, dtype=torch.float32)
-        else:
-            O = torch.empty((B, N, H, D), device=device, dtype=torch.float32)
+        # With autotuned BLOCK_D the kernel may choose either the single-writer
+        # or atomic-accumulation path, so keep the destination zero-initialized.
+        O = torch.zeros((B, N, H, D), device=device, dtype=torch.float32)
         LSE_enc = torch.full((B, H, N, M), -float("inf"), device=device, dtype=torch.float32)
         LSE_dec = torch.empty((B * H, N), device=device, dtype=torch.float32)
         return O, LSE_enc, LSE_dec
@@ -771,21 +591,20 @@ def _run_chunked_output_phase(
             B * H, M, N, D, scale,
             CHUNK_SIZE=config["CHUNK_SIZE"],
             BLOCK_M=config["BLOCK_M"],
-            BLOCK_K=config["FWD_BLOCK_K"],
-            BLOCK_T=config["BLOCK_T"],
             INPUT_PRECISION=config["input_precision"],
             H=H,
-            num_warps=config["decoder_num_warps"],
-            num_stages=config["decoder_num_stages"],
         )
 
     _profiled_call(device, kernel_timings, "flare_chunk_decoder_lse", launch_decoder_lse)
+
+    def fwd_grid(meta):
+        return (B * H, config["NUM_CHUNKS"], num_fwd_m_tiles * triton.cdiv(D, meta["BLOCK_D"]))
 
     def launch_fwd():
         # Forward remains M/D tiled, while decoder normalization is supplied by
         # a dedicated LSE kernel so each tile can reuse precomputed decode
         # weights across the inner token replay loop.
-        flare_chunk_fwd[(B * H, config["NUM_CHUNKS"], num_fwd_m_tiles * config["NUM_FWD_D_BLOCKS"])](
+        flare_chunk_fwd[fwd_grid](
             K_comp, Q_comp, V_comp, Q_dec_comp, K_dec_comp,
             prefix_max, prefix_den, prefix_num,
             O, LSE_enc, LSE_dec,
@@ -801,21 +620,15 @@ def _run_chunked_output_phase(
             LSE_enc_stride[0], LSE_enc_stride[1], LSE_enc_stride[2], LSE_enc_stride[3],
             LSE_dec_stride[0], LSE_dec_stride[1],
             B * H, M, N, D, scale,
-            NUM_D_BLOCKS=config["NUM_FWD_D_BLOCKS"],
             CHUNK_SIZE=config["CHUNK_SIZE"],
             BLOCK_M=config["BLOCK_M"],
-            BLOCK_D=config["FWD_BLOCK_D"],
-            BLOCK_K=config["FWD_BLOCK_K"],
-            BLOCK_T=config["BLOCK_T"],
             USE_FP16=config["use_fp16"],
             USE_BF16=config["use_bf16"],
             USE_FP32_STATS=config["stats_fp32"],
             INPUT_PRECISION=config["input_precision"],
-            SINGLE_WRITER_OUTPUT=single_writer_output,
+            SINGLE_M_TILE=num_fwd_m_tiles == 1,
             WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
             H=H,
-            num_warps=config["fwd_num_warps"],
-            num_stages=config["fwd_num_stages"],
         )
 
     _profiled_call(device, kernel_timings, "flare_chunk_fwd", launch_fwd)
@@ -987,9 +800,6 @@ class ChunkedFLARE(autograd.Function):
         ctx.out_dtype = dtype
         ctx.use_fp32_stats = cfg["stats_fp32"]
         ctx.input_precision = cfg["input_precision"]
-        ctx.block_m = cfg["BLOCK_M"]
-        ctx.prepare_block_d = cfg["PREPARE_BLOCK_D"]
-        ctx.prepare_block_k = cfg["PREPARE_BLOCK_K"]
         ctx.H = H
         ctx.M = M
         ctx.N = N
@@ -1012,6 +822,11 @@ class ChunkedFLARE(autograd.Function):
         return _chunked_flare_lse_backward_impl(ctx, dO, dTimings)
 
 
+@triton.autotune(
+    configs=_CHUNK_PREPARE_AUTOTUNE_CONFIGS,
+    key=["M", "D", "CHUNK_SIZE", "BLOCK_M"],
+    prune_configs_by={"early_config_prune": _prune_prepare_autotune_configs},
+)
 @triton.jit
 def flare_chunk_prepare(
     K_ptr, Q_ptr, V_ptr,
@@ -1027,7 +842,6 @@ def flare_chunk_prepare(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    NUM_D_BLOCKS: tl.constexpr,
     USE_FP16: tl.constexpr,
     USE_BF16: tl.constexpr,
     USE_FP32_STATS: tl.constexpr,
@@ -1037,8 +851,9 @@ def flare_chunk_prepare(
     pid_bh = tl.program_id(0)
     chunk_idx = tl.program_id(1)
     pid_md = tl.program_id(2)
-    pid_m = pid_md // NUM_D_BLOCKS
-    pid_d = pid_md % NUM_D_BLOCKS
+    num_d_blocks = tl.cdiv(D, BLOCK_D)
+    pid_m = pid_md // num_d_blocks
+    pid_d = pid_md % num_d_blocks
     if pid_bh >= BH:
         return
 
@@ -1119,6 +934,11 @@ def flare_chunk_prepare(
     )
 
 
+@triton.autotune(
+    configs=_CHUNK_PREFIX_AUTOTUNE_CONFIGS,
+    key=["M", "D", "NUM_CHUNKS", "BLOCK_M"],
+    prune_configs_by={"early_config_prune": _prune_prefix_autotune_configs},
+)
 @triton.jit
 def flare_chunk_prefix(
     ChunkMax_ptr, ChunkDen_ptr, ChunkNum_ptr,
@@ -1204,6 +1024,11 @@ def flare_chunk_prefix(
         prefix_max_state = max_new.to(state_dtype)
 
 
+@triton.autotune(
+    configs=_CHUNK_DECODER_AUTOTUNE_CONFIGS,
+    key=["M", "D", "CHUNK_SIZE", "BLOCK_M"],
+    prune_configs_by={"early_config_prune": _prune_decoder_autotune_configs},
+)
 @triton.jit
 def flare_chunk_decoder_lse(
     Q_dec_ptr, K_dec_ptr, LSE_dec_ptr,
@@ -1287,6 +1112,11 @@ def flare_chunk_decoder_lse(
         t0 += BLOCK_T
 
 
+@triton.autotune(
+    configs=_CHUNK_FWD_AUTOTUNE_CONFIGS,
+    key=["M", "D", "CHUNK_SIZE", "BLOCK_M", "SINGLE_M_TILE"],
+    prune_configs_by={"early_config_prune": _prune_fwd_autotune_configs},
+)
 @triton.jit
 def flare_chunk_fwd(
     K_ptr, Q_ptr, V_ptr, Q_dec_ptr, K_dec_ptr,
@@ -1304,7 +1134,6 @@ def flare_chunk_fwd(
     stride_lsee_b, stride_lsee_h, stride_lsee_n, stride_lsee_m,
     stride_lsed_bh, stride_lsed_n,
     BH, M: tl.constexpr, N, D: tl.constexpr, scale,
-    NUM_D_BLOCKS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -1314,7 +1143,7 @@ def flare_chunk_fwd(
     USE_BF16: tl.constexpr,
     USE_FP32_STATS: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    SINGLE_WRITER_OUTPUT: tl.constexpr,
+    SINGLE_M_TILE: tl.constexpr,
     WEIGHT_SHARING_ENC_DEC: tl.constexpr,
     H: tl.constexpr,
 ):
@@ -1324,11 +1153,12 @@ def flare_chunk_fwd(
     pid_bh = tl.program_id(0)
     chunk_idx = tl.program_id(1)
     pid_md = tl.program_id(2)
+    num_d_blocks = tl.cdiv(D, BLOCK_D)
     if pid_bh >= BH:
         return
 
-    pid_m = pid_md // NUM_D_BLOCKS
-    pid_d = pid_md - pid_m * NUM_D_BLOCKS
+    pid_m = pid_md // num_d_blocks
+    pid_d = pid_md - pid_m * num_d_blocks
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
 
@@ -1476,7 +1306,7 @@ def flare_chunk_fwd(
             w = exp_a * inv_l
             o_t = tl.sum(w[:, None] * n_state, axis=0)
             o_ptr = O_base_ptr + (t0 + j) * stride_o_n + d_offsets * stride_o_d
-            if SINGLE_WRITER_OUTPUT:
+            if SINGLE_M_TILE and BLOCK_D == D:
                 tl.store(o_ptr, o_t, mask=token_valid & mask_d)
             else:
                 tl.atomic_add(o_ptr, o_t, mask=token_valid & mask_d)
@@ -2154,6 +1984,12 @@ def _chunk_decode_score_vec(
     return tl.where(mask_m, a_t * scale, -float("inf"))
 
 
+@triton.autotune(
+    configs=_CHUNK_BWD_P_PART_AUTOTUNE_CONFIGS,
+    key=["BLOCK_M", "BLOCK_M_REPLAY", "D", "CHUNK_SIZE", "WEIGHT_SHARING_ENC_DEC"],
+    prune_configs_by={"early_config_prune": _prune_p_part_autotune_configs},
+    reset_to_zero=["P_ptr"],
+)
 @triton.jit
 def flare_chunk_bwd_lse_p_part(
     Q_ptr,
@@ -2766,6 +2602,11 @@ def flare_chunk_bwd_lse_p_part(
                 t += 1
 
 
+@triton.autotune(
+    configs=_CHUNK_BWD_GP_REDUCE_AUTOTUNE_CONFIGS,
+    key=["M", "CHUNK_SIZE"],
+    prune_configs_by={"early_config_prune": _prune_gp_reduce_autotune_configs},
+)
 @triton.jit
 def flare_chunk_bwd_lse_gp_reduce(
     P_ptr,
@@ -3005,6 +2846,11 @@ def flare_chunk_bwd_lse_p_part_from_scores(
         t += 1
 
 
+@triton.autotune(
+    configs=_CHUNK_BWD_CHUNK_SUMMARY_AUTOTUNE_CONFIGS,
+    key=["BLOCK_M", "BLOCK_DV", "D", "CHUNK_SIZE"],
+    prune_configs_by={"early_config_prune": _prune_chunk_summary_autotune_configs},
+)
 @triton.jit
 def flare_chunk_bwd_lse_chunk_summary(
     LSE_ptr,
@@ -3183,6 +3029,10 @@ def flare_chunk_bwd_lse_chunk_summary(
     )
 
 
+@triton.autotune(
+    configs=_CHUNK_BWD_CARRY_SCAN_AUTOTUNE_CONFIGS,
+    key=["BLOCK_M", "BLOCK_DV", "D", "NUM_CHUNKS"],
+)
 @triton.jit
 def flare_chunk_bwd_lse_carry_scan(
     BLocal_ptr,
@@ -3263,6 +3113,11 @@ def flare_chunk_bwd_lse_carry_scan(
         future_a = a_local + scale_chunk * future_a
 
 
+@triton.autotune(
+    configs=_CHUNK_BWD_CHUNK_APPLY_AUTOTUNE_CONFIGS,
+    key=["BLOCK_M", "BLOCK_DV", "D", "CHUNK_SIZE", "USE_BLOCKED_APPLY"],
+    prune_configs_by={"early_config_prune": _prune_apply_autotune_configs},
+)
 @triton.jit
 def flare_chunk_bwd_lse_chunk_apply_part(
     V_ptr,
@@ -3489,6 +3344,11 @@ def flare_chunk_bwd_lse_chunk_apply_part(
             lse_next = lse_curr
 
 
+@triton.autotune(
+    configs=_CHUNK_BWD_CHUNK_APPLY_AUTOTUNE_CONFIGS,
+    key=["BLOCK_M", "NUM_DV_TILES", "CHUNK_SIZE", "WEIGHT_SHARING_ENC_DEC", "USE_BLOCKED_APPLY"],
+    prune_configs_by={"early_config_prune": _prune_apply_autotune_configs},
+)
 @triton.jit
 def flare_chunk_bwd_lse_chunk_apply_finalize(
     LSE_ptr,
@@ -3753,6 +3613,11 @@ def flare_chunk_bwd_lse_chunk_apply_finalize(
             lse_next = lse_curr
 
 
+@triton.autotune(
+    configs=_CHUNK_BWD_CHUNK_APPLY_AUTOTUNE_CONFIGS,
+    key=["BLOCK_M", "BLOCK_DV", "D", "CHUNK_SIZE", "WEIGHT_SHARING_ENC_DEC", "USE_BLOCKED_APPLY", "USE_SCALAR_PANEL_APPLY"],
+    prune_configs_by={"early_config_prune": _prune_apply_autotune_configs},
+)
 @triton.jit
 def flare_chunk_bwd_lse_chunk_apply_fused_single_dv(
     V_ptr,
@@ -4207,6 +4072,10 @@ def flare_chunk_bwd_lse_chunk_apply_fused_single_dv(
             lse_next = lse_curr
 
 
+@triton.autotune(
+    configs=_CHUNK_BWD_SCAN_APPLY_FUSED_AUTOTUNE_CONFIGS,
+    key=["BLOCK_M", "BLOCK_DV", "D", "CHUNK_SIZE", "NUM_CHUNKS", "WEIGHT_SHARING_ENC_DEC"],
+)
 @triton.jit
 def flare_chunk_bwd_lse_scan_apply_fused_single_dv(
     V_ptr,
@@ -4350,6 +4219,11 @@ def flare_chunk_bwd_lse_scan_apply_fused_single_dv(
             lse_next = lse_curr
 
 
+@triton.autotune(
+    configs=_CHUNK_BWD_DV_REDUCE_AUTOTUNE_CONFIGS,
+    key=["D", "CHUNK_SIZE", "NUM_M_TILES"],
+    prune_configs_by={"early_config_prune": _prune_dv_reduce_autotune_configs},
+)
 @triton.jit
 def flare_chunk_bwd_lse_dv_reduce(
     dVPart_ptr,
@@ -4461,189 +4335,24 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
         raise ValueError(
             f"ChunkedFLARE LSE backward requires BLOCK_DV be a multiple of 16. Got BLOCK_DV={block_dv_state}"
         )
-    block_k_env = os.environ.get("FLARE_LSE_BWD_BLOCK_K", "")
-    if block_k_env:
-        block_k = int(block_k_env)
-    else:
-        # `p_part` is the dominant backward kernel for D>=96. The bucket table
-        # above keeps D<=64 on the old wider reduction tiles, but explicitly
-        # switches the wider buckets to BLOCK_K=32 because 64 was replaying too
-        # much score-reduction state per program on H100.
-        block_k = _block_k_divisor(D, int(bwd_defaults["block_k"]))
-    if block_k > D:
-        raise ValueError(f"ChunkedFLARE LSE backward requires BLOCK_K <= D. Got D={D}, BLOCK_K={block_k}")
-    if (block_k % 16) != 0:
-        raise ValueError(f"ChunkedFLARE LSE backward requires BLOCK_K be a multiple of 16. Got BLOCK_K={block_k}")
-    if D % block_k != 0:
-        raise ValueError(f"ChunkedFLARE LSE backward requires BLOCK_K to divide D. Got D={D}, BLOCK_K={block_k}")
-
-    block_d_part_env = os.environ.get("FLARE_LSE_BWD_BLOCK_D_PART", "")
-    if block_d_part_env:
-        block_d_part = int(block_d_part_env)
-        if block_d_part > D:
-            raise ValueError(
-                f"ChunkedFLARE LSE backward requires BLOCK_D_PART <= D. Got D={D}, BLOCK_D_PART={block_d_part}"
-            )
-    else:
-        block_d_part = _snap_block_d_default(D, int(bwd_defaults["block_d_part"]))
-        if block_d_part > D:
-            block_d_part = _snap_block_d_default(D, block_d_part)
-    if (block_d_part % 16) != 0:
-        raise ValueError(
-            f"ChunkedFLARE LSE backward requires BLOCK_D_PART be a multiple of 16. Got BLOCK_D_PART={block_d_part}"
-        )
-    _require_power_of_two_tile("FLARE_LSE_BWD_BLOCK_D_PART", block_d_part)
-    block_m_replay_env = os.environ.get("FLARE_LSE_BWD_SCORE_BLOCK_M", "")
-    if block_m_replay_env:
-        block_m_replay = int(block_m_replay_env)
-    else:
-        block_m_replay = block_m
-    if block_m_replay > block_m:
-        block_m_replay = block_m
-    if (block_m_replay % 16) != 0:
-        raise ValueError(
-            "ChunkedFLARE LSE backward requires FLARE_LSE_BWD_SCORE_BLOCK_M be a multiple of 16. "
-            f"Got FLARE_LSE_BWD_SCORE_BLOCK_M={block_m_replay}"
-        )
-    block_t_replay_env = os.environ.get("FLARE_LSE_BWD_BLOCK_T_REPLAY", "")
-    block_t_state_env = os.environ.get("FLARE_LSE_BWD_BLOCK_T_STATE", "")
-    if block_t_state_env:
-        use_blocked_suffix_summary = True
-        block_t_state = int(block_t_state_env)
-        if block_t_state > chunk_size:
-            block_t_state = chunk_size
-        if block_t_state <= 0:
-            raise ValueError(f"ChunkedFLARE LSE backward requires BLOCK_T_STATE > 0. Got BLOCK_T_STATE={block_t_state}")
-        if (block_t_state % 16) != 0:
-            raise ValueError(
-                f"ChunkedFLARE LSE backward requires BLOCK_T_STATE be a multiple of 16. Got BLOCK_T_STATE={block_t_state}"
-            )
-    else:
-        default_block_t_state = (min(32, chunk_size) // 16) * 16
-        if default_block_t_state >= 16:
-            use_blocked_suffix_summary = True
-            block_t_state = default_block_t_state
-        else:
-            use_blocked_suffix_summary = False
-            block_t_state = 16
-    block_t_qk_env = os.environ.get("FLARE_LSE_BWD_BLOCK_T_QK", "")
-    if block_t_qk_env:
-        block_t_qk = int(block_t_qk_env)
-    else:
-        # `flare_chunk_bwd_recurrent_qk` materializes full [M, D] Q tiles and [BLOCK_T, M] dS
-        # tiles inside one program. On H100, `BLOCK_T=64` is best for the common small/medium-M
-        # D<=32 regime, but once M grows the kernel exceeds the shared-memory limit. Keep the
-        # wider tile only where it is known to fit, and fall back to 32-wide token panels
-        # elsewhere.
-        if D <= 32 and M <= 128 and chunk_size >= 64:
-            block_t_qk = 64
-        else:
-            block_t_qk = 16 if chunk_size <= 32 else 32
-    if block_t_qk > chunk_size:
-        block_t_qk = chunk_size
-    if (block_t_qk % 16) != 0:
-        raise ValueError(
-            f"ChunkedFLARE LSE backward requires BLOCK_T_QK be a multiple of 16. Got BLOCK_T_QK={block_t_qk}"
-        )
-    block_d_qk_env = os.environ.get("FLARE_LSE_BWD_QK_BLOCK_D", "")
-    if block_d_qk_env:
-        block_d_qk = int(block_d_qk_env)
-    else:
-        # Recurrent QK used to materialize the entire D axis inside one program,
-        # which broke non-power-of-two widths (for example D=96) and inflated
-        # register pressure for the wider buckets. Tile the contraction over D
-        # with a power-of-two panel instead; D<=64 still keeps the untiled path.
-        block_d_qk = _snap_block_d_default(D, int(bwd_defaults["qk_block_d"]))
-    if block_d_qk > D:
-        raise ValueError(
-            f"ChunkedFLARE LSE backward requires FLARE_LSE_BWD_QK_BLOCK_D <= D. Got D={D}, BLOCK_D={block_d_qk}"
-        )
-    if (block_d_qk % 16) != 0:
-        raise ValueError(
-            "ChunkedFLARE LSE backward requires QK_BLOCK_D be a multiple of 16. "
-            f"Got FLARE_LSE_BWD_QK_BLOCK_D={block_d_qk}"
-        )
-    _require_power_of_two_tile("FLARE_LSE_BWD_QK_BLOCK_D", block_d_qk)
-    block_t_apply_env = os.environ.get("FLARE_LSE_BWD_BLOCK_T_APPLY", "")
-    if block_t_apply_env:
-        block_t_apply = int(block_t_apply_env)
-        if block_t_apply > chunk_size:
-            block_t_apply = chunk_size
-        if block_t_apply < 16 or (block_t_apply % 16) != 0:
-            raise ValueError(
-                "ChunkedFLARE LSE backward requires BLOCK_T_APPLY be a multiple of 16 and >= 16. "
-                f"Got BLOCK_T_APPLY={block_t_apply}"
-            )
-        use_blocked_apply = True
-    else:
-        block_t_apply = 16
-        use_blocked_apply = False
-    scalar_apply_panel_env = os.environ.get("FLARE_LSE_BWD_SCALAR_APPLY_PANEL", "")
-    if scalar_apply_panel_env:
-        scalar_apply_panel = int(scalar_apply_panel_env)
-        if scalar_apply_panel > chunk_size:
-            scalar_apply_panel = chunk_size
-        if scalar_apply_panel <= 0:
-            raise ValueError(
-                f"ChunkedFLARE LSE backward requires SCALAR_APPLY_PANEL > 0. Got SCALAR_APPLY_PANEL={scalar_apply_panel}"
-            )
-        use_scalar_panel_apply = not use_blocked_apply
-    else:
-        scalar_apply_panel = 4
-        use_scalar_panel_apply = False
+    block_m_replay = block_m
+    use_blocked_suffix_summary = True
+    block_t_qk, block_d_qk, qk_num_warps, qk_num_stages = _select_chunked_bwd_qk_launch(M, D, chunk_size)
+    use_blocked_apply = False
+    use_scalar_panel_apply = False
     num_m_tiles = triton.cdiv(M, block_m)
     num_dv_state_tiles = triton.cdiv(D, block_dv_state)
-    num_d_part_blocks = triton.cdiv(D, block_d_part)
     num_replay_tiles = triton.cdiv(block_m, block_m_replay)
     use_fused_single_dv_apply = num_dv_state_tiles == 1
-    use_fused_chunk_scan = use_fused_single_dv_apply and os.environ.get("FLARE_LSE_BWD_FUSE_CHUNK_SCAN", "0") == "1"
+    use_fused_chunk_scan = False
     num_qk_d_tiles = triton.cdiv(D, block_d_qk)
-    if block_t_replay_env:
-        block_t_replay = int(block_t_replay_env)
-    else:
-        block_t_replay = 16
-    if block_t_replay > chunk_size:
-        block_t_replay = chunk_size
-    if block_t_replay <= 0:
-        raise ValueError(f"ChunkedFLARE LSE backward requires BLOCK_T_REPLAY > 0. Got BLOCK_T_REPLAY={block_t_replay}")
     use_blocked_score_replay = block_m <= 32
     use_subtiled_score_replay = (not use_blocked_score_replay) and (block_m_replay < block_m)
-    if use_subtiled_score_replay and block_t_replay < 16:
-        raise ValueError(
-            "ChunkedFLARE LSE backward requires BLOCK_T_REPLAY >= 16 when using internal score-replay subtiles "
-            f"because Triton tl.dot needs M/N/K >= 16. Got BLOCK_T_REPLAY={block_t_replay}."
-        )
     if use_subtiled_score_replay and num_replay_tiles > 4:
         raise ValueError(
             "ChunkedFLARE LSE backward currently supports at most 4 internal score-replay subtiles. "
             f"Got BLOCK_M={block_m}, BLOCK_M_REPLAY={block_m_replay}."
         )
-    replay_defaults = tuple(bwd_defaults["replay_launch"])
-    state_defaults = tuple(bwd_defaults["state_launch"])
-    qk_defaults = tuple(bwd_defaults["qk_launch"])
-    scan_apply_defaults = (
-        (2, 1) if use_fused_chunk_scan and block_m <= 64 and D <= 32 else state_defaults
-    )
-    replay_num_warps, replay_num_stages = _resolve_backward_launch(
-        "replay",
-        default_num_warps=replay_defaults[0],
-        default_num_stages=replay_defaults[1],
-    )
-    state_num_warps, state_num_stages = _resolve_backward_launch(
-        "state",
-        default_num_warps=state_defaults[0],
-        default_num_stages=state_defaults[1],
-    )
-    qk_num_warps, qk_num_stages = _resolve_backward_launch(
-        "qk",
-        default_num_warps=qk_defaults[0],
-        default_num_stages=qk_defaults[1],
-    )
-    scan_apply_num_warps, scan_apply_num_stages = _resolve_backward_launch(
-        "scan_apply",
-        default_num_warps=scan_apply_defaults[0],
-        default_num_stages=scan_apply_defaults[1],
-    )
 
     # The backward pass is split into a few replay/scanning phases:
     # 1) replay the forward normalized-value recurrence inside each chunk to recover per-token scalar terms,
@@ -4665,12 +4374,9 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
 
     def alloc_bwd_buffers():
         # Per-token/query scalar p_t(m) = <z_t(m), dO_t>, where z_t(m) is the normalized running value state
-        # after token t has been incorporated for query row m. When the replay uses multiple D tiles, the kernel
-        # atomically accumulates across pid_d; otherwise it writes each value directly.
-        if num_d_part_blocks > 1:
-            p_buf = torch.zeros((BH, N, M), device=device, dtype=torch.float32)
-        else:
-            p_buf = torch.empty((BH, N, M), device=device, dtype=torch.float32)
+        # after token t has been incorporated for query row m. The autotuned replay kernel may choose either
+        # a single D tile or a multi-tile path, so keep the destination zero-initialized.
+        p_buf = torch.zeros((BH, N, M), device=device, dtype=torch.float32)
         # g_t(m) = exp(score_dec_t(m) - LSE_dec_t): token-wise softmax weight over the M decode rows.
         g_buf = torch.empty((BH, N, M), device=device, dtype=torch.float32)
         # gp_buf[t] = sum_m g_t(m) * p_t(m): the global M-axis reduction used by ds_g.
@@ -4758,7 +4464,9 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
     # - a_buf[t, m] = exp(score_t(m) - L_t(m)).
     #
     def launch_bwd_p_part():
-        return flare_chunk_bwd_lse_p_part[(BH, num_chunks * num_m_tiles, num_d_part_blocks)](
+        return flare_chunk_bwd_lse_p_part[
+            lambda meta: (BH, num_chunks * num_m_tiles, triton.cdiv(D, meta["BLOCK_D"]))
+        ](
             Q, K, V, Q_dec_saved, K_dec_saved, z_prefix_unnormalized, LSE_enc_ctx, LSE_dec, dO_bnhd, p_buf, g_buf, a_buf,
             Q.stride(0), Q.stride(1), Q.stride(2),
             K.stride(0), K.stride(1), K.stride(2), K.stride(3),
@@ -4780,38 +4488,13 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
             BLOCK_M=block_m,
             BLOCK_M_REPLAY=block_m_replay,
             NUM_REPLAY_TILES=num_replay_tiles,
-            BLOCK_D=block_d_part,
-            BLOCK_K=block_k,
-            BLOCK_T=block_t_replay,
             INPUT_PRECISION=ctx.input_precision,
             USE_BLOCKED_SCORE_REPLAY=use_blocked_score_replay,
             USE_SUBTILED_SCORE_REPLAY=use_subtiled_score_replay,
             WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
-            num_warps=replay_num_warps,
-            num_stages=replay_num_stages,
         )
 
     profiled_bwd_call("flare_chunk_bwd_lse_p_part", launch_bwd_p_part)
-
-    block_t_gp_env = os.environ.get("FLARE_LSE_BWD_BLOCK_T_GP", "")
-    if block_t_gp_env:
-        block_t_gp = int(block_t_gp_env)
-    else:
-        block_t_gp = 32 if chunk_size >= 64 else 16
-    if block_t_gp > chunk_size:
-        block_t_gp = chunk_size
-    if block_t_gp <= 0:
-        raise ValueError(f"ChunkedFLARE LSE backward requires BLOCK_T_GP > 0. Got BLOCK_T_GP={block_t_gp}")
-
-    block_m_gp_env = os.environ.get("FLARE_LSE_BWD_BLOCK_M_GP", "")
-    if block_m_gp_env:
-        block_m_gp = int(block_m_gp_env)
-    else:
-        block_m_gp = 64 if M >= 64 else (32 if M >= 32 else (16 if M >= 16 else M))
-    if block_m_gp > M:
-        block_m_gp = M
-    if block_m_gp <= 0:
-        raise ValueError(f"ChunkedFLARE LSE backward requires BLOCK_M_GP > 0. Got BLOCK_M_GP={block_m_gp}")
 
     def launch_bwd_gp_reduce():
         # Reduce gp in chunk-tiled token panels to avoid one-program-per-token
@@ -4826,10 +4509,6 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
             N,
             M,
             CHUNK_SIZE=chunk_size,
-            BLOCK_M=block_m_gp,
-            BLOCK_T=block_t_gp,
-            num_warps=2 if block_m_gp >= 64 else 1,
-            num_stages=1,
         )
 
     profiled_bwd_call("flare_chunk_bwd_lse_gp_reduce", launch_bwd_gp_reduce)
@@ -4856,7 +4535,6 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                 H, M, N,
                 CHUNK_SIZE=chunk_size, D=D, BLOCK_M=block_m, BLOCK_DV=block_dv_state,
                 WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
-                num_warps=scan_apply_num_warps, num_stages=scan_apply_num_stages,
             )
 
         profiled_bwd_call("flare_chunk_bwd_lse_scan_apply_fused", launch_bwd_apply_fused)
@@ -4878,11 +4556,8 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                 H, M, N,
                 NUM_DV_TILES=num_dv_state_tiles,
                 CHUNK_SIZE=chunk_size, D=D, BLOCK_M=block_m, BLOCK_DV=block_dv_state,
-                BLOCK_T=block_t_state,
                 INPUT_PRECISION=ctx.input_precision,
                 USE_BLOCKED_SUFFIX_SUMMARY=use_blocked_suffix_summary,
-                num_warps=state_num_warps,
-                num_stages=state_num_stages,
             )
 
         profiled_bwd_call("flare_chunk_bwd_lse_chunk_summary", launch_bwd_chunk_summary)
@@ -4898,7 +4573,6 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                 M, num_chunks,
                 NUM_DV_TILES=num_dv_state_tiles,
                 D=D, BLOCK_M=block_m, BLOCK_DV=block_dv_state,
-                num_warps=state_num_warps, num_stages=state_num_stages,
             )
 
         profiled_bwd_call("flare_chunk_bwd_lse_carry_scan", launch_bwd_carry_scan)
@@ -4921,13 +4595,10 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                     dV_part.stride(0), dV_part.stride(1), dV_part.stride(2), dV_part.stride(3), dV_part.stride(4),
                     H, M, N,
                     CHUNK_SIZE=chunk_size, D=D, BLOCK_M=block_m, BLOCK_DV=block_dv_state,
-                    BLOCK_T=block_t_apply,
-                    SCALAR_PANEL_T=scalar_apply_panel,
                     INPUT_PRECISION=ctx.input_precision,
                     USE_BLOCKED_APPLY=use_blocked_apply,
                     USE_SCALAR_PANEL_APPLY=use_scalar_panel_apply,
                     WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
-                    num_warps=state_num_warps, num_stages=state_num_stages,
                 )
 
             profiled_bwd_call("flare_chunk_bwd_lse_chunk_apply_fused", launch_bwd_apply_fused)
@@ -4946,8 +4617,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                     H, M, N,
                     NUM_DV_TILES=num_dv_state_tiles,
                     CHUNK_SIZE=chunk_size, D=D, BLOCK_M=block_m, BLOCK_DV=block_dv_state,
-                    BLOCK_T=block_t_apply, INPUT_PRECISION=ctx.input_precision, USE_BLOCKED_APPLY=use_blocked_apply,
-                    num_warps=state_num_warps, num_stages=state_num_stages,
+                    INPUT_PRECISION=ctx.input_precision, USE_BLOCKED_APPLY=use_blocked_apply,
                 )
 
             profiled_bwd_call("flare_chunk_bwd_lse_chunk_apply_part", launch_bwd_apply_part)
@@ -4966,9 +4636,8 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
                     dS_dec.stride(0), dS_dec.stride(1), dS_dec.stride(2), dS_dec.stride(3),
                     H, M, N,
                     NUM_DV_TILES=num_dv_state_tiles,
-                    CHUNK_SIZE=chunk_size, BLOCK_M=block_m, BLOCK_T=block_t_apply, USE_BLOCKED_APPLY=use_blocked_apply,
+                    CHUNK_SIZE=chunk_size, BLOCK_M=block_m, USE_BLOCKED_APPLY=use_blocked_apply,
                     WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
-                    num_warps=state_num_warps, num_stages=state_num_stages,
                 )
 
             profiled_bwd_call("flare_chunk_bwd_lse_chunk_apply_finalize", launch_bwd_apply_finalize)
@@ -4978,13 +4647,12 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
     # we can bypass the reduction kernel and reuse dV_part directly.
     if num_m_tiles > 1:
         def launch_bwd_dv_reduce():
-            return flare_chunk_bwd_lse_dv_reduce[(BH, num_chunks, num_d_part_blocks)](
+            return flare_chunk_bwd_lse_dv_reduce[lambda meta: (BH, num_chunks, triton.cdiv(D, meta["BLOCK_D"]))](
                 dV_part, dV_bhtd,
                 dV_part.stride(0), dV_part.stride(1), dV_part.stride(2), dV_part.stride(3), dV_part.stride(4),
                 dV_bhtd.stride(0), dV_bhtd.stride(1), dV_bhtd.stride(2),
                 num_m_tiles, N,
-                CHUNK_SIZE=chunk_size, D=D, BLOCK_D=block_d_part,
-                num_warps=state_num_warps, num_stages=state_num_stages,
+                CHUNK_SIZE=chunk_size, D=D,
             )
 
         profiled_bwd_call("flare_chunk_bwd_lse_dv_reduce", launch_bwd_dv_reduce)

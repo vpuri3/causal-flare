@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
@@ -32,7 +31,6 @@ except ImportError:
     )
 
 from causal_flare import flare_decode_triton, flare_prefill_triton
-from causal_flare.chunked import _block_k_divisor, _require_power_of_two_tile, _snap_block_d_default
 from causal_flare.inference import flare_recurrent_step_kernel
 
 
@@ -63,46 +61,7 @@ def compile_decode_kernel(
     q_dec_step = k_comp
     k_dec_latent = q_comp
     y = torch.empty((b, h, d), device=k_step.device, dtype=torch.float32)
-
-    block_m_env = os.environ.get("FLARE_DECODE_BLOCK_M", "")
-    if block_m_env:
-        block_m = int(block_m_env)
-    else:
-        block_m = max(16, triton.next_power_of_2(m))
-    if block_m < m:
-        raise ValueError(f"FLARE_DECODE_BLOCK_M must be >= M. Got M={m}, FLARE_DECODE_BLOCK_M={block_m}.")
-    if block_m % 16 != 0:
-        raise ValueError(f"FLARE_DECODE_BLOCK_M must be divisible by 16. Got FLARE_DECODE_BLOCK_M={block_m}.")
-    _require_power_of_two_tile("FLARE_DECODE_BLOCK_M", block_m)
-    block_d_env = os.environ.get("FLARE_DECODE_BLOCK_D", "")
-    if block_d_env:
-        block_d = int(block_d_env)
-        if block_d > d:
-            raise ValueError(f"FLARE_DECODE_BLOCK_D must be <= D. Got D={d}, FLARE_DECODE_BLOCK_D={block_d}.")
-    else:
-        block_d = _snap_block_d_default(d, d if d <= 128 else 64)
-    if block_d % 16 != 0:
-        raise ValueError(f"FLARE_DECODE_BLOCK_D must be divisible by 16. Got FLARE_DECODE_BLOCK_D={block_d}.")
-    _require_power_of_two_tile("FLARE_DECODE_BLOCK_D", block_d)
-    block_k_env = os.environ.get("FLARE_DECODE_BLOCK_K", "")
-    if block_k_env:
-        block_k = int(block_k_env)
-    else:
-        block_k = _block_k_divisor(d, d if block_d == d else 32)
-    if block_k > d:
-        raise ValueError(f"FLARE_DECODE_BLOCK_K must be <= D. Got D={d}, FLARE_DECODE_BLOCK_K={block_k}.")
-    if block_k % 16 != 0:
-        raise ValueError(f"FLARE_DECODE_BLOCK_K must be divisible by 16. Got FLARE_DECODE_BLOCK_K={block_k}.")
-    if d % block_k != 0:
-        raise ValueError(f"FLARE_DECODE_BLOCK_K must divide D. Got D={d}, FLARE_DECODE_BLOCK_K={block_k}.")
-    num_d_blocks = triton.cdiv(d, block_d)
-    decode_launch_kwargs = {}
-    if os.environ.get("FLARE_DECODE_NUM_WARPS", ""):
-        decode_launch_kwargs["num_warps"] = int(os.environ["FLARE_DECODE_NUM_WARPS"])
-    if os.environ.get("FLARE_DECODE_NUM_STAGES", ""):
-        decode_launch_kwargs["num_stages"] = int(os.environ["FLARE_DECODE_NUM_STAGES"])
-
-    compiled = flare_recurrent_step_kernel[(b * h, num_d_blocks)](
+    compiled = flare_recurrent_step_kernel[lambda meta: (b * h, triton.cdiv(d, meta["BLOCK_D"]))](
         q_comp,
         k_comp,
         v_comp,
@@ -148,12 +107,7 @@ def compile_decode_kernel(
         d,
         float(d ** -0.5 if d > 8 else 1.0),
         HAS_MASK=False,
-        BLOCK_M=block_m,
-        BLOCK_D=block_d,
-        BLOCK_K=block_k,
         WEIGHT_SHARING_ENC_DEC=True,
-        NUM_D_BLOCKS=num_d_blocks,
-        **decode_launch_kwargs,
     )
     torch.cuda.synchronize()
     return {"flare_decode_step": compiled}

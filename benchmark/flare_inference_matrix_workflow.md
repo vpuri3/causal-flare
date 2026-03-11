@@ -1,5 +1,9 @@
 # FLARE Inference Matrix Tuning Workflow
 
+Current source of truth for which knobs are still structural versus autotuned:
+
+- [`README.md`](./README.md)
+
 Use this workflow to retune FLARE inference after major kernel/code changes:
 
 - prefill: [`profile_flare_inference.py`](./profile_flare_inference.py) and [`tune_flare_inference_matrix.py`](./tune_flare_inference_matrix.py) with `--mode prefill`
@@ -37,15 +41,13 @@ python benchmark/tune_flare_inference_matrix.py \
   --m-values 64 \
   --n-values 4096 \
   --bh-values 8 \
-  --families default,chunk_size,prefill_block_d,prefill_block_k,prefill_launch,combined
+  --families default,chunk_size,prefill_block_m,combined
 ```
 
 Focus on:
 
 - `CHUNK_SIZE`
-- prefill `BLOCK_D`
-- prefill `BLOCK_K`
-- phase-specific forward launches
+- prefill `BLOCK_M`
 
 ## Decode Seed
 
@@ -58,16 +60,16 @@ python benchmark/tune_flare_inference_matrix.py \
   --n-values 4096 \
   --bh-values 8 \
   --decode-steps 256 \
-  --families default,decode_block_d,decode_block_k,decode_launch,combined
+  --families default
 ```
 
 Focus on:
 
-- decode `BLOCK_D`
-- decode `BLOCK_K`
-- decode launch geometry (`FLARE_DECODE_NUM_WARPS`, `FLARE_DECODE_NUM_STAGES`)
+- decode end-to-end latency and per-kernel profile totals only
+- decode launch parameters are now owned by Triton autotune rather than runtime env overrides
 
 ## Notes
 
-- Decode now validates `BLOCK_D` as a power-of-two tile and requires `BLOCK_K` to divide `D`.
+- Prefill structural sweeps should focus on `CHUNK_SIZE` and `BLOCK_M`; local kernel tiles and launch geometry are now autotuned.
+- Decode uses a curated Triton autotune shortlist for kernel-local launch parameters and no longer exposes `FLARE_DECODE_*` runtime tuning envs.
 - Failed candidate configs are recorded as error rows instead of aborting the entire shard.

@@ -1,17 +1,46 @@
 from ._common import *
 from .chunked import *
 from .chunked import (
-    _block_k_divisor,
+    _autotune_arg,
     _get_chunked_forward_config,
     _profiled_call,
     _refresh_profile_totals,
-    _require_power_of_two_tile,
     _run_chunked_output_phase,
     _run_chunked_prefix_phase,
     _run_chunked_prepare_phase,
-    _snap_block_d_default,
 )
 from .torch import _resolve_flare_causal_decode_inputs as _resolve_inference_decode_inputs
+
+
+def _prune_decode_step_autotune_configs(configs, named_args, **kwargs):
+    m = int(_autotune_arg(named_args, kwargs, "M"))
+    d = int(_autotune_arg(named_args, kwargs, "D"))
+    keep = []
+    for cfg in configs:
+        block_m = int(cfg.kwargs["BLOCK_M"])
+        block_d = int(cfg.kwargs["BLOCK_D"])
+        block_k = int(cfg.kwargs["BLOCK_K"])
+        if block_m < m or block_d > d or block_k > d:
+            continue
+        keep.append(cfg)
+    return keep
+
+
+_INFERENCE_DECODE_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_M": 16, "BLOCK_D": 16, "BLOCK_K": 16}, num_warps=2, num_stages=1),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 16, "BLOCK_K": 16}, num_warps=2, num_stages=1),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 32, "BLOCK_K": 16}, num_warps=2, num_stages=1),
+    triton.Config({"BLOCK_M": 32, "BLOCK_D": 32, "BLOCK_K": 32}, num_warps=2, num_stages=1),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 32, "BLOCK_K": 16}, num_warps=2, num_stages=1),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 32, "BLOCK_K": 32}, num_warps=2, num_stages=1),
+    triton.Config({"BLOCK_M": 64, "BLOCK_D": 64, "BLOCK_K": 32}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_M": 128, "BLOCK_D": 32, "BLOCK_K": 32}, num_warps=2, num_stages=1),
+    triton.Config({"BLOCK_M": 128, "BLOCK_D": 64, "BLOCK_K": 32}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_M": 128, "BLOCK_D": 64, "BLOCK_K": 64}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_M": 256, "BLOCK_D": 64, "BLOCK_K": 32}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_M": 256, "BLOCK_D": 64, "BLOCK_K": 64}, num_warps=4, num_stages=1),
+    triton.Config({"BLOCK_M": 256, "BLOCK_D": 128, "BLOCK_K": 64}, num_warps=4, num_stages=1),
+]
 
 def _init_flare_recurrent_state(
     batch_size: int,
@@ -290,6 +319,13 @@ def flare_decode_pytorch(
 # Triton Cached Implementations
 #======================================================================#
 
+@triton.autotune(
+    configs=_INFERENCE_DECODE_AUTOTUNE_CONFIGS,
+    key=["M", "D", "HAS_MASK"],
+    prune_configs_by={"early_config_prune": _prune_decode_step_autotune_configs},
+    reset_to_zero=["Y_ptr"],
+    restore_value=["M_ptr", "D_ptr", "U_ptr"],
+)
 @triton.jit
 def flare_recurrent_step_kernel(
     Q_ptr, K_ptr, V_ptr, Q_dec_ptr, K_dec_ptr,
@@ -311,7 +347,6 @@ def flare_recurrent_step_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     WEIGHT_SHARING_ENC_DEC: tl.constexpr,
-    NUM_D_BLOCKS: tl.constexpr,
 ):
     pid_bh = tl.program_id(0)
     pid_d = tl.program_id(1)
@@ -495,46 +530,7 @@ def flare_decode_triton(
         prepare_decode_io,
     )
 
-    block_m_env = os.environ.get("FLARE_DECODE_BLOCK_M", "")
-    if block_m_env:
-        block_m = int(block_m_env)
-    else:
-        block_m = max(16, triton.next_power_of_2(M))
-    if block_m < M:
-        raise ValueError(f"FLARE_DECODE_BLOCK_M must be >= M. Got M={M}, FLARE_DECODE_BLOCK_M={block_m}.")
-    if block_m % 16 != 0:
-        raise ValueError(f"FLARE_DECODE_BLOCK_M must be divisible by 16. Got FLARE_DECODE_BLOCK_M={block_m}.")
-    _require_power_of_two_tile("FLARE_DECODE_BLOCK_M", block_m)
-    block_d_env = os.environ.get("FLARE_DECODE_BLOCK_D", "")
-    if block_d_env:
-        block_d = int(block_d_env)
-        if block_d > D:
-            raise ValueError(f"FLARE_DECODE_BLOCK_D must be <= D. Got D={D}, FLARE_DECODE_BLOCK_D={block_d}.")
-    else:
-        block_d = _snap_block_d_default(D, D if D <= 128 else 64)
-    if block_d % 16 != 0:
-        raise ValueError(f"FLARE_DECODE_BLOCK_D must be divisible by 16. Got FLARE_DECODE_BLOCK_D={block_d}.")
-    _require_power_of_two_tile("FLARE_DECODE_BLOCK_D", block_d)
-    block_k_env = os.environ.get("FLARE_DECODE_BLOCK_K", "")
-    if block_k_env:
-        block_k = int(block_k_env)
-    else:
-        block_k = _block_k_divisor(D, D if block_d == D else 32)
-    if block_k > D:
-        raise ValueError(f"FLARE_DECODE_BLOCK_K must be <= D. Got D={D}, FLARE_DECODE_BLOCK_K={block_k}.")
-    if block_k % 16 != 0:
-        raise ValueError(f"FLARE_DECODE_BLOCK_K must be divisible by 16. Got FLARE_DECODE_BLOCK_K={block_k}.")
-    if D % block_k != 0:
-        raise ValueError(f"FLARE_DECODE_BLOCK_K must divide D. Got D={D}, FLARE_DECODE_BLOCK_K={block_k}.")
-    num_d_blocks = math.ceil(D / block_d)
-    decode_num_warps_env = os.environ.get("FLARE_DECODE_NUM_WARPS", "")
-    decode_num_stages_env = os.environ.get("FLARE_DECODE_NUM_STAGES", "")
-    decode_launch_kwargs = {}
-    if decode_num_warps_env:
-        decode_launch_kwargs["num_warps"] = int(decode_num_warps_env)
-    if decode_num_stages_env:
-        decode_launch_kwargs["num_stages"] = int(decode_num_stages_env)
-    grid = (B * H, num_d_blocks)
+    grid = lambda meta: (B * H, triton.cdiv(D, meta["BLOCK_D"]))
     def launch_decode():
         if attention_mask is None:
             return flare_recurrent_step_kernel[grid](
@@ -553,12 +549,7 @@ def flare_decode_triton(
                 0,
                 B, H, M, D, float(scale),
                 HAS_MASK=False,
-                BLOCK_M=block_m,
-                BLOCK_D=block_d,
-                BLOCK_K=block_k,
                 WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
-                NUM_D_BLOCKS=num_d_blocks,
-                **decode_launch_kwargs,
             )
         return flare_recurrent_step_kernel[grid](
             q, k, v, q_dec_step, k_dec_latent,
@@ -576,12 +567,7 @@ def flare_decode_triton(
             attention_mask.stride(0),
             B, H, M, D, float(scale),
             HAS_MASK=True,
-            BLOCK_M=block_m,
-            BLOCK_D=block_d,
-            BLOCK_K=block_k,
             WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
-            NUM_D_BLOCKS=num_d_blocks,
-            **decode_launch_kwargs,
         )
 
     _profiled_call(K.device, forward_timings, "flare_decode_step", launch_decode)
@@ -689,14 +675,6 @@ def flare_prefill_triton(
         dtype=dtype,
         input_precision=input_precision,
     )
-    block_t_env = os.environ.get("FLARE_PREFILL_BLOCK_T", "")
-    if block_t_env:
-        block_t = int(block_t_env)
-        if block_t > cfg["CHUNK_SIZE"]:
-            block_t = cfg["CHUNK_SIZE"]
-        if block_t <= 0:
-            raise ValueError(f"FLARE_PREFILL_BLOCK_T must be > 0. Got {block_t}.")
-        cfg["BLOCK_T"] = block_t
 
     q = Q.contiguous()
     k = K.contiguous()

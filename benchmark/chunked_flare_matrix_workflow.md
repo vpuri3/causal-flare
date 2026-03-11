@@ -1,5 +1,9 @@
 # Chunked FLARE Matrix Tuning Workflow
 
+Current source of truth for which knobs are still structural versus autotuned:
+
+- [`README.md`](./README.md)
+
 This workflow turns launch-config tuning into a repeatable sweep over the expected deployment matrix:
 
 - `D = 16, 32, 64, 96, 128, 192, 256, 384, 512`
