@@ -1,5 +1,15 @@
 # TODO
 
+- [ ] High priority: write a Block-Causal FLARE implementation using the chunkwise training algorithm, with:
+  - contiguous token blocks of size `B`, where tokens in block `k` can attend to all tokens in blocks `<= k`, i.e. if token `t` is in block `k`, its receptive field is tokens `1:(B*k)`.
+  - an effective attention mask that keeps all within-block interactions and all interactions with preceding blocks, while zeroing only the strictly upper block-triangular region.
+  - an implementation strategy that exploits the existing chunkwise training algorithm rather than introducing a separate dense-style training path.
+  - an explicit requirement that chunk size `C` be a multiple of block size `B`, so the block-causal mask lines up cleanly with chunk boundaries and training-time summaries.
+  - an initial supported chunk-size set of `C in {16, 32, 64, 128}`, with any additional chunk sizes treated as follow-up work rather than silently supported.
+  - kernel/API validation that rejects invalid `(B, C)` combinations early with precise errors instead of allowing misaligned masking semantics.
+  - targeted correctness tests against a reference block-causal attention mask, including cases that exercise multiple blocks per chunk and multiple chunks per sequence.
+  - a performance check to confirm that the chunkwise formulation actually gives the intended efficiency advantage over a naive masked implementation for representative `(B, C)` settings.
+
 - [ ] High priority: investigate using Triton's `associative_scan` for forward computations in the recurrent and chunked implementations, with:
   - an explicit audit of which forward recurrences/prefix-style reductions in `RecurrentFLARE` and `ChunkedFLARE` can be expressed cleanly as an associative combine without contorting the kernel structure or weakening numerics.
   - a prototype path using `triton.language.associative_scan` for the forward computation where it fits naturally, plus a direct comparison against the current implementation for correctness, numerical stability, and performance.
