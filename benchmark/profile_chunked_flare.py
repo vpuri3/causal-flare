@@ -165,14 +165,15 @@ def compile_forward_kernels(
     *,
     input_precision: str | None,
 ) -> dict[str, object]:
-    h, m, d = q.shape
+    h, m, d_score = q.shape
     b, n, _, _ = k.shape
-    scale = _resolve_attn_scale(None, d)
+    d_value = v.size(3)
+    scale = _resolve_attn_scale(None, d_score)
     cfg = _get_chunked_forward_config(
         M=m,
         N=n,
-        score_head_dim=d,
-        value_head_dim=d,
+        score_head_dim=d_score,
+        value_head_dim=d_value,
         dtype=k.dtype,
         chunk_size=None,
         input_precision=input_precision,
@@ -186,14 +187,16 @@ def compile_forward_kernels(
     stats_dtype = cfg["stats_dtype"]
     chunk_max = torch.full((bh, cfg["NUM_CHUNKS"], m), -float("inf"), device=device, dtype=stats_dtype)
     chunk_den = torch.zeros((bh, cfg["NUM_CHUNKS"], m), device=device, dtype=stats_dtype)
-    chunk_num = torch.zeros((bh, cfg["NUM_CHUNKS"], m, d), device=device, dtype=stats_dtype)
+    chunk_num = torch.zeros((bh, cfg["NUM_CHUNKS"], m, d_value), device=device, dtype=stats_dtype)
 
     q_stride = q.stride()
     k_stride = k.stride()
     v_stride = v.stride()
-    prepare_kernel = flare_chunk_prepare[
-        (bh, cfg["NUM_CHUNKS"], cfg["NUM_M_BLOCKS"] * cfg["NUM_PREPARE_D_BLOCKS"])
-    ](
+
+    def prepare_grid(meta):
+        return (bh, cfg["NUM_CHUNKS"], cfg["NUM_M_BLOCKS"] * triton.cdiv(d_value, meta["BLOCK_D"]))
+
+    prepare_kernel = flare_chunk_prepare[prepare_grid](
         k,
         q,
         v,
@@ -217,13 +220,13 @@ def compile_forward_kernels(
         bh,
         m,
         n,
-        d,
+        d_score,
+        d_value,
         scale,
         CHUNK_SIZE=cfg["CHUNK_SIZE"],
         BLOCK_M=cfg["BLOCK_M"],
         BLOCK_D=cfg["PREPARE_BLOCK_D"],
         BLOCK_K=cfg["PREPARE_BLOCK_K"],
-        NUM_D_BLOCKS=cfg["NUM_PREPARE_D_BLOCKS"],
         USE_FP16=cfg["use_fp16"],
         USE_BF16=cfg["use_bf16"],
         USE_FP32_STATS=cfg["stats_fp32"],
@@ -235,8 +238,12 @@ def compile_forward_kernels(
 
     prefix_max = torch.empty((bh, cfg["NUM_CHUNKS"], m), device=device, dtype=stats_dtype)
     prefix_den = torch.zeros((bh, cfg["NUM_CHUNKS"], m), device=device, dtype=stats_dtype)
-    prefix_num = torch.zeros((bh, cfg["NUM_CHUNKS"], m, d), device=device, dtype=stats_dtype)
-    prefix_kernel = flare_chunk_prefix[(bh, cfg["NUM_PREFIX_M_BLOCKS"], cfg["NUM_PREFIX_D_BLOCKS"])](
+    prefix_num = torch.zeros((bh, cfg["NUM_CHUNKS"], m, d_value), device=device, dtype=stats_dtype)
+
+    def prefix_grid(_meta):
+        return (bh, cfg["NUM_PREFIX_M_BLOCKS"], triton.cdiv(d_value, cfg["PREFIX_BLOCK_D"]))
+
+    prefix_kernel = flare_chunk_prefix[prefix_grid](
         chunk_max,
         chunk_den,
         chunk_num,
@@ -251,7 +258,7 @@ def compile_forward_kernels(
         *prefix_num.stride(),
         bh,
         m,
-        d,
+        d_value,
         cfg["NUM_CHUNKS"],
         BLOCK_M=cfg["PREFIX_BLOCK_M"],
         BLOCK_D=cfg["PREFIX_BLOCK_D"],
@@ -263,11 +270,7 @@ def compile_forward_kernels(
     )
 
     num_fwd_m_tiles = triton.cdiv(m, cfg["BLOCK_M"])
-    single_writer_output = num_fwd_m_tiles == 1 and cfg["NUM_FWD_D_BLOCKS"] == 1
-    if single_writer_output:
-        output = torch.empty((b, n, h, d), device=device, dtype=torch.float32)
-    else:
-        output = torch.zeros((b, n, h, d), device=device, dtype=torch.float32)
+    output = torch.zeros((b, n, h, d_value), device=device, dtype=torch.float32)
     lse_enc = torch.full((b, h, n, m), -float("inf"), device=device, dtype=torch.float32)
     lse_dec = torch.empty((b * h, n), device=device, dtype=torch.float32)
     q_dec_stride = q_dec_comp.stride()
@@ -284,11 +287,12 @@ def compile_forward_kernels(
         k_dec_stride[0],
         k_dec_stride[1],
         k_dec_stride[2],
-        *lse_dec.stride(),
+        lse_dec.stride()[0],
+        lse_dec.stride()[1],
         b * h,
         m,
         n,
-        d,
+        d_score,
         scale,
         CHUNK_SIZE=cfg["CHUNK_SIZE"],
         BLOCK_M=cfg["BLOCK_M"],
@@ -300,7 +304,10 @@ def compile_forward_kernels(
         num_stages=cfg["decoder_num_stages"],
     )
 
-    fwd_kernel = flare_chunk_fwd[(b * h, cfg["NUM_CHUNKS"], num_fwd_m_tiles * cfg["NUM_FWD_D_BLOCKS"])](
+    def fwd_grid(_meta):
+        return (b * h, cfg["NUM_CHUNKS"], num_fwd_m_tiles * triton.cdiv(d_value, cfg["FWD_BLOCK_D"]))
+
+    fwd_kernel = flare_chunk_fwd[fwd_grid](
         k,
         q,
         v,
@@ -339,9 +346,9 @@ def compile_forward_kernels(
         b * h,
         m,
         n,
-        d,
+        d_score,
+        d_value,
         scale,
-        NUM_D_BLOCKS=cfg["NUM_FWD_D_BLOCKS"],
         CHUNK_SIZE=cfg["CHUNK_SIZE"],
         BLOCK_M=cfg["BLOCK_M"],
         BLOCK_D=cfg["FWD_BLOCK_D"],
@@ -351,7 +358,7 @@ def compile_forward_kernels(
         USE_BF16=cfg["use_bf16"],
         USE_FP32_STATS=cfg["stats_fp32"],
         INPUT_PRECISION=cfg["input_precision"],
-        SINGLE_WRITER_OUTPUT=single_writer_output,
+        SINGLE_M_TILE=num_fwd_m_tiles == 1,
         WEIGHT_SHARING_ENC_DEC=weight_sharing,
         H=h,
         num_warps=cfg["fwd_num_warps"],
