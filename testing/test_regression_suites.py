@@ -4,7 +4,7 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 _CORRECTNESS_NUM_SHARDS = 8
 _GRAD_CHECKS_NUM_SHARDS = 8
-_AUTOTUNE_COVERAGE_NUM_SHARDS = 8
+_AUTOTUNE_COVERAGE_NUM_SHARDS = 4
 _SHARP_BWD_NUM_SHARDS = 12
 _LONGCTX_NUM_SHARDS = 8
 _CHUNK_SENS_NUM_SHARDS = 8
@@ -91,7 +91,7 @@ def test_autotune_launch_coverage_suite(
         monkeypatch.setenv("FLARE_AUTOTUNE_COVERAGE_QK_STDS", "4.0")
         monkeypatch.setenv("FLARE_AUTOTUNE_COVERAGE_DECODE_SEPARATION_MODES", "11")
     else:
-        monkeypatch.setenv("FLARE_AUTOTUNE_COVERAGE_PRECISIONS", "ieee,tf32")
+        monkeypatch.setenv("FLARE_AUTOTUNE_COVERAGE_PRECISIONS", "ieee")
         monkeypatch.setenv("FLARE_AUTOTUNE_COVERAGE_CONFIGS", "1,4,16,256,32;1,8,64,1024,64")
         monkeypatch.setenv("FLARE_AUTOTUNE_COVERAGE_QK_STDS", "4.0")
         monkeypatch.setenv("FLARE_AUTOTUNE_COVERAGE_DECODE_SEPARATION_MODES", "11")

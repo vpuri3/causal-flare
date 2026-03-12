@@ -43,7 +43,7 @@ Run full long-running regression/stress matrices:
 pytest testing --run-regression --run-stress --full-matrix -q
 ```
 
-Run the collected suite across all visible GPUs:
+Run the collected suite across all available GPUs:
 
 ```bash
 python -m testing.distributed_runner -- testing -q
@@ -61,8 +61,15 @@ Increase parallelism further by launching multiple independent workers on each v
 python -m testing.distributed_runner --workers-per-gpu 2 -- testing --run-regression --run-stress --full-matrix -q
 ```
 
-- The distributed runner pins one subprocess per visible GPU via `CUDA_VISIBLE_DEVICES=<single_gpu>`, so existing tests that use `torch.device("cuda")` stay isolated per shard.
-- `--workers-per-gpu` oversubscribes each visible GPU with multiple pytest workers when the suite is latency-bound rather than memory- or compute-bound.
+Limit the run to the first available GPU only:
+
+```bash
+python -m testing.distributed_runner --visible-gpus 1 -- testing -q
+```
+
+- The distributed runner uses all available GPUs by default. `--visible-gpus N` means "use the first `N` available GPUs" and errors if fewer than `N` GPUs are usable.
+- The runner pins one subprocess per selected GPU via `CUDA_VISIBLE_DEVICES=<single_gpu>`, so existing tests that use `torch.device("cuda")` stay isolated per shard.
+- `--workers-per-gpu` oversubscribes each selected GPU with multiple pytest workers when the suite is latency-bound rather than memory- or compute-bound.
 - It replaces `test_regression_bundle` with its unique component suites (`parity`, `trainlike_sanity`, and `trainlike_multistep_parity` when `--full-matrix` is enabled) so distributed runs do not duplicate the slower correctness/grad/stress wrappers already collected elsewhere.
 - Per-shard logs default to `/tmp/flare-pytest-shards`; use `--log-dir` to override or `--dry-run` to print the task plan without executing it.
 
@@ -100,7 +107,9 @@ Legacy env-flag entrypoints in `testing/test.py` (`FLARE_DEBUG_*`, `FLARE_RECURR
 ## What These Suites Cover
 
 - `_autotune_launch_coverage_suite`
-  - Small representative correctness/gradient suite that forces full autotune search inside the suite.
+  - Small representative correctness/gradient suite for the launch families that remain benchmark-owned.
+  - The default coverage matrix is intentionally narrower than the historical full-precision sweep so the suite still catches launch-specific bugs without dominating end-to-end suite runtime.
+  - Even with `--full-matrix`, this suite stays on IEEE precision and only expands to two representative shapes instead of restoring the older broad precision/config sweep.
   - Intended to catch launch-config-specific correctness bugs without turning the entire regression matrix into a full-autotune run.
   - Pytest wrapper shards this suite into 4 independent nodeids (`autotune1` ... `autotune4`).
 - `_run_correctness_suite`
@@ -231,7 +240,7 @@ Below are the key matrix dimensions each suite exercises. Most are configurable 
   - Wrapper does not apply bounded matrix overrides.
   - Regression bundle sets `FLARE_REGRESSION_EXTENDED=1`.
   - Suite-native defaults execute, including large-N long-context and sharp-bwd sweeps.
-  - Autotuning is still reduced during testing; `--full-matrix` expands the test-case matrix, not the autotune search matrix.
+  - `--full-matrix` expands the test-case matrix, not the runtime config search, because the default runtime path is heuristic-only.
 
 ## Notes
 
@@ -240,7 +249,8 @@ Below are the key matrix dimensions each suite exercises. Most are configurable 
   - `--run-stress`
   - `--full-matrix` (disables reduced bounded defaults in wrappers)
 - The wrappers that expose these suites as pytest tests are in `testing/test_regression_suites.py`.
-- Test runs default `FLARE_TEST_REDUCE_AUTOTUNE=1` so the autotune search space stays reduced even for `--full-matrix` coverage runs.
+- Test runs no longer carry a separate reduced-autotune mode, because the default runtime path is already heuristic-only and does not run Triton autotune searches.
+- The distributed runner keeps `autotune_launch_coverage` shards on worker `0` of each GPU so these explicitly expensive full-search checks do not get oversubscribed when `--workers-per-gpu > 1`.
 - For chunked-path numerical debugging, especially sharp-softmax backward regressions, treat
   `causal-flare @ git+https://github.com/vpuri3/causal-flare.git@72394e2d2a109be2d8464147c17f10b28f423fcc`
   as a useful oracle/reference point. That upstream commit is a good baseline for checking

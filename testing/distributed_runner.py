@@ -45,6 +45,13 @@ class WorkerSlot:
         return f"gpu={self.gpu_id}/worker={self.worker_index}"
 
 
+def _is_autotune_coverage_task(task: Task) -> bool:
+    return (
+        task.kind == "pytest"
+        and task.name.startswith("testing/test_regression_suites.py::test_autotune_launch_coverage_suite[")
+    )
+
+
 _BUNDLE_NODEID = "testing/test_regression_suites.py::test_regression_bundle"
 _DEFAULT_PYTEST_ARGS = ["testing", "-q"]
 
@@ -89,28 +96,53 @@ def _normalize_pytest_args(raw_args: list[str]) -> list[str]:
     return args or list(_DEFAULT_PYTEST_ARGS)
 
 
-def _ensure_test_env_defaults(env: dict[str, str] | None = None, *, reduce_autotune: bool) -> dict[str, str] | None:
-    target = os.environ if env is None else env
-    if reduce_autotune:
-        target.setdefault("FLARE_TEST_REDUCE_AUTOTUNE", "1")
-    else:
-        target.pop("FLARE_TEST_REDUCE_AUTOTUNE", None)
-    return env
+def _gpu_id_is_usable(gpu_id: str) -> bool:
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu_id
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import torch; raise SystemExit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
 
 
-def _visible_gpu_ids(override: str | None = None) -> list[str]:
-    raw = override if override is not None else os.environ.get("CUDA_VISIBLE_DEVICES", "")
+def _filter_usable_gpu_ids(requested_gpu_ids: list[str], checker: Callable[[str], bool] | None = None) -> list[str]:
+    probe = _gpu_id_is_usable if checker is None else checker
+    return [gpu_id for gpu_id in requested_gpu_ids if probe(gpu_id)]
+
+
+def _visible_gpu_ids(requested_count: int | None = None) -> list[str]:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if raw:
-        return [token.strip() for token in raw.split(",") if token.strip()]
+        candidate_gpu_ids = [token.strip() for token in raw.split(",") if token.strip()]
+    else:
+        try:
+            import torch
+        except ImportError:
+            return []
 
-    try:
-        import torch
-    except ImportError:
-        return []
+        if not torch.cuda.is_available():
+            return []
+        candidate_gpu_ids = [str(idx) for idx in range(torch.cuda.device_count())]
 
-    if not torch.cuda.is_available():
-        return []
-    return [str(idx) for idx in range(torch.cuda.device_count())]
+    usable_gpu_ids = _filter_usable_gpu_ids(candidate_gpu_ids)
+    if requested_count is None:
+        return usable_gpu_ids
+    if requested_count < 1:
+        raise ValueError(f"--visible-gpus must be at least 1 when provided. Got {requested_count}.")
+    if requested_count > len(usable_gpu_ids):
+        raise ValueError(
+            "Requested GPU count exceeds available usable GPU count. "
+            f"requested_count={requested_count}, usable_gpu_ids={usable_gpu_ids}."
+        )
+    return usable_gpu_ids[:requested_count]
 
 
 def _parse_collected_nodeids(stdout: str) -> list[str]:
@@ -199,14 +231,18 @@ def _weight_for_nodeid(nodeid: str) -> int:
     return 1
 
 
-def _schedule_tasks(tasks: list[Task], gpu_ids: list[str]) -> list[list[Task]]:
-    if not gpu_ids:
+def _schedule_tasks(tasks: list[Task], slots: list[WorkerSlot]) -> list[list[Task]]:
+    if not slots:
         raise ValueError("Cannot schedule tasks without at least one GPU id.")
 
-    assignments: list[list[Task]] = [[] for _ in gpu_ids]
-    loads = [0 for _ in gpu_ids]
+    assignments: list[list[Task]] = [[] for _ in slots]
+    loads = [0 for _ in slots]
+    coverage_slot_indexes = [idx for idx, slot in enumerate(slots) if slot.worker_index == 0]
+    if not coverage_slot_indexes:
+        raise ValueError("Autotune coverage scheduling requires at least one worker_index=0 slot.")
     for task in sorted(tasks, key=lambda item: (-item.weight, item.label)):
-        shard_idx = min(range(len(gpu_ids)), key=lambda idx: (loads[idx], idx))
+        candidate_indexes = coverage_slot_indexes if _is_autotune_coverage_task(task) else list(range(len(slots)))
+        shard_idx = min(candidate_indexes, key=lambda idx: (loads[idx], idx))
         assignments[shard_idx].append(task)
         loads[shard_idx] += task.weight
     return assignments
@@ -238,12 +274,11 @@ def _collect_nodeids(pytest_args: list[str], repo_root: Path) -> list[str]:
     return nodeids
 
 
-def _run_suite_task(task_name: str, *, reduce_autotune: bool) -> None:
+def _run_suite_task(task_name: str) -> None:
     runner = _SUITE_RUNNERS.get(task_name)
     if runner is None:
         known = ", ".join(sorted(_SUITE_RUNNERS))
         raise ValueError(f"Unknown suite task '{task_name}'. Known: {known}")
-    _ensure_test_env_defaults(reduce_autotune=reduce_autotune)
     _apply_regression_defaults()
     runner()
 
@@ -275,12 +310,10 @@ def _run_shard(
     pytest_args: list[str],
     repo_root: Path,
     log_dir: Path,
-    reduce_autotune: bool,
 ) -> list[TaskResult]:
     results: list[TaskResult] = []
     log_path = log_dir / f"shard-{shard_index:02d}-gpu-{slot.gpu_id}-worker-{slot.worker_index}.log"
     env = os.environ.copy()
-    _ensure_test_env_defaults(env, reduce_autotune=reduce_autotune)
     env["CUDA_VISIBLE_DEVICES"] = slot.gpu_id
     env.setdefault("PYTHONUNBUFFERED", "1")
 
@@ -328,7 +361,6 @@ def _print_plan(assignments: list[list[Task]], slots: list[WorkerSlot]) -> None:
 
 def _run_distributed(args: argparse.Namespace) -> int:
     repo_root = Path(__file__).resolve().parents[1]
-    _ensure_test_env_defaults(reduce_autotune=True)
     pytest_args = _normalize_pytest_args(args.pytest_args)
     gpu_ids = _visible_gpu_ids(args.visible_gpus)
     if not gpu_ids:
@@ -340,7 +372,7 @@ def _run_distributed(args: argparse.Namespace) -> int:
         raise RuntimeError("No runnable distributed tasks were produced from pytest collection.")
 
     slots = _build_worker_slots(gpu_ids, args.workers_per_gpu)
-    assignments = _schedule_tasks(tasks, [slot.label for slot in slots])
+    assignments = _schedule_tasks(tasks, slots)
     if args.dry_run:
         _print_plan(assignments, slots)
         return 0
@@ -360,7 +392,6 @@ def _run_distributed(args: argparse.Namespace) -> int:
                 pytest_args,
                 repo_root,
                 log_dir,
-                not args.full_matrix,
             ): shard_index
             for shard_index in range(len(slots))
             if assignments[shard_index]
@@ -384,13 +415,13 @@ def _run_distributed(args: argparse.Namespace) -> int:
 
 
 def _run_single_suite(args: argparse.Namespace) -> int:
-    _run_suite_task(args.run_suite, reduce_autotune=True)
+    _run_suite_task(args.run_suite)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Shard the collected pytest suite across visible GPUs.")
-    parser.add_argument("--visible-gpus", default=None, help="Optional explicit GPU id list, e.g. '0,1,2,3'.")
+    parser.add_argument("--visible-gpus", type=int, default=None, help="Optional number of GPUs to use. Defaults to all available GPUs.")
     parser.add_argument("--workers-per-gpu", type=int, default=1, help="Independent workers to launch per visible GPU.")
     parser.add_argument("--log-dir", default="/tmp/flare-pytest-shards", help="Directory for per-shard logs.")
     parser.add_argument("--dry-run", action="store_true", help="Print the shard plan without running anything.")
