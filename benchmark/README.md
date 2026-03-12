@@ -2,7 +2,23 @@
 
 This directory contains the benchmark and profiling workflows for the current FLARE launch-tuning policy.
 
-Use this file as the high-level source of truth for what is still tuned manually and what is now owned by Triton autotune.
+Use this file as the high-level source of truth for which knobs are owned by offline matrix tuning versus fixed runtime heuristics.
+
+## Why Runtime Uses Heuristics
+
+We briefly tried moving chunked and inference runtime config selection over to Triton autotune on the default user path.
+
+That experiment did not hold up operationally:
+
+- cold-cache compile and first-use latency became extremely large
+- the expensive cost was paid during normal user execution instead of during an explicit offline tuning workflow
+- the resulting user experience was materially worse even when steady-state performance was acceptable
+
+The current policy therefore follows the `72394e2d2a109be2d8464147c17f10b28f423fcc` workflow again:
+
+- benchmark scripts own the search
+- runtime code uses promoted heuristic bucket rules
+- Triton autotune is not part of the default user path
 
 ## Current Policy
 
@@ -16,24 +32,51 @@ Benchmark tools:
 
 - [`benchmark_prefill_decode.py`](./benchmark_prefill_decode.py)
 - [`profile_chunked_flare.py`](./profile_chunked_flare.py)
+- [`measure_cold_start.py`](./measure_cold_start.py)
 - [`tune_chunked_flare_matrix.py`](./tune_chunked_flare_matrix.py)
 - [`chunked_flare_matrix_workflow.md`](./chunked_flare_matrix_workflow.md)
 
-Chunked is tuned hierarchically:
+Chunked is tuned offline, then promoted back into runtime heuristics.
 
-- Structural knobs are still chosen outside Triton autotune.
-  - `CHUNK_SIZE`
-  - forward `BLOCK_M`
-  - backward `BLOCK_M`
-  - backward `BLOCK_DV`
-- Kernel-local tile and launch choices are handled by Triton autotune.
-  - forward `prepare`, `prefix`, `decoder_lse`, `fwd`
-  - backward replay/summary/apply/reduce kernels
+- The matrix runner owns the knob search.
+- Runtime consumes the promoted bucket policy plus optional env overrides.
+- Default user execution does not run Triton autotune searches or multi-candidate runtime compile loops.
+
+Offline-tuned chunked knobs:
+
+- `CHUNK_SIZE`
+- `FLARE_BLOCK_M`
+- `FLARE_PREFIX_BLOCK_M`
+- `FLARE_PREPARE_BLOCK_D`
+- `FLARE_PREPARE_BLOCK_K`
+- `FLARE_PREFIX_BLOCK_D`
+- `FLARE_FWD_BLOCK_D`
+- `FLARE_FWD_BLOCK_K`
+- `FLARE_BLOCK_T`
+- `FLARE_PREPARE_NUM_WARPS` / `FLARE_PREPARE_NUM_STAGES`
+- `FLARE_PREFIX_NUM_WARPS` / `FLARE_PREFIX_NUM_STAGES`
+- `FLARE_DECODER_NUM_WARPS` / `FLARE_DECODER_NUM_STAGES`
+- `FLARE_FWD_NUM_WARPS` / `FLARE_FWD_NUM_STAGES`
+- `FLARE_LSE_BWD_BLOCK_M`
+- `FLARE_LSE_BWD_SCORE_BLOCK_M`
+- `FLARE_LSE_BWD_BLOCK_DV`
+- `FLARE_LSE_BWD_BLOCK_K`
+- `FLARE_LSE_BWD_BLOCK_D_PART`
+- `FLARE_LSE_BWD_QK_BLOCK_D`
+- `FLARE_LSE_BWD_BLOCK_T_QK`
+- `FLARE_LSE_BWD_BLOCK_T_REPLAY`
+- `FLARE_LSE_BWD_BLOCK_T_STATE`
+- `FLARE_LSE_BWD_BLOCK_T_APPLY`
+- `FLARE_LSE_BWD_SCALAR_APPLY_PANEL`
+- `FLARE_LSE_BWD_REPLAY_NUM_WARPS` / `FLARE_LSE_BWD_REPLAY_NUM_STAGES`
+- `FLARE_LSE_BWD_STATE_NUM_WARPS` / `FLARE_LSE_BWD_STATE_NUM_STAGES`
+- `FLARE_LSE_BWD_QK_NUM_WARPS` / `FLARE_LSE_BWD_QK_NUM_STAGES`
+- `FLARE_LSE_BWD_SCAN_APPLY_NUM_WARPS` / `FLARE_LSE_BWD_SCAN_APPLY_NUM_STAGES`
 
 Practical implication:
 
-- Benchmarks should primarily sweep structural families.
-- Local kernel tiles such as `BLOCK_D`, `BLOCK_K`, `BLOCK_T`, `num_warps`, and `num_stages` are no longer first-class runtime tuning env knobs.
+- Benchmarks should use a staged matrix sweep and then promote a narrow policy back into runtime bucket rules.
+- The default matrix should use representative anchors first, with `--full-matrix` reserved for confirmation.
 
 ### Inference
 
@@ -46,21 +89,19 @@ Benchmark tools:
 - [`benchmark_prefill_decode.py`](./benchmark_prefill_decode.py)
 - [`benchmark_train_step.py`](./benchmark_train_step.py)
 - [`profile_flare_inference.py`](./profile_flare_inference.py)
+- [`measure_cold_start.py`](./measure_cold_start.py)
 - [`tune_flare_inference_matrix.py`](./tune_flare_inference_matrix.py)
 - [`flare_inference_matrix_workflow.md`](./flare_inference_matrix_workflow.md)
 
 Inference is split into prefill and decode:
 
-- Prefill reuses the Chunked forward kernels.
-  - Structural sweeps still make sense for `CHUNK_SIZE` and `BLOCK_M`.
-  - Local forward kernel launch choices are autotuned.
-- Decode uses one Triton recurrent-step kernel with a curated autotune shortlist.
-  - Shared and nonshared decode now reuse the same autotune choice.
-  - There are no runtime `FLARE_DECODE_*` launch env overrides anymore.
+- Prefill reuses the chunked forward heuristics and benchmark-owned env knobs.
+- Decode uses one heuristic-selected recurrent-step config plus optional `FLARE_DECODE_*` env overrides.
+- Default user execution does not run Triton autotune search loops or runtime launch sweeps.
 
 Practical implication:
 
-- Decode benchmarking should compare end-to-end latency and per-kernel profile totals, not try to brute-force runtime launch envs that no longer exist.
+- Prefill and decode benchmarking should sweep the explicit env knobs offline, then promote the winners back into runtime heuristics.
 
 ### Head-Dimension Terminology
 
@@ -77,16 +118,23 @@ Recommended:
 
 - `FLARE_CHUNK_SIZE`
 - `FLARE_BLOCK_M`
+- `FLARE_PREFIX_BLOCK_M`
+- `FLARE_PREPARE_BLOCK_D`
+- `FLARE_PREPARE_BLOCK_K`
+- `FLARE_PREFIX_BLOCK_D`
+- `FLARE_FWD_BLOCK_D`
+- `FLARE_FWD_BLOCK_K`
+- forward launch presets
 - `FLARE_LSE_BWD_BLOCK_M`
+- `FLARE_LSE_BWD_SCORE_BLOCK_M`
 - `FLARE_LSE_BWD_BLOCK_DV`
+- `FLARE_LSE_BWD_BLOCK_K`
+- `FLARE_LSE_BWD_BLOCK_D_PART`
+- `FLARE_LSE_BWD_QK_BLOCK_D`
+- `FLARE_LSE_BWD_BLOCK_T_QK`
+- backward launch presets
 
-Avoid rebuilding a manual search over:
-
-- per-kernel `BLOCK_D`
-- per-kernel `BLOCK_K`
-- per-kernel `BLOCK_T`
-- `num_warps`
-- `num_stages`
+Default anchor matrix and staging live in [chunked_flare_matrix_workflow.md](./chunked_flare_matrix_workflow.md).
 
 ### Inference benchmark sweeps
 
@@ -94,11 +142,19 @@ Prefill:
 
 - `FLARE_CHUNK_SIZE`
 - `FLARE_BLOCK_M`
+- `FLARE_PREPARE_BLOCK_D`
+- `FLARE_PREPARE_BLOCK_K`
+- `FLARE_PREFIX_BLOCK_D`
+- `FLARE_FWD_BLOCK_D`
+- `FLARE_FWD_BLOCK_K`
+- prefill launch presets
 
 Decode:
 
-- no runtime launch env sweep
-- measure the runtime autotuned path directly
+- `FLARE_DECODE_BLOCK_D`
+- `FLARE_DECODE_BLOCK_K`
+- `FLARE_DECODE_NUM_WARPS`
+- `FLARE_DECODE_NUM_STAGES`
 
 Example mixed-dimension benchmark:
 
@@ -120,5 +176,6 @@ python benchmark/benchmark_train_step.py \
 
 ## Notes
 
-- The older workflow markdown files may still contain historical staging detail from the manual-launch era. Use them for matrix structure and artifact conventions, but treat this README and the runtime code as authoritative for which knobs are still real.
-- If a new kernel-local knob becomes worth exposing again, update this README at the same time as the runtime and benchmark scripts.
+- Runtime no longer owns any default-path Triton autotune search in chunked or inference decode.
+- The benchmark workflow is intentionally where compile-heavy exploration happens; normal inference and training should compile only the chosen heuristic path.
+- If a knob is removed from runtime heuristics, remove it from the matrix workflow at the same time.

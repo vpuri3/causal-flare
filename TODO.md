@@ -1,12 +1,23 @@
 # TODO
 
+- [ ] Restore heuristic/offline tuning workflow from `72394e2d2a109be2d8464147c17f10b28f423fcc` so normal user execution no longer pays runtime Triton autotune costs, with:
+  - [x] inventory current tuning ownership versus `72394e2` across `causal_flare/chunked.py`, `causal_flare/inference.py`, and the benchmark workflow docs; write down which knobs must move back out of runtime autotune.
+  - [x] restore heuristic config selection as the default runtime path for chunked training and inference prefill/decode, using narrow promoted bucket rules instead of runtime search.
+    - [x] inference decode: replace runtime decode-step autotune with one heuristic-selected config plus env overrides.
+    - [x] chunked training forward/backward: restore promoted bucket tables and explicit launch selection for prepare/prefix/decoder/fwd and backward replay/reduction kernels.
+  - [x] demote Triton autotune to explicit developer/benchmark mode rather than the default user path.
+  - [x] update `benchmark/chunked_flare_matrix_workflow.md`, `benchmark/flare_inference_matrix_workflow.md`, and the corresponding tuning runners/catalogs so offline matrix sweeps again own the promoted knobs.
+  - [x] add a reproducible cold-cache startup benchmark for representative anchor shapes and use it as a regression guardrail.
+  - [ ] rerun targeted correctness/regression coverage plus cold/warm startup measurements and compare against the rollback success criteria.
+
 - [ ] High priority: write a Block-Causal FLARE implementation using the chunkwise training algorithm, with:
   - contiguous token blocks of size `B`, where tokens in block `k` can attend to all tokens in blocks `<= k`, i.e. if token `t` is in block `k`, its receptive field is tokens `1:(B*k)`.
   - an effective attention mask that keeps all within-block interactions and all interactions with preceding blocks, while zeroing only the strictly upper block-triangular region.
   - an implementation strategy that exploits the existing chunkwise training algorithm rather than introducing a separate dense-style training path.
-  - an explicit requirement that chunk size `C` be a multiple of block size `B`, so the block-causal mask lines up cleanly with chunk boundaries and training-time summaries.
+  - an explicit requirement that block size `B` be a multiple of chunk size `C`, so the block-causal mask lines up cleanly with chunk boundaries and training-time summaries.
   - an initial supported chunk-size set of `C in {16, 32, 64, 128}`, with any additional chunk sizes treated as follow-up work rather than silently supported.
   - kernel/API validation that rejects invalid `(B, C)` combinations early with precise errors instead of allowing misaligned masking semantics.
+  - a torch prototype in `causal_flare/block_causal.py` that mirrors the `ChunkedFLARE` forward structure before any CUDA/Triton kernel work.
   - targeted correctness tests against a reference block-causal attention mask, including cases that exercise multiple blocks per chunk and multiple chunks per sequence.
   - a performance check to confirm that the chunkwise formulation actually gives the intended efficiency advantage over a naive masked implementation for representative `(B, C)` settings.
 

@@ -1,16 +1,20 @@
 # Chunked FLARE Matrix Tuning Workflow
 
-Current source of truth for which knobs are still structural versus autotuned:
+Current source of truth for which knobs are owned by offline tuning and then promoted into runtime heuristics:
 
 - [`README.md`](./README.md)
 
+This workflow exists because runtime Triton autotune on the chunked user path proved too expensive in practice. We tried it, but cold-cache compile and first-use latency became extremely large, so the project moved back to offline matrix sweeps plus promoted heuristic buckets in `causal_flare/chunked.py`.
+
 This workflow turns launch-config tuning into a repeatable sweep over the expected deployment matrix:
 
-- `D_k = 16, 32, 64, 96, 128, 192, 256, 384, 512`
+- fast default anchors: `D_k = 64, 128, 256`
 - `D_v = D_k` for baseline sweeps, plus targeted mixed-dimension confirmations such as `D_k=64, D_v=128`
-- `M = 16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048`
-- `N = 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072`
-- `BH = multiples of 4`
+- fast default anchors: `M = 64, 512`
+- fast default anchors: `N = 2048, 32768`
+- `BH = 8` by default
+
+Use `--full-matrix` only for explicit exhaustive confirmation sweeps. The default runner now tunes representative shape buckets first rather than treating the full deployment matrix as the day-to-day workflow or pushing that exploration into runtime.
 
 The runner is [`tune_chunked_flare_matrix.py`](./tune_chunked_flare_matrix.py). It reuses the per-kernel profiler in [`profile_chunked_flare.py`](./profile_chunked_flare.py) and automatically saves raw profiling artifacts plus a grouped summary.
 
@@ -18,10 +22,12 @@ The runner is [`tune_chunked_flare_matrix.py`](./tune_chunked_flare_matrix.py). 
 
 Do not brute-force the full Cartesian product of every launch knob across the entire matrix in one pass. That is too expensive and makes it hard to separate width-driven effects from `M` or `N` effects.
 
+The same logic applies to runtime policy: users should not pay this exploration cost on their first forward or backward call. The runtime only consumes the promoted winners.
+
 Use three passes:
 
 1. Seed `D` families at one representative `(M, N, BH)` point.
-2. Refine `BLOCK_M`, `CHUNK_SIZE`, and related knobs over the wider `M x N` matrix using the seeded width families.
+2. Refine `BLOCK_M`, width-dependent tile choices, and launch presets over the wider `M x N` anchor matrix using the seeded width families.
 3. Confirm the promoted configs across the full matrix, then update the heuristic buckets in `causal_flare/chunked.py`.
 
 `BH` is usually held fixed at one representative multiple of 4 because the kernels parallelize over `B * H`. If a regression appears BH-sensitive, rerun the same stage with a different `--batch-size` / `--bh-values` factorization.
@@ -50,42 +56,46 @@ Use `--run-name <name> --resume` to continue a long sweep.
 
 ## Stage 1: Seed Width Families
 
-Start with one representative training point such as `BH=8`, `M=64`, `N=4096`, then sweep all `D` buckets with the core families:
+Start with one representative training point such as `BH=8`, `M=64`, `N=2048`, then sweep the anchor `D` buckets with the width families:
 
 ```bash
 source .venv/bin/activate
 python benchmark/tune_chunked_flare_matrix.py \
-  --run-name d-seed-bh8-m64-n4096 \
-  --d-values 16,32,64,96,128,192,256,384,512 \
+  --run-name d-seed-bh8-m64-n2048 \
+  --d-values 64,128,256 \
   --m-values 64 \
-  --n-values 4096 \
+  --n-values 2048 \
   --bh-values 8 \
-  --families core,combined \
-  --mode both
+  --families full_forward \
+  --mode forward
 ```
 
 Goal:
 
 - identify width-driven winners for:
-  - forward `BLOCK_D` over `D_v`, `BLOCK_K` over `D_k`, and per-phase launches
-  - backward replay/QK launches and wide-D replay tile choices
+  - `CHUNK_SIZE`
+  - forward `BLOCK_M`
+  - `FLARE_PREPARE_BLOCK_D` / `FLARE_PREPARE_BLOCK_K`
+  - `FLARE_PREFIX_BLOCK_D`
+  - `FLARE_FWD_BLOCK_D` / `FLARE_FWD_BLOCK_K`
+  - forward launch presets
 
 Promote only patterns that win consistently across neighboring `D` buckets.
 
 ## Stage 2: Refine `M` And `N`
 
-Once the `D` families are seeded, sweep the larger `M x N` space while keeping the focus on `BLOCK_M`, `CHUNK_SIZE`, and token-panel knobs:
+Once the `D` buckets are seeded, sweep the larger `M x N` anchor space while keeping the focus on the promoted runtime knobs:
 
 ```bash
 python benchmark/tune_chunked_flare_matrix.py \
   --run-name mn-refine-bh8 \
-  --d-values 16,32,64,96,128,192,256,384,512 \
-  --m-values 16,32,64,96,128,192,256,384,512,768,1024,2048 \
-  --n-values 1024,2048,4096,8192,16384,32768,65536,131072 \
+  --d-values 64,128,256 \
+  --m-values 64,512 \
+  --n-values 2048,32768 \
   --bh-values 8 \
-  --families chunk_size,forward_block_m,backward_block_m,backward_block_t_qk,backward_block_t_state,combined \
+  --families core_fast,combined \
   --mode both \
-  --num-shards 8 \
+  --num-shards 4 \
   --shard-index 0
 ```
 
@@ -94,8 +104,9 @@ Run the same command for each shard index.
 Goal:
 
 - decide where `BLOCK_M=32` vs `64` vs larger tiles win
-- decide whether `CHUNK_SIZE` should change with `N`
-- verify whether backward token-panel choices need separate large-`N` handling
+- decide whether `CHUNK_SIZE=32,64,128,256` should change with `N`
+- decide whether backward `BLOCK_M` / `BLOCK_DV` need separate large-`N` handling
+- decide whether replay/QK launch presets still need different wide-`D` or large-`N` handling
 
 ## Stage 3: Confirm Promoted Families
 
@@ -104,12 +115,10 @@ After reading the stage-1 and stage-2 summaries, rerun only the promoted familie
 ```bash
 python benchmark/tune_chunked_flare_matrix.py \
   --run-name full-confirm-bh8 \
-  --d-values 16,32,64,96,128,192,256,384,512 \
-  --m-values 16,32,64,96,128,192,256,384,512,768,1024,2048 \
-  --n-values 1024,2048,4096,8192,16384,32768,65536,131072 \
+  --full-matrix \
   --bh-values 8 \
   --families default \
-  --extra-config promoted_wide_d:FLARE_FWD_BLOCK_D=128,FLARE_FWD_BLOCK_K=32,FLARE_LSE_BWD_BLOCK_M=64,FLARE_LSE_BWD_BLOCK_K=32 \
+  --extra-config promoted_structural:FLARE_CHUNK_SIZE=64,FLARE_BLOCK_M=64,FLARE_LSE_BWD_BLOCK_M=64,FLARE_LSE_BWD_BLOCK_DV=128 \
   --extra-config promoted_large_n:FLARE_CHUNK_SIZE=256,FLARE_BLOCK_M=64,FLARE_PREFIX_BLOCK_M=64 \
   --mode both \
   --num-shards 8 \
@@ -137,6 +146,14 @@ Goal:
 - `backward_block_t_qk`
 - `backward_launch`
 
+`core_fast`:
+
+- `default`
+- `chunk_size`
+- `forward_block_m`
+- `backward_block_m`
+- `backward_block_dv`
+
 `extended`:
 
 - `backward_block_dv`
@@ -151,6 +168,12 @@ Goal:
 
 - merges the best winner from each selected family for the same case
 - useful as a cheap second pass before promoting a config family
+
+Important:
+
+- The runtime path is heuristic-only by default.
+- That is intentional. We previously tried runtime Triton autotune, but the compile/autotune cost was too high for acceptable user experience.
+- These families are the place where tile and launch alternatives are explored before promoting winners back into `causal_flare/chunked.py`.
 
 ## Reading The Results
 

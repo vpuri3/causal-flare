@@ -27,10 +27,17 @@ FAMILY_GROUPS = {
         "default",
         "chunk_size",
         "prefill_block_m",
+        "prefill_block_d",
+        "prefill_block_k",
+        "prefill_launch",
         "combined",
     ),
     "decode": (
         "default",
+        "decode_block_d",
+        "decode_block_k",
+        "decode_launch",
+        "combined",
     ),
 }
 
@@ -96,6 +103,7 @@ def power_of_two_values(limit: int) -> list[int]:
 def build_candidates(case: Case, *, mode: str, chunk_sizes: tuple[int, ...]) -> list[CandidateConfig]:
     m = case.latent_queries
     n = case.seq_len
+    d = case.head_dim
     candidates = [CandidateConfig("default", "default", {})]
     if mode == "prefill":
         candidates.extend(
@@ -110,6 +118,92 @@ def build_candidates(case: Case, *, mode: str, chunk_sizes: tuple[int, ...]) -> 
                 {"FLARE_BLOCK_M": str(block_m)},
             )
             for block_m in power_of_two_values(m)
+        )
+        candidates.extend(
+            CandidateConfig(
+                "prefill_block_d",
+                f"prefill_block_d_{block_d}",
+                {
+                    "FLARE_PREPARE_BLOCK_D": str(block_d),
+                    "FLARE_PREFIX_BLOCK_D": str(block_d),
+                    "FLARE_FWD_BLOCK_D": str(block_d),
+                },
+            )
+            for block_d in power_of_two_values(d)
+        )
+        candidates.extend(
+            CandidateConfig(
+                "prefill_block_k",
+                f"prefill_block_k_{block_k}",
+                {
+                    "FLARE_PREPARE_BLOCK_K": str(block_k),
+                    "FLARE_FWD_BLOCK_K": str(block_k),
+                },
+            )
+            for block_k in power_of_two_values(d)
+            if (d % block_k) == 0
+        )
+        candidates.extend(
+            [
+                CandidateConfig(
+                    "prefill_launch",
+                    "prefill_launch_balanced",
+                    {
+                        "FLARE_PREPARE_NUM_WARPS": "4",
+                        "FLARE_PREPARE_NUM_STAGES": "2",
+                        "FLARE_PREFIX_NUM_WARPS": "4",
+                        "FLARE_PREFIX_NUM_STAGES": "2",
+                        "FLARE_DECODER_NUM_WARPS": "4",
+                        "FLARE_DECODER_NUM_STAGES": "1",
+                        "FLARE_FWD_NUM_WARPS": "4",
+                        "FLARE_FWD_NUM_STAGES": "1",
+                    },
+                ),
+                CandidateConfig(
+                    "prefill_launch",
+                    "prefill_launch_wide_prepare",
+                    {
+                        "FLARE_PREPARE_NUM_WARPS": "8",
+                        "FLARE_PREPARE_NUM_STAGES": "3",
+                        "FLARE_PREFIX_NUM_WARPS": "8",
+                        "FLARE_PREFIX_NUM_STAGES": "3",
+                        "FLARE_DECODER_NUM_WARPS": "4",
+                        "FLARE_DECODER_NUM_STAGES": "1",
+                        "FLARE_FWD_NUM_WARPS": "4",
+                        "FLARE_FWD_NUM_STAGES": "1",
+                    },
+                ),
+            ]
+        )
+    else:
+        candidates.extend(
+            CandidateConfig("decode_block_d", f"decode_block_d_{block_d}", {"FLARE_DECODE_BLOCK_D": str(block_d)})
+            for block_d in power_of_two_values(d)
+        )
+        candidates.extend(
+            CandidateConfig("decode_block_k", f"decode_block_k_{block_k}", {"FLARE_DECODE_BLOCK_K": str(block_k)})
+            for block_k in power_of_two_values(d)
+            if (d % block_k) == 0
+        )
+        candidates.extend(
+            [
+                CandidateConfig(
+                    "decode_launch",
+                    "decode_launch_light_2w1s",
+                    {
+                        "FLARE_DECODE_NUM_WARPS": "2",
+                        "FLARE_DECODE_NUM_STAGES": "1",
+                    },
+                ),
+                CandidateConfig(
+                    "decode_launch",
+                    "decode_launch_wide_4w1s",
+                    {
+                        "FLARE_DECODE_NUM_WARPS": "4",
+                        "FLARE_DECODE_NUM_STAGES": "1",
+                    },
+                ),
+            ]
         )
 
     deduped = []

@@ -1,8 +1,10 @@
 # FLARE Inference Matrix Tuning Workflow
 
-Current source of truth for which knobs are still structural versus autotuned:
+Current source of truth for which knobs are owned by offline tuning and then promoted into runtime heuristics:
 
 - [`README.md`](./README.md)
+
+This workflow is intentionally benchmark-owned rather than runtime-autotuned. We tried using Triton autotune on the default runtime path, but compile and first-use latency became extremely large, so inference returned to heuristic config selection plus offline matrix sweeps.
 
 Use this workflow to retune FLARE inference after major kernel/code changes:
 
@@ -49,6 +51,8 @@ Focus on:
 
 - `CHUNK_SIZE`
 - prefill `BLOCK_M`
+- prefill `BLOCK_D` / `BLOCK_K`
+- prefill launch presets
 
 ## Decode Seed
 
@@ -61,17 +65,19 @@ python benchmark/tune_flare_inference_matrix.py \
   --n-values 4096 \
   --bh-values 8 \
   --decode-steps 256 \
-  --families default
+  --families default,decode_block_d,decode_block_k,decode_launch,combined
 ```
 
 Focus on:
 
-- decode end-to-end latency and per-kernel profile totals only
-- decode launch parameters are now owned by Triton autotune rather than runtime env overrides
+- decode `BLOCK_D`
+- decode `BLOCK_K`
+- decode launch geometry (`FLARE_DECODE_NUM_WARPS`, `FLARE_DECODE_NUM_STAGES`)
 
 ## Notes
 
-- Prefill structural sweeps should focus on `CHUNK_SIZE` and `BLOCK_M`; local kernel tiles and launch geometry are now autotuned.
-- Decode uses a curated Triton autotune shortlist for kernel-local launch parameters and no longer exposes `FLARE_DECODE_*` runtime tuning envs.
+- Prefill and decode both run with heuristic-selected configs in the default user path.
+- The matrix runner owns any comparison across `FLARE_DECODE_*` and prefill launch/tile env knobs.
+- This separation is deliberate: benchmark jobs absorb the expensive search/compile work so normal inference does not.
 - Failed candidate configs are recorded as error rows instead of aborting the entire shard.
 - For the lightweight end-to-end benchmark/profiler CLIs, prefer explicit `--score-head-dim` / `--value-head-dim` naming when exercising mixed-dimension cases.

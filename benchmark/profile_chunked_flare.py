@@ -540,8 +540,16 @@ def bench_case(
     )
 
     with temp_env(env):
-        compiled_kernels = compile_forward_kernels(q, k, v, input_precision=input_precision)
-        kernel_profiles = collect_kernel_profiles(compiled_kernels, device_idx)
+        try:
+            compiled_kernels = compile_forward_kernels(q, k, v, input_precision=input_precision)
+            kernel_profiles = collect_kernel_profiles(compiled_kernels, device_idx)
+        except KeyError:
+            # The standalone forward compile profiler still expects some
+            # pre-autotune config fields that the runtime no longer exposes.
+            # Keep timing sweeps running and omit only the compiled resource
+            # metadata until the profiler path is brought back in sync.
+            compiled_kernels = {}
+            kernel_profiles = {}
         avg_forward_timings, avg_backward_timings, backward_resources = average_profile_timings(
             q,
             k,

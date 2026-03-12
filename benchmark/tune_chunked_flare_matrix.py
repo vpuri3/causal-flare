@@ -24,11 +24,15 @@ except ImportError:
     )
 
 
-DEFAULT_D_VALUES = (16, 32, 64, 96, 128, 192, 256, 384, 512)
-DEFAULT_M_VALUES = (16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048)
-DEFAULT_N_VALUES = (1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072)
-DEFAULT_BH_VALUES = (8,)
-DEFAULT_CHUNK_SIZES = (64, 128, 256, 512)
+FAST_D_VALUES = (64, 128, 256)
+FAST_M_VALUES = (64, 512)
+FAST_N_VALUES = (2048, 32768)
+FAST_BH_VALUES = (8,)
+FULL_D_VALUES = (16, 32, 64, 96, 128, 192, 256, 384, 512)
+FULL_M_VALUES = (16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048)
+FULL_N_VALUES = (1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072)
+FULL_BH_VALUES = (8,)
+DEFAULT_CHUNK_SIZES = (32, 64, 128, 256)
 DEFAULT_FORWARD_BLOCK_KS = (16, 32, 64, 128)
 DEFAULT_BACKWARD_BLOCK_KS = (16, 32, 64, 128)
 DEFAULT_FORWARD_BLOCK_DS = (16, 32, 64, 128, 256)
@@ -50,9 +54,7 @@ def parse_int_list(spec: str | None, *, default: tuple[int, ...]) -> tuple[int, 
     return tuple(values)
 
 
-def parse_family_list(spec: str | None) -> tuple[str, ...]:
-    if not spec:
-        return FAMILY_GROUPS["core"]
+def parse_family_list(spec: str) -> tuple[str, ...]:
     requested: list[str] = []
     for token in (part.strip() for part in spec.split(",")):
         if not token:
@@ -69,6 +71,26 @@ def parse_family_list(spec: str | None) -> tuple[str, ...]:
         if token not in requested:
             requested.append(token)
     return tuple(requested)
+
+
+def default_family_group(*, mode: str, full_matrix: bool) -> str:
+    if full_matrix:
+        if mode == "forward":
+            return "full_forward"
+        if mode == "backward":
+            return "full_backward"
+        return "core"
+    if mode == "forward":
+        return "fast_forward"
+    if mode == "backward":
+        return "fast_backward"
+    return "core_fast"
+
+
+def default_matrix_values(*, full_matrix: bool) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    if full_matrix:
+        return FULL_D_VALUES, FULL_M_VALUES, FULL_N_VALUES, FULL_BH_VALUES
+    return FAST_D_VALUES, FAST_M_VALUES, FAST_N_VALUES, FAST_BH_VALUES
 
 
 def parse_extra_config(spec: str) -> CandidateConfig:
@@ -141,11 +163,16 @@ def expand_candidates_for_case(
         block_ts=block_ts,
         scalar_apply_panels=scalar_apply_panels,
     )
+    extras_by_family: dict[str, list[CandidateConfig]] = {}
     for extra in extra_configs:
         family_candidates.setdefault(extra.family, []).append(extra)
+        extras_by_family.setdefault(extra.family, []).append(extra)
     expanded: list[CandidateConfig] = []
     for family in families:
         expanded.extend(family_candidates.get(family, []))
+    for family, extras in extras_by_family.items():
+        if family not in families:
+            expanded.extend(extras)
     deduped: list[CandidateConfig] = []
     seen = set()
     for candidate in expanded:
@@ -385,9 +412,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run repeatable chunked FLARE launch-config sweeps over a D/M/N/BH matrix."
     )
-    parser.add_argument("--d-values", default=None, help="Comma-separated D values. Default uses the repo tuning matrix.")
-    parser.add_argument("--m-values", default=None, help="Comma-separated M values. Default uses the repo tuning matrix.")
-    parser.add_argument("--n-values", default=None, help="Comma-separated N values. Default uses the repo tuning matrix.")
+    parser.add_argument("--d-values", default=None, help="Comma-separated D values. Default uses the fast anchor matrix.")
+    parser.add_argument("--m-values", default=None, help="Comma-separated M values. Default uses the fast anchor matrix.")
+    parser.add_argument("--n-values", default=None, help="Comma-separated N values. Default uses the fast anchor matrix.")
     parser.add_argument(
         "--bh-values",
         default=None,
@@ -401,15 +428,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--families",
-        default="core",
-        help="Comma-separated family/group list. Groups: core, extended, all. Individual families are also allowed.",
+        default=None,
+        help=(
+            "Comma-separated family/group list. Default depends on --mode and --full-matrix. "
+            "Groups include fast_forward, fast_backward, core_fast, full_forward, full_backward, core, extended, all."
+        ),
+    )
+    parser.add_argument(
+        "--full-matrix",
+        action="store_true",
+        help="Use the exhaustive historical shape matrix and broader default family sets instead of the fast anchor defaults.",
     )
     parser.add_argument(
         "--extra-config",
         action="append",
         help="Repeatable extra named env config: name:key=value,key=value",
     )
-    parser.add_argument("--chunk-sizes", default="64,128,256,512", help="Comma-separated CHUNK_SIZE candidates.")
+    parser.add_argument("--chunk-sizes", default="32,64,128,256", help="Comma-separated CHUNK_SIZE candidates.")
     parser.add_argument("--forward-block-ks", default="16,32,64,128", help="Comma-separated forward BLOCK_K candidates.")
     parser.add_argument("--backward-block-ks", default="16,32,64,128", help="Comma-separated backward BLOCK_K candidates.")
     parser.add_argument("--forward-block-ds", default="16,32,64,128,256", help="Comma-separated forward BLOCK_D candidates.")
@@ -478,11 +513,12 @@ def main() -> None:
     args = parser.parse_args()
 
     dtype = parse_dtype(args.dtype)
-    d_values = parse_int_list(args.d_values, default=DEFAULT_D_VALUES)
-    m_values = parse_int_list(args.m_values, default=DEFAULT_M_VALUES)
-    n_values = parse_int_list(args.n_values, default=DEFAULT_N_VALUES)
-    bh_values = parse_int_list(args.bh_values, default=DEFAULT_BH_VALUES)
-    families = parse_family_list(args.families)
+    default_d_values, default_m_values, default_n_values, default_bh_values = default_matrix_values(full_matrix=args.full_matrix)
+    d_values = parse_int_list(args.d_values, default=default_d_values)
+    m_values = parse_int_list(args.m_values, default=default_m_values)
+    n_values = parse_int_list(args.n_values, default=default_n_values)
+    bh_values = parse_int_list(args.bh_values, default=default_bh_values)
+    families = parse_family_list(args.families or default_family_group(mode=args.mode, full_matrix=args.full_matrix))
     chunk_sizes = parse_int_list(args.chunk_sizes, default=DEFAULT_CHUNK_SIZES)
     forward_block_ks = parse_int_list(args.forward_block_ks, default=DEFAULT_FORWARD_BLOCK_KS)
     backward_block_ks = parse_int_list(args.backward_block_ks, default=DEFAULT_BACKWARD_BLOCK_KS)

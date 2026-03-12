@@ -70,9 +70,10 @@ The forward pass is implemented by `ChunkedFLARE.forward` in
 - `BLOCK_T` token micro-tile
 - Triton launch settings
 
-There is one narrow default override: if no explicit chunk size is provided and
-the shape is the current measured H100 target (`bf16`, `M=64`, `D=32`,
-`N=2048`), the default chunk size is `64`; otherwise it stays `128`.
+If no explicit chunk size is provided, the runtime now defaults to
+`CHUNK_SIZE=64` for the chunked path. That default was promoted from the
+reduced tuning matrix after consistently beating the historical `128` baseline
+across the representative training shapes we care about.
 
 ### 2. Prepare Per-Chunk Encoder Statistics
 

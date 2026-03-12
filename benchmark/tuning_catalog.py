@@ -39,6 +39,46 @@ class TuningCatalog:
 
 
 CHUNKED_TUNING_FAMILY_GROUPS = {
+    "fast_forward": (
+        "default",
+        "chunk_size",
+        "forward_block_m",
+    ),
+    "fast_backward": (
+        "default",
+        "chunk_size",
+        "backward_block_m",
+    ),
+    "core_fast": (
+        "default",
+        "chunk_size",
+        "forward_block_m",
+        "backward_block_m",
+    ),
+    "full_forward": (
+        "default",
+        "chunk_size",
+        "forward_block_m",
+        "forward_block_d",
+        "forward_block_k",
+        "forward_launch",
+    ),
+    "full_backward": (
+        "default",
+        "chunk_size",
+        "backward_block_m",
+        "backward_block_dv",
+        "backward_block_k",
+        "backward_block_d_part",
+        "backward_qk_block_d",
+        "backward_block_t_qk",
+        "backward_block_t_replay",
+        "backward_block_t_state",
+        "backward_block_t_apply",
+        "backward_scalar_apply_panel",
+        "backward_fused_chunk_scan",
+        "backward_launch",
+    ),
     "core": (
         "default",
         "chunk_size",
@@ -117,6 +157,28 @@ def filter_divisors(values: Iterable[int], dim: int) -> list[int]:
 
 def filter_tiles(values: Iterable[int], dim: int) -> list[int]:
     return [value for value in values if value <= dim]
+
+
+def _filter_chunked_forward_chunk_sizes(values: Iterable[int], *, latent_queries: int, head_dim: int, seq_len: int) -> list[int]:
+    valid = [value for value in values if value <= seq_len and (value % 16) == 0]
+    # `CHUNK_SIZE=256` regularly spills over the shared-memory budget once the
+    # forward working set reaches even moderate `M x D`. Keep it available only
+    # for the smaller regimes where it is plausibly viable.
+    if latent_queries > 32 or head_dim > 64:
+        valid = [value for value in valid if value != 256]
+    return valid
+
+
+def _filter_forward_block_m_values(values: Iterable[int]) -> list[int]:
+    # Wider forward M tiles have repeatedly fallen off the shared-memory cliff
+    # in tuning smoke runs while providing no evidence of wins over 64.
+    return [value for value in values if value <= 64]
+
+
+def _filter_backward_block_m_values(values: Iterable[int]) -> list[int]:
+    # Very large backward M tiles were consistently dominated in smoke runs and
+    # can produce extremely slow scans/replays on long-context shapes.
+    return [value for value in values if value <= 128]
 
 
 def chunked_forward_launch_presets() -> tuple[CandidateConfig, ...]:
@@ -257,13 +319,13 @@ def build_chunked_family_candidates(
     d = head_dim
     m = latent_queries
     n = seq_len
-    forward_block_m_values = power_of_two_values(m)
-    backward_block_m_values = power_of_two_values(m)
+    forward_block_m_values = _filter_forward_block_m_values(power_of_two_values(m))
+    backward_block_m_values = _filter_backward_block_m_values(power_of_two_values(m))
     valid_forward_block_d = filter_tiles(forward_block_ds, d)
     valid_backward_block_d = filter_tiles(backward_block_ds, d)
     valid_forward_block_k = filter_divisors(forward_block_ks, d)
     valid_backward_block_k = filter_divisors(backward_block_ks, d)
-    valid_chunk_sizes = [value for value in chunk_sizes if value <= n and (value % 16) == 0]
+    valid_chunk_sizes = _filter_chunked_forward_chunk_sizes(chunk_sizes, latent_queries=m, head_dim=d, seq_len=n)
     valid_block_ts = [value for value in block_ts if value <= min(n, 512) and (value % 16) == 0]
     valid_scalar_apply_panels = [value for value in scalar_apply_panels if value <= min(128, n)]
 

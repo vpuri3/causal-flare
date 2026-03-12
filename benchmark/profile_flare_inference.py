@@ -31,7 +31,7 @@ except ImportError:
     )
 
 from causal_flare import flare_decode_triton, flare_prefill_triton
-from causal_flare.inference import flare_recurrent_step_kernel
+from causal_flare.inference import _get_decode_step_config, flare_recurrent_step_kernel
 
 
 DEFAULT_CASES = [
@@ -54,6 +54,7 @@ def compile_decode_kernel(
 ) -> dict[str, object]:
     b, h, d = k_step.shape
     m = q.shape[1]
+    cfg = _get_decode_step_config(m, d, d)
     state = clone_state(base_state)
     q_comp = q.contiguous().float()
     k_comp = k_step.contiguous().float()
@@ -61,7 +62,7 @@ def compile_decode_kernel(
     q_dec_step = k_comp
     k_dec_latent = q_comp
     y = torch.empty((b, h, d), device=k_step.device, dtype=torch.float32)
-    compiled = flare_recurrent_step_kernel[lambda meta: (b * h, triton.cdiv(d, meta["BLOCK_D"]))](
+    compiled = flare_recurrent_step_kernel[(b * h, triton.cdiv(d, int(cfg["BLOCK_D"])))](
         q_comp,
         k_comp,
         v_comp,
@@ -105,9 +106,15 @@ def compile_decode_kernel(
         h,
         m,
         d,
+        d,
         float(d ** -0.5 if d > 8 else 1.0),
         HAS_MASK=False,
+        BLOCK_M=int(cfg["BLOCK_M"]),
+        BLOCK_D=int(cfg["BLOCK_D"]),
+        BLOCK_K=int(cfg["BLOCK_K"]),
         WEIGHT_SHARING_ENC_DEC=True,
+        num_warps=int(cfg["num_warps"]),
+        num_stages=int(cfg["num_stages"]),
     )
     torch.cuda.synchronize()
     return {"flare_decode_step": compiled}
