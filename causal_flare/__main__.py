@@ -125,12 +125,15 @@ def run_semi_autoregressive_main(
     import time
 
     import torch
+    import torch.nn.functional as F
     import triton
+    from flash_attn import flash_attn_func
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    from causal_flare.semi_autoregressive import flare_semi_autoregressive_trition
     from causal_flare.semi_autoregressive.reference import (
-        _block_causal_forward_pytorch,
-        block_causal_sdpa_flex,
-        block_causal_sdpa_reference,
-        flare_block_causal_reference,
+        _block_causal_forward_pytorch_block_stats,
+        _block_causal_forward_pytorch_chunk_stats,
+        semi_autoregressive_flare_reference,
     )
     from testing.suite_runners.common import compute_errors, measure_memory
 
@@ -185,7 +188,13 @@ def run_semi_autoregressive_main(
         try:
             compile_ms = _probe_compile(fn)
             y, mem = measure_memory(fn)
-            ms = triton.testing.do_bench(fn, warmup=2, rep=2)
+            if device.type == "cuda":
+                ms = triton.testing.do_bench(fn, warmup=2, rep=2)
+            else:
+                start = time.perf_counter()
+                for _ in range(2):
+                    fn()
+                ms = (time.perf_counter() - start) * 1e3 / 2
             errors = compute_errors(y, ref, ref_prefix) if ref is not None and ref_prefix is not None else {}
             return {
                 "label": label,
@@ -205,6 +214,27 @@ def run_semi_autoregressive_main(
                 "compile_ms": float("nan"),
             }
 
+    def _run_sdpa(q, k, v, *, is_causal: bool):
+        q_in = q.permute(0, 2, 1, 3)
+        k_in = k.permute(0, 2, 1, 3)
+        v_in = v.permute(0, 2, 1, 3)
+        return F.scaled_dot_product_attention(
+            q_in,
+            k_in,
+            v_in,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=is_causal,
+            scale=scale,
+        ).permute(0, 2, 1, 3).to(v.dtype)
+
+    def _run_sdpa_fa2(q, k, v, *, is_causal: bool):
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            return _run_sdpa(q, k, v, is_causal=is_causal)
+
+    def _run_flash_attn(q, k, v, *, is_causal: bool):
+        return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=is_causal)
+
     print(
         f"Testing Semi-Autoregressive FLARE Forward Pass "
         f"(B={B}, H={H}, M={M}, N={N}, D={D}, block_size={block_size}, chunk_size={chunk_size}, dtype={dtype_obj}, device={device})"
@@ -212,75 +242,151 @@ def run_semi_autoregressive_main(
 
     print("Measuring semi-AR FLARE reference...", end=" ", flush=True)
     flare_ref_result = _run_impl(
-        "Block-Causal FLARE reference",
-        lambda: flare_block_causal_reference(Q_flare, K_flare, V_flare, block_size=block_size, scale=scale),
+        "FLARE Semi AR Reference",
+        lambda: semi_autoregressive_flare_reference(Q_flare, K_flare, V_flare, block_size=block_size, scale=scale),
     )
     print(flare_ref_result["status"] + _compile_suffix(flare_ref_result["compile_ms"]))
 
     flare_ref_output = None
     if flare_ref_result["status"] == "OK":
-        flare_ref_output = flare_block_causal_reference(Q_flare, K_flare, V_flare, block_size=block_size, scale=scale)
+        flare_ref_output = semi_autoregressive_flare_reference(Q_flare, K_flare, V_flare, block_size=block_size, scale=scale)
 
-    print("Measuring semi-AR chunkwise PyTorch reference...", end=" ", flush=True)
-    flare_chunked_result = _run_impl(
-        "Block-Causal FLARE chunkwise",
-        lambda: _block_causal_forward_pytorch(
+    print("Measuring semi-AR chunk-stats PyTorch reference...", end=" ", flush=True)
+    flare_chunk_stats_result = _run_impl(
+        "FLARE chunk-stats",
+        lambda: _block_causal_forward_pytorch_chunk_stats(
             Q_flare, K_flare, V_flare, block_size=block_size, chunk_size=chunk_size, scale=scale
         ),
         ref=flare_ref_output,
-        ref_prefix="semi_ar_chunked",
+        ref_prefix="semi_ar_chunk_stats",
     )
-    print(flare_chunked_result["status"] + _compile_suffix(flare_chunked_result["compile_ms"]))
+    print(flare_chunk_stats_result["status"] + _compile_suffix(flare_chunk_stats_result["compile_ms"]))
 
-    print("Measuring masked block-causal SDPA reference...", end=" ", flush=True)
-    sdpa_ref_result = _run_impl(
-        "Block-Causal SDPA reference",
-        lambda: block_causal_sdpa_reference(Q_sdpa, K_sdpa, V_sdpa, block_size=block_size, scale=scale),
+    print("Measuring semi-AR block-stats PyTorch reference...", end=" ", flush=True)
+    flare_block_stats_result = _run_impl(
+        "FLARE block-stats",
+        lambda: _block_causal_forward_pytorch_block_stats(
+            Q_flare, K_flare, V_flare, block_size=block_size, chunk_size=chunk_size, scale=scale
+        ),
+        ref=flare_ref_output,
+        ref_prefix="semi_ar_block_stats",
     )
-    print(sdpa_ref_result["status"] + _compile_suffix(sdpa_ref_result["compile_ms"]))
+    print(flare_block_stats_result["status"] + _compile_suffix(flare_block_stats_result["compile_ms"]))
 
-    sdpa_ref_output = None
-    if sdpa_ref_result["status"] == "OK":
-        sdpa_ref_output = block_causal_sdpa_reference(Q_sdpa, K_sdpa, V_sdpa, block_size=block_size, scale=scale)
+    triton_skip_reason = None if device.type == "cuda" else "requires CUDA"
 
-    print("Measuring block-causal FlexAttention SDPA...", end=" ", flush=True)
-    sdpa_flex_result = _run_impl(
-        "Block-Causal SDPA flex",
-        lambda: block_causal_sdpa_flex(Q_sdpa, K_sdpa, V_sdpa, block_size=block_size, scale=scale),
-        ref=sdpa_ref_output,
-        ref_prefix="semi_ar_sdpa_flex",
+    print("Measuring SemiAutoRegressiveFLARE Triton chunk-stats...", end=" ", flush=True)
+    semi_ar_triton_chunk_result = _run_impl(
+        "SemiAutoRegressiveFLARE Triton chunk-stats",
+        lambda: flare_semi_autoregressive_trition(
+            Q_flare,
+            K_flare,
+            V_flare,
+            block_size=block_size,
+            chunk_size=chunk_size,
+            scale=scale,
+            save_chunk_stats=True,
+        ),
+        ref=flare_ref_output,
+        ref_prefix="semi_ar_triton_chunk_stats",
+        skip_reason=triton_skip_reason,
     )
-    print(sdpa_flex_result["status"] + _compile_suffix(sdpa_flex_result["compile_ms"]))
+    print(semi_ar_triton_chunk_result["status"] + _compile_suffix(semi_ar_triton_chunk_result["compile_ms"]))
 
-    print("\n" + "=" * 120)
-    print("Semi-AR FLARE Family")
-    print("=" * 120)
-    print(f"{'Implementation':<30} {'Time (ms)':<12} {'Memory (GB)':<15} {'Abs Err (mean/max)':<22} {'Rel Err (mean/max)':<22} {'Status'}")
-    print("-" * 120)
-    for row in [flare_ref_result, flare_chunked_result]:
-        ms_str = f"{row['ms']:.2f}" if not math.isnan(row["ms"]) else "N/A"
-        print(
-            f"{row['label']:<30} {ms_str:<12} {row['mem']:<15.2e} "
-            f"{_format_err(row['errors'], 'semi_ar_chunked', 'abs') if row is flare_chunked_result else 'N/A':<22} "
-            f"{_format_err(row['errors'], 'semi_ar_chunked', 'rel') if row is flare_chunked_result else 'N/A':<22} "
-            f"{row['status']}"
+    print("Measuring SemiAutoRegressiveFLARE Triton block-stats...", end=" ", flush=True)
+    semi_ar_triton_block_result = _run_impl(
+        "SemiAutoRegressiveFLARE Triton block-stats",
+        lambda: flare_semi_autoregressive_trition(
+            Q_flare,
+            K_flare,
+            V_flare,
+            block_size=block_size,
+            chunk_size=chunk_size,
+            scale=scale,
+            save_chunk_stats=False,
+        ),
+        ref=flare_ref_output,
+        ref_prefix="semi_ar_triton_block_stats",
+        skip_reason=triton_skip_reason,
+    )
+    print(semi_ar_triton_block_result["status"] + _compile_suffix(semi_ar_triton_block_result["compile_ms"]))
+
+    print("Measuring causal SDPA via flash_attn...", end=" ", flush=True)
+    sdpa_causal_result = _run_impl(
+        "Causal SDPA (flash_attn)",
+        lambda: _run_flash_attn(Q_sdpa, K_sdpa, V_sdpa, is_causal=True),
+        skip_reason=triton_skip_reason,
+    )
+    print(sdpa_causal_result["status"] + _compile_suffix(sdpa_causal_result["compile_ms"]))
+
+    print("Measuring causal SDPA FA2...", end=" ", flush=True)
+    sdpa_causal_fa2_result = _run_impl(
+        "Causal SDPA FA2",
+        lambda: _run_sdpa_fa2(Q_sdpa, K_sdpa, V_sdpa, is_causal=True),
+        skip_reason=triton_skip_reason,
+    )
+    print(sdpa_causal_fa2_result["status"] + _compile_suffix(sdpa_causal_fa2_result["compile_ms"]))
+
+    triton_chunk_profile = None
+    triton_block_profile = None
+    if device.type == "cuda" and semi_ar_triton_chunk_result["status"] == "OK":
+        _, triton_chunk_profile = flare_semi_autoregressive_trition(
+            Q_flare,
+            K_flare,
+            V_flare,
+            block_size=block_size,
+            chunk_size=chunk_size,
+            scale=scale,
+            save_chunk_stats=True,
+            profile=True,
+        )
+    if device.type == "cuda" and semi_ar_triton_block_result["status"] == "OK":
+        _, triton_block_profile = flare_semi_autoregressive_trition(
+            Q_flare,
+            K_flare,
+            V_flare,
+            block_size=block_size,
+            chunk_size=chunk_size,
+            scale=scale,
+            save_chunk_stats=False,
+            profile=True,
         )
 
-    print("\n" + "=" * 120)
-    print("Semi-AR SDPA Family")
-    print("=" * 120)
-    print(f"{'Implementation':<30} {'Time (ms)':<12} {'Memory (GB)':<15} {'Abs Err (mean/max)':<22} {'Rel Err (mean/max)':<22} {'Status'}")
-    print("-" * 120)
-    for row in [sdpa_ref_result, sdpa_flex_result]:
-        prefix = "semi_ar_sdpa_flex"
+    print("\n" + "=" * 136)
+    print(f"{'Implementation':<42} {'Time (ms)':<12} {'Memory (GB)':<15} {'Abs Err (mean/max)':<22} {'Rel Err (mean/max)':<22} {'Status'}")
+    print("-" * 136)
+    rows = [
+        (flare_ref_result, None),
+        (flare_chunk_stats_result, "semi_ar_chunk_stats"),
+        (flare_block_stats_result, "semi_ar_block_stats"),
+        (semi_ar_triton_chunk_result, "semi_ar_triton_chunk_stats"),
+        (semi_ar_triton_block_result, "semi_ar_triton_block_stats"),
+        (sdpa_causal_result, None),
+        (sdpa_causal_fa2_result, None),
+    ]
+    for row, prefix in rows:
         ms_str = f"{row['ms']:.2f}" if not math.isnan(row["ms"]) else "N/A"
-        abs_err_str = _format_err(row["errors"], prefix, "abs") if row is sdpa_flex_result else "N/A"
-        rel_err_str = _format_err(row["errors"], prefix, "rel") if row is sdpa_flex_result else "N/A"
+        abs_err_str = _format_err(row["errors"], prefix, "abs") if prefix is not None else "N/A"
+        rel_err_str = _format_err(row["errors"], prefix, "rel") if prefix is not None else "N/A"
         print(
-            f"{row['label']:<30} {ms_str:<12} {row['mem']:<15.2e} "
+            f"{row['label']:<42} {ms_str:<12} {row['mem']:<15.2e} "
             f"{abs_err_str:<22} {rel_err_str:<22} "
             f"{row['status']}"
         )
+
+    if triton_chunk_profile is not None or triton_block_profile is not None:
+        chunk_forward = triton_chunk_profile.get("forward", {}) if triton_chunk_profile is not None else {}
+        block_forward = triton_block_profile.get("forward", {}) if triton_block_profile is not None else {}
+        kernel_names = sorted(set(chunk_forward.keys()) | set(block_forward.keys()))
+        print("\n" + "=" * 96)
+        print(f"{'SemiAutoRegressiveFLARE Forward Kernel':<44} {'Chunk-stats (ms)':<20} {'Block-stats (ms)':<20}")
+        print("-" * 96)
+        for kernel_name in kernel_names:
+            chunk_ms = chunk_forward.get(kernel_name)
+            block_ms = block_forward.get(kernel_name)
+            chunk_ms_str = f"{chunk_ms:.3f}" if chunk_ms is not None else "N/A"
+            block_ms_str = f"{block_ms:.3f}" if block_ms is not None else "N/A"
+            print(f"{kernel_name:<44} {chunk_ms_str:<20} {block_ms_str:<20}")
 
     return
 
