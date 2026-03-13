@@ -108,7 +108,7 @@ def _autotune_launch_coverage_suite(*, shard_index: int | None = None, num_shard
             Q_dec_ref = Q_dec.detach().clone().requires_grad_(True) if Q_dec is not None else None
             K_dec_ref = K_dec.detach().clone().requires_grad_(True) if K_dec is not None else None
 
-            Y_t3 = flare_chunk_triton(Q_t3, K_t3, V_t3, scale, None, None, False, Q_dec_t3, K_dec_t3)
+            Y_t3 = flare_autoregressive_triton(Q_t3, K_t3, V_t3, scale, None, None, False, Q_dec_t3, K_dec_t3)
             with _temp_env_var("FLARE_REFERENCE_FP32", "1"):
                 with _scoped_float32_math_mode(allow_tf32=False):
                     Y_ref_grad = flare_causal_reference(

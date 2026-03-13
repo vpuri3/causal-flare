@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Fast benchmark for one forward+backward training step:
-- FLARE chunk Triton (`flare_chunk_triton`) for multiple latent counts M
+- FLARE chunk Triton (`flare_autoregressive_triton`) for multiple latent counts M
 - FlashAttention2 Triton (`flash_attention2_triton_bnhd`)
 
 Benchmarks are saved incrementally to raw JSONL so long runs are resumable.
@@ -23,7 +23,7 @@ import pandas as pd
 import torch
 import triton.testing
 
-from causal_flare import flare_chunk_triton
+from causal_flare import flare_autoregressive_triton
 
 
 DEFAULT_SEQ_LENGTHS = [2048, 4096, 8192, 16384, 32768, 65536, 131072]
@@ -75,7 +75,7 @@ def build_cases(seq_lengths: list[int], flare_m_list: list[int], include_fa2: bo
     if include_flare:
         for m in flare_m_list:
             for n in seq_lengths:
-                cases.append(BenchCase(provider="flare_chunk_triton", n=n, m=m))
+                cases.append(BenchCase(provider="flare_autoregressive_triton", n=n, m=m))
     return cases
 
 
@@ -194,7 +194,7 @@ def _build_flare_step_fn(
 
     def run_step() -> None:
         _clear_grads(tensors)
-        y = flare_chunk_triton(
+        y = flare_autoregressive_triton(
             q,
             k,
             v,
@@ -285,14 +285,14 @@ def benchmark_one_case(
         "p80_ms": math.nan,
         "error": "",
     }
-    if case.provider == "flare_chunk_triton":
+    if case.provider == "flare_autoregressive_triton":
         base_row["flare_chunk_size"] = flare_chunk_size
         base_row["flare_input_precision"] = flare_input_precision
     if case.provider == "fa2_triton":
         base_row["fa2_warp_specialize"] = fa2_warp_specialize
 
     try:
-        if case.provider == "flare_chunk_triton":
+        if case.provider == "flare_autoregressive_triton":
             if case.m is None:
                 raise ValueError("FLARE case missing M.")
             run_step = _build_flare_step_fn(
@@ -449,7 +449,7 @@ def run_benchmark(args: argparse.Namespace, output_dir: Path) -> pd.DataFrame:
 def _curve_label(provider: str, m: int | None) -> str:
     if provider == "fa2_triton":
         return "FlashAttention2 Triton"
-    if provider == "flare_chunk_triton":
+    if provider == "flare_autoregressive_triton":
         return f"FLARE Chunk Triton (M={m})"
     return provider
 
@@ -465,14 +465,14 @@ def plot_summary(df: pd.DataFrame, png_path: Path, pdf_path: Path, title: str) -
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
     styles = {
         ("fa2_triton", None): ("#1f77b4", "o"),
-        ("flare_chunk_triton", 32): ("#ff7f0e", "o"),
-        ("flare_chunk_triton", 64): ("#2ca02c", "o"),
-        ("flare_chunk_triton", 128): ("#d62728", "o"),
-        ("flare_chunk_triton", 256): ("#9467bd", "o"),
+        ("flare_autoregressive_triton", 32): ("#ff7f0e", "o"),
+        ("flare_autoregressive_triton", 64): ("#2ca02c", "o"),
+        ("flare_autoregressive_triton", 128): ("#d62728", "o"),
+        ("flare_autoregressive_triton", 256): ("#9467bd", "o"),
     }
 
     groups = []
-    for provider in ["fa2_triton", "flare_chunk_triton"]:
+    for provider in ["fa2_triton", "flare_autoregressive_triton"]:
         sub = ok[ok["provider"] == provider]
         if sub.empty:
             continue

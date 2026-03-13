@@ -1,10 +1,13 @@
-from ._common import *
+"""Experimental dense autoregressive FLARE variants."""
+
+from causal_flare._common import *
 
 # NOTE:
 # - This file does not implement sequence-length (N-axis) chunking.
 # - It is used to prototype inner methods that may later be used inside
 #   chunked algorithms.
-# - Keep this module self-contained: do not import kernels from chunked.py.
+# - Keep this module self-contained: do not import kernels from training.py.
+# - This path is experimental and is not exported from the default package API.
 
 
 def flare_causal_pytorch_dense1(Q, K, V, scale=None, eps=None, profile: bool = False):
@@ -265,7 +268,7 @@ def _denseflare_blocked_forward(
 
 class DenseFLARE(autograd.Function):
     # Experimental dense path only. Current recommendation is to use
-    # recurrent `ChunkedFLARE`; latest runs show dense underperforming it.
+    # recurrent `AutoRegressiveFLARE`; latest runs show dense underperforming it.
     @staticmethod
     def forward(ctx, Q, K, V, scale=None):
         if Q.dim() != 3 or K.dim() != 4 or V.dim() != 4:
@@ -405,7 +408,7 @@ class DenseFLARE(autograd.Function):
 
 class DenseFLARE1(autograd.Function):
     # Experimental dense path only. Current recommendation is to use
-    # recurrent `ChunkedFLARE`; latest runs show dense underperforming it.
+    # recurrent `AutoRegressiveFLARE`; latest runs show dense underperforming it.
     @staticmethod
     def forward(ctx, Q, K, V, scale=None):
         if Q.dim() != 3 or K.dim() != 4 or V.dim() != 4:

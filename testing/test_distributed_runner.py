@@ -34,15 +34,15 @@ def test_visible_gpu_ids_defaults_to_all_available(monkeypatch) -> None:
 def test_parse_collected_nodeids_filters_pytest_summary_lines() -> None:
     stdout = "\n".join(
         [
-            "testing/test_flare.py::test_one",
-            "testing/test_regression_suites.py::test_regression_bundle",
+            "testing/autoregressive/test_flare.py::test_one",
+            "testing/autoregressive/test_regression_suites.py::test_regression_bundle",
             "",
             "2 tests collected in 0.10s",
         ]
     )
     assert distributed_runner._parse_collected_nodeids(stdout) == [
-        "testing/test_flare.py::test_one",
-        "testing/test_regression_suites.py::test_regression_bundle",
+        "testing/autoregressive/test_flare.py::test_one",
+        "testing/autoregressive/test_regression_suites.py::test_regression_bundle",
     ]
 
 
@@ -85,13 +85,13 @@ def test_execution_pytest_args_drops_root_selector_but_keeps_flags() -> None:
 def test_expand_tasks_replaces_regression_bundle_with_unique_components() -> None:
     tasks = distributed_runner._expand_tasks(
         [
-            "testing/test_flare.py::test_one",
-            "testing/test_regression_suites.py::test_regression_bundle",
+            "testing/autoregressive/test_flare.py::test_one",
+            "testing/autoregressive/test_regression_suites.py::test_regression_bundle",
         ],
         full_matrix=False,
     )
     assert [task.label for task in tasks] == [
-        "pytest:testing/test_flare.py::test_one",
+        "pytest:testing/autoregressive/test_flare.py::test_one",
         "suite:parity",
         "suite:trainlike_sanity",
     ]
@@ -99,7 +99,7 @@ def test_expand_tasks_replaces_regression_bundle_with_unique_components() -> Non
 
 def test_expand_tasks_adds_multistep_suite_for_full_matrix() -> None:
     tasks = distributed_runner._expand_tasks(
-        ["testing/test_regression_suites.py::test_regression_bundle"],
+        ["testing/autoregressive/test_regression_suites.py::test_regression_bundle"],
         full_matrix=True,
     )
     assert [task.label for task in tasks] == [
@@ -136,12 +136,12 @@ def test_schedule_tasks_keeps_autotune_coverage_on_worker_zero_slots() -> None:
     tasks = [
         distributed_runner.Task(
             kind="pytest",
-            name="testing/test_regression_suites.py::test_autotune_launch_coverage_suite[autotune1]",
+            name="testing/autoregressive/test_regression_suites.py::test_autotune_launch_coverage_suite[autotune1]",
             weight=2,
         ),
         distributed_runner.Task(
             kind="pytest",
-            name="testing/test_regression_suites.py::test_autotune_launch_coverage_suite[autotune2]",
+            name="testing/autoregressive/test_regression_suites.py::test_autotune_launch_coverage_suite[autotune2]",
             weight=2,
         ),
         distributed_runner.Task(kind="pytest", name="ordinary", weight=1),
@@ -158,7 +158,7 @@ def test_schedule_tasks_keeps_autotune_coverage_on_worker_zero_slots() -> None:
 
 
 def test_task_command_targets_single_nodeid_without_collecting_testing_root() -> None:
-    task = distributed_runner.Task(kind="pytest", name="testing/test_flare.py::test_one", weight=1)
+    task = distributed_runner.Task(kind="pytest", name="testing/autoregressive/test_flare.py::test_one", weight=1)
     command = distributed_runner._task_command(task, ["testing", "--run-regression", "-q"])
     assert command == [
         distributed_runner.sys.executable,
@@ -166,5 +166,5 @@ def test_task_command_targets_single_nodeid_without_collecting_testing_root() ->
         "pytest",
         "--run-regression",
         "-q",
-        "testing/test_flare.py::test_one",
+        "testing/autoregressive/test_flare.py::test_one",
     ]

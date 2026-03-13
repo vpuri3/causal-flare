@@ -22,7 +22,7 @@ Why:
 ### Chunked training runtime
 
 `72394e2` default behavior:
-- heuristic bucket selection in `causal_flare/chunked.py`
+- heuristic bucket selection in `causal_flare/autoregressive/training.py`
 - explicit width buckets via `_get_chunked_forward_bucket_defaults(...)`
 - explicit backward buckets via `_get_chunked_backward_bucket_defaults(...)`
 - per-phase launch defaults resolved by `_resolve_forward_launch(...)` / `_resolve_backward_launch(...)`

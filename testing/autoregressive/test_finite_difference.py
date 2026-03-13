@@ -4,9 +4,9 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from causal_flare import flare_chunk_triton
-from causal_flare.recurrent import RecurrentFLARE
-from causal_flare.torch import flare_causal_chunked, flare_causal_reference
+from causal_flare import flare_autoregressive_triton
+from causal_flare.autoregressive.recurrent import RecurrentFLARE
+from causal_flare.autoregressive.reference import flare_causal_chunked, flare_causal_reference
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -177,7 +177,7 @@ def test_causal_flare_backward_matches_directional_finite_difference(
         elif impl_name == "recurrent":
             y = RecurrentFLARE.apply(values["q"], values["k"], values["v"], scale, None, None, q_dec, k_dec, 16)
         elif impl_name == "triton_chunked":
-            y = flare_chunk_triton(
+            y = flare_autoregressive_triton(
                 Q=values["q"],
                 K=values["k"],
                 V=values["v"],

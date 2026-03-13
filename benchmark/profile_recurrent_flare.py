@@ -24,7 +24,7 @@ import triton.testing
 from triton.runtime.driver import driver
 
 from causal_flare._common import _get_input_precision, _resolve_attn_scale
-from causal_flare.recurrent import (
+from causal_flare.autoregressive.recurrent import (
     _get_recurrent_block_d_k,
     _get_recurrent_block_m,
     _get_recurrent_block_t,

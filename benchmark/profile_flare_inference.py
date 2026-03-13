@@ -31,7 +31,7 @@ except ImportError:
     )
 
 from causal_flare import flare_decode_triton, flare_prefill_triton
-from causal_flare.inference import _get_decode_step_config, flare_recurrent_step_kernel
+from causal_flare.autoregressive.inference import _get_decode_step_config, flare_recurrent_step_kernel
 
 
 DEFAULT_CASES = [

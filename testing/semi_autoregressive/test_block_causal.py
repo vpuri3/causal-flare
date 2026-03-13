@@ -3,12 +3,16 @@ import os
 import pytest
 import torch
 
-from causal_flare.block_causal import (
-    _block_causal_forward_torch,
-    flare_block_causal_reference,
-    flare_block_causal_torch,
+from causal_flare.semi_autoregressive import (
+    flare_semi_autoregressive_decode_trition,
+    flare_semi_autoregressive_prefill_trition,
+    flare_semi_autoregressive_trition,
+)
+from causal_flare.semi_autoregressive.reference import (
+    _block_causal_forward_pytorch,
     block_causal_sdpa_flex,
     block_causal_sdpa_reference,
+    flare_block_causal_reference,
 )
 
 
@@ -25,8 +29,8 @@ def test_block_causal_validation_rejects_invalid_block_chunk_pairs(block_size: i
     k = torch.randn((1, 8, 2, 16), dtype=torch.float32)
     v = torch.randn((1, 8, 2, 16), dtype=torch.float32)
 
-    with pytest.raises(ValueError, match=message):
-        flare_block_causal_torch(q, k, v, block_size=block_size, chunk_size=chunk_size)
+    with pytest.raises(NotImplementedError, match="not implemented yet"):
+        flare_semi_autoregressive_trition(q, k, v, block_size=block_size, chunk_size=chunk_size)
 
 
 def test_block_causal_validation_rejects_non_block_aligned_sequence_length():
@@ -34,8 +38,8 @@ def test_block_causal_validation_rejects_non_block_aligned_sequence_length():
     k = torch.randn((1, 33, 2, 16), dtype=torch.float32)
     v = torch.randn((1, 33, 2, 16), dtype=torch.float32)
 
-    with pytest.raises(ValueError, match="sequence length N to be an exact multiple of block_size"):
-        flare_block_causal_torch(q, k, v, block_size=16, chunk_size=16)
+    with pytest.raises(NotImplementedError, match="not implemented yet"):
+        flare_semi_autoregressive_trition(q, k, v, block_size=16, chunk_size=16)
 
 
 @pytest.mark.parametrize(
@@ -64,7 +68,7 @@ def test_block_causal_forward_matches_sdpa_reference(
     v = torch.randn((B, seq_len, H, D), dtype=torch.float32)
 
     y_ref = flare_block_causal_reference(q, k, v, block_size=block_size, scale=scale)
-    y_impl, aux = _block_causal_forward_torch(
+    y_impl, aux = _block_causal_forward_pytorch(
         q,
         k,
         v,
@@ -80,7 +84,34 @@ def test_block_causal_forward_matches_sdpa_reference(
     torch.testing.assert_close(y_impl, y_ref, rtol=1e-4, atol=1e-5)
 
 
-def test_block_causal_autograd_matches_reference():
+def test_block_causal_training_wrapper_is_not_implemented():
+    q = torch.randn((2, 4, 16), dtype=torch.float32, requires_grad=True)
+    k = torch.randn((1, 32, 2, 16), dtype=torch.float32, requires_grad=True)
+    v = torch.randn((1, 32, 2, 16), dtype=torch.float32, requires_grad=True)
+
+    with pytest.raises(NotImplementedError, match="not implemented yet"):
+        flare_semi_autoregressive_trition(q, k, v, block_size=32, chunk_size=16)
+
+
+def test_block_causal_prefill_wrapper_is_not_implemented():
+    q = torch.randn((2, 4, 16), dtype=torch.float32)
+    k = torch.randn((1, 32, 2, 16), dtype=torch.float32)
+    v = torch.randn((1, 32, 2, 16), dtype=torch.float32)
+
+    with pytest.raises(NotImplementedError, match="not implemented yet"):
+        flare_semi_autoregressive_prefill_trition(q, k, v)
+
+
+def test_block_causal_decode_wrapper_is_not_implemented():
+    q = torch.randn((2, 4, 16), dtype=torch.float32)
+    k = torch.randn((1, 2, 16), dtype=torch.float32)
+    v = torch.randn((1, 2, 16), dtype=torch.float32)
+
+    with pytest.raises(NotImplementedError, match="not implemented yet"):
+        flare_semi_autoregressive_decode_trition(q, k, v)
+
+
+def test_block_causal_reference_forward_matches_reference():
     torch.manual_seed(1)
 
     B = 2
@@ -92,24 +123,14 @@ def test_block_causal_autograd_matches_reference():
     chunk_size = 16
     scale = D ** -0.5
 
-    q_ref = torch.randn((H, M, D), dtype=torch.float32, requires_grad=True)
-    k_ref = torch.randn((B, N, H, D), dtype=torch.float32, requires_grad=True)
-    v_ref = torch.randn((B, N, H, D), dtype=torch.float32, requires_grad=True)
-    q_impl = q_ref.detach().clone().requires_grad_(True)
-    k_impl = k_ref.detach().clone().requires_grad_(True)
-    v_impl = v_ref.detach().clone().requires_grad_(True)
-    grad_out = torch.randn((B, N, H, D), dtype=torch.float32)
+    q_ref = torch.randn((H, M, D), dtype=torch.float32)
+    k_ref = torch.randn((B, N, H, D), dtype=torch.float32)
+    v_ref = torch.randn((B, N, H, D), dtype=torch.float32)
 
     y_ref = flare_block_causal_reference(q_ref, k_ref, v_ref, block_size=block_size, scale=scale)
-    (y_ref * grad_out).sum().backward()
+    y_impl = _block_causal_forward_pytorch(q_ref, k_ref, v_ref, block_size=block_size, chunk_size=chunk_size, scale=scale)
 
-    y_impl = flare_block_causal_torch(q_impl, k_impl, v_impl, block_size=block_size, chunk_size=chunk_size, scale=scale)
-    (y_impl * grad_out).sum().backward()
-
-    torch.testing.assert_close(y_impl, y_ref.detach(), rtol=1e-4, atol=1e-5)
-    torch.testing.assert_close(q_impl.grad, q_ref.grad, rtol=2e-4, atol=2e-5)
-    torch.testing.assert_close(k_impl.grad, k_ref.grad, rtol=2e-4, atol=2e-5)
-    torch.testing.assert_close(v_impl.grad, v_ref.grad, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(y_impl, y_ref, rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="flex attention coverage requires CUDA")
@@ -158,7 +179,7 @@ def test_block_causal_perf_check_block256_chunk128():
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    y = flare_block_causal_torch(q, k, v, block_size=block_size, chunk_size=chunk_size)
+    y = _block_causal_forward_pytorch(q, k, v, block_size=block_size, chunk_size=chunk_size)
     end.record()
     torch.cuda.synchronize()
 

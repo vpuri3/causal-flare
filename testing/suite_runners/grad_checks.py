@@ -34,7 +34,7 @@ def _gradcheck_suite(dtype: torch.dtype, B: int, H: int, N: int, M: int, D: int,
         return (y * R).sum()
 
     def _loss_t3(q, k, v):
-        y = flare_chunk_triton(q, k, v, scale)
+        y = flare_autoregressive_triton(q, k, v, scale)
         return (y * R).sum()
 
     loss_ref = _loss_ref(Q, K, V)
@@ -280,7 +280,7 @@ def _run_grad_checks_suite(*, shard_index: int | None = None, num_shards: int | 
                     V_t3 = V.detach().clone().requires_grad_(True)
                     Q_dec_t3 = Q_dec.detach().clone().requires_grad_(True) if Q_dec is not None else None
                     K_dec_t3 = K_dec.detach().clone().requires_grad_(True) if K_dec is not None else None
-                    Y_t3 = flare_chunk_triton(
+                    Y_t3 = flare_autoregressive_triton(
                         Q_t3, K_t3, V_t3, scale, chunk_size, input_precision, False, Q_dec_t3, K_dec_t3
                     )
                     Y_t3.sum().backward()

@@ -15,9 +15,9 @@ import triton
 import triton.testing
 from triton.runtime.driver import driver
 
-from causal_flare import flare_chunk_triton
+from causal_flare import flare_autoregressive_triton
 from causal_flare._common import _resolve_attn_scale
-from causal_flare.chunked import (
+from causal_flare.autoregressive.training import (
     _get_chunked_forward_config,
     _resolve_chunked_decode_inputs,
     flare_chunk_decoder_lse,
@@ -445,7 +445,7 @@ def average_profile_timings(
 
     def run_once(profile: bool) -> dict[str, object] | None:
         zero_grads()
-        result = flare_chunk_triton(q, k, v, input_precision=input_precision, profile=profile)
+        result = flare_autoregressive_triton(q, k, v, input_precision=input_precision, profile=profile)
         if profile:
             out, profile_data = result
         else:
@@ -496,7 +496,7 @@ def bench_end_to_end_ms(
             k.grad.zero_()
         if v.grad is not None:
             v.grad.zero_()
-        out = flare_chunk_triton(q, k, v, input_precision=input_precision)
+        out = flare_autoregressive_triton(q, k, v, input_precision=input_precision)
         if include_backward:
             out.float().sum().backward()
 

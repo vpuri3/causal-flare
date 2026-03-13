@@ -43,7 +43,7 @@ def _parity_tests():
 
     with torch.no_grad():
         Y_ref = flare_causal_chunked(Q, K, V, scale=scale)
-        Y_t3 = flare_chunk_triton(Q, K, V, scale)
+        Y_t3 = flare_autoregressive_triton(Q, K, V, scale)
     fwd_err = compute_errors(Y_t3, Y_ref, "triton_fwd")
     print(
         "[FLARE PARITY] fwd "
@@ -73,7 +73,7 @@ def _parity_tests():
     V_t3 = V.detach().clone().requires_grad_(True)
 
     Y_ref = flare_causal_chunked(Q_ref, K_ref, V_ref, scale=scale)
-    Y_t3 = flare_chunk_triton(Q_t3, K_t3, V_t3, scale)
+    Y_t3 = flare_autoregressive_triton(Q_t3, K_t3, V_t3, scale)
     Y_ref.sum().backward()
     Y_t3.sum().backward()
 
@@ -163,7 +163,7 @@ def _parity_tests():
         V_t3 = torch.einsum("bnhd,hde->bnhe", hidden, Wv_t3)
 
         Y_ref = flare_causal_chunked(latent_q_ref, K_ref, V_ref, scale=scale)
-        Y_t3 = flare_chunk_triton(latent_q_t3, K_t3, V_t3, scale)
+        Y_t3 = flare_autoregressive_triton(latent_q_t3, K_t3, V_t3, scale)
 
         loss_ref = Y_ref.float().pow(2).mean()
         loss_t3 = Y_t3.float().pow(2).mean()

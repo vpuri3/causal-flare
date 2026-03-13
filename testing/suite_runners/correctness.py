@@ -101,17 +101,17 @@ def _run_correctness_suite(*, shard_index: int | None = None, num_shards: int | 
                     # Validation policy:
                     # - flare_causal_reference is the canonical correctness oracle.
                     # - flare_causal_chunked (run with the same input dtype/chunking
-                    #   as ChunkedFLARE and explicit matmul TF32 controls) is the
+                    #   as AutoRegressiveFLARE and explicit matmul TF32 controls) is the
                     #   FlashAttention-style noise model for non-IEEE modes.
                     Y_ref = _run_correctness_reference(Q, K, V, scale=scale, Q_dec=Q_dec, K_dec=K_dec)
                     Y_pytorch2 = _run_correctness_pytorch2(
                         Q, K, V, scale=scale, chunk_size=chunk_size, allow_tf32=noise_allow_tf32, Q_dec=Q_dec, K_dec=K_dec
                     )
-                    Y_t3 = flare_chunk_triton(Q, K, V, scale, chunk_size, input_precision, False, Q_dec, K_dec)
+                    Y_t3 = flare_autoregressive_triton(Q, K, V, scale, chunk_size, input_precision, False, Q_dec, K_dec)
                     y_p2_err = compute_errors(Y_pytorch2, Y_ref, "suite_p2")
                     y_t3_err = compute_errors(Y_t3, Y_ref, "suite_t3")
                     _print_err_report("PyTorch 2 vs Ref", Y_pytorch2, Y_ref, atol)
-                    _print_err_report("ChunkedFLARE vs Ref", Y_t3, Y_ref, atol)
+                    _print_err_report("AutoRegressiveFLARE vs Ref", Y_t3, Y_ref, atol)
 
                     y_pa_err = None
                     if (not separate_q_dec) and (not separate_k_dec):
@@ -162,7 +162,7 @@ def _run_correctness_suite(*, shard_index: int | None = None, num_shards: int | 
                             failures,
                             y_t3_err["suite_t3_mean_abs_err"] > fwd_mean_abs_max,
                             (
-                                "Correctness suite failed (ChunkedFLARE mean_abs): "
+                                "Correctness suite failed (AutoRegressiveFLARE mean_abs): "
                                 f"{y_t3_err['suite_t3_mean_abs_err']:.3e} > {fwd_mean_abs_max:.3e} "
                                 f"for dtype={dtype}, B={B}, H={H}, N={N}, M={M}, D={D}, qk_std={qk_std}, {decode_label}"
                             ),
@@ -171,7 +171,7 @@ def _run_correctness_suite(*, shard_index: int | None = None, num_shards: int | 
                             failures,
                             y_t3_err["suite_t3_max_abs_err"] > fwd_max_abs_max,
                             (
-                                "Correctness suite failed (ChunkedFLARE max_abs): "
+                                "Correctness suite failed (AutoRegressiveFLARE max_abs): "
                                 f"{y_t3_err['suite_t3_max_abs_err']:.3e} > {fwd_max_abs_max:.3e} "
                                 f"for dtype={dtype}, B={B}, H={H}, N={N}, M={M}, D={D}, qk_std={qk_std}, {decode_label}"
                             ),
@@ -184,7 +184,7 @@ def _run_correctness_suite(*, shard_index: int | None = None, num_shards: int | 
                             failures,
                             y_t3_err["suite_t3_max_abs_err"] > t3_fwd_max_abs_limit,
                             (
-                                "Correctness suite failed (ChunkedFLARE max_abs vs reference): "
+                                "Correctness suite failed (AutoRegressiveFLARE max_abs vs reference): "
                                 f"{y_t3_err['suite_t3_max_abs_err']:.3e} > {t3_fwd_max_abs_limit:.3e} "
                                 f"(pytorch2={y_p2_err['suite_p2_max_abs_err']:.3e}, mult={fa_fwd_mult:.2f}, "
                                 f"slack={fa_fwd_slack:.1e}) for input_precision={input_precision}, dtype={dtype}, "

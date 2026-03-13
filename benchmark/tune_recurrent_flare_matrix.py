@@ -18,7 +18,7 @@ from triton.runtime.driver import driver
 
 from causal_flare import flare_recurrent_triton
 from causal_flare._common import _resolve_attn_scale
-from causal_flare.recurrent import (
+from causal_flare.autoregressive.recurrent import (
     _alloc_recurrent_outputs,
     _launch_recurrent_decode_lse,
     _recurrent_multi_kernel_output,

@@ -2,7 +2,7 @@ import argparse
 
 import torch
 
-from causal_flare.block_causal import benchmark_block_causal_torch
+from causal_flare.semi_autoregressive.reference import benchmark_block_causal_torch
 
 
 def _parse_args():

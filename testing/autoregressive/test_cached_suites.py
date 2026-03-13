@@ -2,13 +2,13 @@ import pytest
 import torch
 
 from causal_flare import flare_recurrent_triton
-from causal_flare.inference import (
+from causal_flare.autoregressive.inference import (
     flare_decode_pytorch,
     flare_decode_triton,
     flare_prefill_pytorch,
     flare_prefill_triton,
 )
-from causal_flare.torch import flare_causal_reference
+from causal_flare.autoregressive.reference import flare_causal_reference
 
 
 pytestmark = [
@@ -102,4 +102,3 @@ def test_cached_prefill_decode_regression_suite() -> None:
         ("ydn_tr", ydn_tr),
     ):
         _check_finite(name, tensor)
-

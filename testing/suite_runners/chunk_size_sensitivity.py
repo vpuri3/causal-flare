@@ -47,7 +47,7 @@ def _chunk_size_sensitivity_suite(*, shard_index: int | None = None, num_shards:
         qx = q.detach().clone().requires_grad_(True)
         kx = k.detach().clone().requires_grad_(True)
         vx = v.detach().clone().requires_grad_(True)
-        y = flare_chunk_triton(qx, kx, vx, scale)
+        y = flare_autoregressive_triton(qx, kx, vx, scale)
         (y.float() * grad_out.float()).sum().backward()
         return y.detach(), qx.grad.detach(), kx.grad.detach(), vx.grad.detach()
 

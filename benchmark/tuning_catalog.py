@@ -691,7 +691,7 @@ def get_recurrent_tuning_catalog() -> TuningCatalog:
 
 def get_chunked_tuning_catalog() -> TuningCatalog:
     return TuningCatalog(
-        implementation="ChunkedFLARE",
+        implementation="AutoRegressiveFLARE",
         summary="Forward and backward launch knobs used by the chunked tuning matrix sweep, grouped by independently sweepable families.",
         family_groups=CHUNKED_TUNING_FAMILY_GROUPS,
         parameters=(

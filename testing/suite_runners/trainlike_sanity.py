@@ -56,7 +56,7 @@ def _trainlike_sanity():
                 K = (qkv_std * torch.randn(B, N, H, D, device=device, dtype=dtype)).requires_grad_()
                 V = (qkv_std * torch.randn(B, N, H, D, device=device, dtype=dtype)).requires_grad_()
 
-                Y = flare_chunk_triton(Q, K, V, scale)
+                Y = flare_autoregressive_triton(Q, K, V, scale)
                 loss = Y.float().pow(2).mean()
                 loss.backward()
 

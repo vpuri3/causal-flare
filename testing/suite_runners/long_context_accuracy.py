@@ -72,7 +72,7 @@ def _long_context_accuracy_suite(*, shard_index: int | None = None, num_shards: 
                 Vr = V.detach().clone().float().requires_grad_(True)
 
                 try:
-                    Yn = flare_chunk_triton(Qn, Kn, Vn, scale)
+                    Yn = flare_autoregressive_triton(Qn, Kn, Vn, scale)
                     Yo = flare_causal_chunked(Qo, Ko, Vo, scale=scale, chunk_size=Ko.size(1))
                     Yr = flare_causal_pytorch_dense(Qr, Kr, Vr, scale=scale)
 

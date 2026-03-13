@@ -4,14 +4,14 @@ import math
 import pytest
 import torch
 
-from causal_flare import flare_chunk_triton, flare_recurrent_triton
-from causal_flare.inference import (
+from causal_flare import flare_autoregressive_triton, flare_recurrent_triton
+from causal_flare.autoregressive.inference import (
     flare_decode_pytorch,
     flare_decode_triton,
     flare_prefill_pytorch,
     flare_prefill_triton,
 )
-from causal_flare.torch import (
+from causal_flare.autoregressive.reference import (
     flare_causal_chunked,
     flare_recurrent_dense_backward_pytorch,
     flare_recurrent_pytorch,
@@ -66,7 +66,7 @@ def _run_chunked_impl(impl_name, q, k, v, *, scale, q_dec=None, k_dec=None, chun
     if impl_name == "reference":
         return flare_causal_chunked(q, k, v, scale=scale, chunk_size=chunk_size, Q_dec=q_dec, K_dec=k_dec)
     if impl_name == "chunked":
-        return flare_chunk_triton(Q=q, K=k, V=v, scale=scale, chunk_size=chunk_size, Q_dec=q_dec, K_dec=k_dec)
+        return flare_autoregressive_triton(Q=q, K=k, V=v, scale=scale, chunk_size=chunk_size, Q_dec=q_dec, K_dec=k_dec)
     raise ValueError(f"Unknown implementation: {impl_name}")
 
 

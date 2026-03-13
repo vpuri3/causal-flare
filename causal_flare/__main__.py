@@ -5,14 +5,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m causal_flare",
         description=(
-            "Run the ChunkedFLARE diagnostics + benchmark matrix on CUDA.\n"
-            "This entrypoint applies H100-oriented runtime tuning first, then executes\n"
-            "forward/backward comparisons across reference, PyTorch, Triton, recurrent,\n"
-            "and optional FA2 baselines."
+            "Run FLARE diagnostics + benchmark comparisons on CUDA.\n"
+            "By default this runs the autoregressive diagnostics matrix. With --semi_ar\n"
+            "it runs the semi-autoregressive/block-causal comparison flow instead."
         ),
         epilog=(
             "Examples:\n"
             "  python -m causal_flare --B 1 --H 8 --M 16 --N 32 --D 16 --dtype bfloat16\n"
+            "  python -m causal_flare --semi_ar --block-size 256 --chunk-size 128\n"
             "  FLARE_COMPILE_TIMINGS=0 python -m causal_flare --N 512 --dtype float16\n"
             "\n"
             "Useful env vars:\n"
@@ -22,19 +22,22 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("--B", type=int, default=8, help="Batch size (number of sequences).")
-    parser.add_argument("--H", type=int, default=16, help="Number of attention heads.")
-    parser.add_argument("--M", type=int, default=64, help="Latent/query length per head.")
-    parser.add_argument("--N", type=int, default=2048, help="Context/sequence length.")
+    parser.add_argument("--semi_ar", action="store_true", help="Run the semi-autoregressive/block-causal comparison flow.")
+    parser.add_argument("--B", type=int, default=None, help="Batch size (number of sequences).")
+    parser.add_argument("--H", type=int, default=None, help="Number of attention heads.")
+    parser.add_argument("--M", type=int, default=None, help="Latent/query length per head.")
+    parser.add_argument("--N", type=int, default=None, help="Context/sequence length.")
     parser.add_argument(
         "--D",
         type=int,
-        default=32,
+        default=None,
         help="Score head dimension D_k. This diagnostics CLI still assumes value_head_dim == score_head_dim.",
     )
+    parser.add_argument("--block-size", type=int, default=None, help="Semi-autoregressive block size.")
+    parser.add_argument("--chunk-size", type=int, default=None, help="Semi-autoregressive chunk size.")
     parser.add_argument(
         "--dtype",
-        default="bfloat16",
+        default=None,
         help="Torch dtype name used for tensor initialization (e.g. bfloat16, float16, float32).",
     )
     return parser
@@ -43,7 +46,29 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
     optimize_for_h100()
-    run_module_main(B=args.B, H=args.H, M=args.M, N=args.N, D=args.D, dtype=args.dtype)
+    if args.semi_ar:
+        print("Selected mode: semi_autoregressive")
+        run_semi_autoregressive_main(
+            B=4 if args.B is None else args.B,
+            H=16 if args.H is None else args.H,
+            M=64 if args.M is None else args.M,
+            N=65536 if args.N is None else args.N,
+            D=32 if args.D is None else args.D,
+            dtype="bfloat16" if args.dtype is None else args.dtype,
+            block_size=256 if args.block_size is None else args.block_size,
+            chunk_size=128 if args.chunk_size is None else args.chunk_size,
+        )
+        return
+
+    print("Selected mode: autoregressive")
+    run_module_main(
+        B=8 if args.B is None else args.B,
+        H=16 if args.H is None else args.H,
+        M=64 if args.M is None else args.M,
+        N=2048 if args.N is None else args.N,
+        D=32 if args.D is None else args.D,
+        dtype="bfloat16" if args.dtype is None else args.dtype,
+    )
 
 
 def optimize_for_h100() -> None:
@@ -85,6 +110,180 @@ def optimize_for_h100() -> None:
 
     print("H100 optimizations applied successfully!")
 
+def run_semi_autoregressive_main(
+    B: int = 4,
+    H: int = 16,
+    M: int = 64,
+    N: int = 65536,
+    D: int = 32,
+    dtype: str = "bfloat16",
+    block_size: int = 256,
+    chunk_size: int = 128,
+):
+    import math
+    import os
+    import time
+
+    import torch
+    import triton
+    from causal_flare.semi_autoregressive.reference import (
+        _block_causal_forward_pytorch,
+        block_causal_sdpa_flex,
+        block_causal_sdpa_reference,
+        flare_block_causal_reference,
+    )
+    from testing.suite_runners.common import compute_errors, measure_memory
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype_obj = getattr(torch, dtype)
+    scale = D ** -0.5
+
+    torch.manual_seed(0)
+    Q_flare = torch.randn((H, M, D), device=device, dtype=dtype_obj)
+    K_flare = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
+    V_flare = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
+    Q_sdpa = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
+    K_sdpa = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
+    V_sdpa = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
+
+    compile_timing_enabled = os.environ.get("FLARE_COMPILE_TIMINGS", "1") == "1"
+
+    def _compile_suffix(ms: float) -> str:
+        if math.isnan(ms):
+            return ""
+        return f" (compile={ms:.2f} ms)"
+
+    def _probe_compile(run_fn) -> float:
+        if not compile_timing_enabled:
+            return float("nan")
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        run_fn()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        return (time.perf_counter() - t0) * 1e3
+
+    def _format_err(errors: dict, prefix: str, kind: str) -> str:
+        mean_key = f"{prefix}_mean_{kind}_err"
+        max_key = f"{prefix}_max_{kind}_err"
+        if errors and mean_key in errors and max_key in errors:
+            return f"{errors[mean_key]:.2e}/{errors[max_key]:.2e}"
+        return "N/A"
+
+    def _run_impl(label: str, fn, *, ref=None, ref_prefix: str | None = None, skip_reason: str | None = None):
+        if skip_reason is not None:
+            return {
+                "label": label,
+                "ms": float("nan"),
+                "mem": 0.0,
+                "errors": {},
+                "status": f"Skipped: {skip_reason}",
+                "compile_ms": float("nan"),
+            }
+
+        try:
+            compile_ms = _probe_compile(fn)
+            y, mem = measure_memory(fn)
+            ms = triton.testing.do_bench(fn, warmup=2, rep=2)
+            errors = compute_errors(y, ref, ref_prefix) if ref is not None and ref_prefix is not None else {}
+            return {
+                "label": label,
+                "ms": ms,
+                "mem": mem,
+                "errors": errors,
+                "status": "OK",
+                "compile_ms": compile_ms,
+            }
+        except Exception as exc:
+            return {
+                "label": label,
+                "ms": float("nan"),
+                "mem": 0.0,
+                "errors": {},
+                "status": f"Failed: {exc}",
+                "compile_ms": float("nan"),
+            }
+
+    print(
+        f"Testing Semi-Autoregressive FLARE Forward Pass "
+        f"(B={B}, H={H}, M={M}, N={N}, D={D}, block_size={block_size}, chunk_size={chunk_size}, dtype={dtype_obj}, device={device})"
+    )
+
+    print("Measuring semi-AR FLARE reference...", end=" ", flush=True)
+    flare_ref_result = _run_impl(
+        "Block-Causal FLARE reference",
+        lambda: flare_block_causal_reference(Q_flare, K_flare, V_flare, block_size=block_size, scale=scale),
+    )
+    print(flare_ref_result["status"] + _compile_suffix(flare_ref_result["compile_ms"]))
+
+    flare_ref_output = None
+    if flare_ref_result["status"] == "OK":
+        flare_ref_output = flare_block_causal_reference(Q_flare, K_flare, V_flare, block_size=block_size, scale=scale)
+
+    print("Measuring semi-AR chunkwise PyTorch reference...", end=" ", flush=True)
+    flare_chunked_result = _run_impl(
+        "Block-Causal FLARE chunkwise",
+        lambda: _block_causal_forward_pytorch(
+            Q_flare, K_flare, V_flare, block_size=block_size, chunk_size=chunk_size, scale=scale
+        ),
+        ref=flare_ref_output,
+        ref_prefix="semi_ar_chunked",
+    )
+    print(flare_chunked_result["status"] + _compile_suffix(flare_chunked_result["compile_ms"]))
+
+    print("Measuring masked block-causal SDPA reference...", end=" ", flush=True)
+    sdpa_ref_result = _run_impl(
+        "Block-Causal SDPA reference",
+        lambda: block_causal_sdpa_reference(Q_sdpa, K_sdpa, V_sdpa, block_size=block_size, scale=scale),
+    )
+    print(sdpa_ref_result["status"] + _compile_suffix(sdpa_ref_result["compile_ms"]))
+
+    sdpa_ref_output = None
+    if sdpa_ref_result["status"] == "OK":
+        sdpa_ref_output = block_causal_sdpa_reference(Q_sdpa, K_sdpa, V_sdpa, block_size=block_size, scale=scale)
+
+    print("Measuring block-causal FlexAttention SDPA...", end=" ", flush=True)
+    sdpa_flex_result = _run_impl(
+        "Block-Causal SDPA flex",
+        lambda: block_causal_sdpa_flex(Q_sdpa, K_sdpa, V_sdpa, block_size=block_size, scale=scale),
+        ref=sdpa_ref_output,
+        ref_prefix="semi_ar_sdpa_flex",
+    )
+    print(sdpa_flex_result["status"] + _compile_suffix(sdpa_flex_result["compile_ms"]))
+
+    print("\n" + "=" * 120)
+    print("Semi-AR FLARE Family")
+    print("=" * 120)
+    print(f"{'Implementation':<30} {'Time (ms)':<12} {'Memory (GB)':<15} {'Abs Err (mean/max)':<22} {'Rel Err (mean/max)':<22} {'Status'}")
+    print("-" * 120)
+    for row in [flare_ref_result, flare_chunked_result]:
+        ms_str = f"{row['ms']:.2f}" if not math.isnan(row["ms"]) else "N/A"
+        print(
+            f"{row['label']:<30} {ms_str:<12} {row['mem']:<15.2e} "
+            f"{_format_err(row['errors'], 'semi_ar_chunked', 'abs') if row is flare_chunked_result else 'N/A':<22} "
+            f"{_format_err(row['errors'], 'semi_ar_chunked', 'rel') if row is flare_chunked_result else 'N/A':<22} "
+            f"{row['status']}"
+        )
+
+    print("\n" + "=" * 120)
+    print("Semi-AR SDPA Family")
+    print("=" * 120)
+    print(f"{'Implementation':<30} {'Time (ms)':<12} {'Memory (GB)':<15} {'Abs Err (mean/max)':<22} {'Rel Err (mean/max)':<22} {'Status'}")
+    print("-" * 120)
+    for row in [sdpa_ref_result, sdpa_flex_result]:
+        prefix = "semi_ar_sdpa_flex"
+        ms_str = f"{row['ms']:.2f}" if not math.isnan(row["ms"]) else "N/A"
+        abs_err_str = _format_err(row["errors"], prefix, "abs") if row is sdpa_flex_result else "N/A"
+        rel_err_str = _format_err(row["errors"], prefix, "rel") if row is sdpa_flex_result else "N/A"
+        print(
+            f"{row['label']:<30} {ms_str:<12} {row['mem']:<15.2e} "
+            f"{abs_err_str:<22} {rel_err_str:<22} "
+            f"{row['status']}"
+        )
+
+    return
+
 def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int = 16, dtype: str = "bfloat16"):
     import math
     import os
@@ -108,7 +307,7 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
         flare_causal_perciever_ar,
         flare_causal_pytorch_dense,
         flare_causal_reference,
-        flare_chunk_triton,
+        flare_autoregressive_triton,
         flare_recurrent_pytorch,
         measure_memory,
     )
@@ -398,7 +597,7 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
                 print(f"  t={t} max_abs_formula_vs_ref={err_ref:.3e} max_abs_formula_vs_p2={err_p2:.3e}")
 
     #======================================================================#
-    # Benchmark ChunkedFLARE implementation (input_precision modes)
+    # Benchmark AutoRegressiveFLARE implementation (input_precision modes)
     #======================================================================#
     def _normalize_chunked_forward_timings(raw_timings):
         if not isinstance(raw_timings, dict):
@@ -432,19 +631,19 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
             normalized["Total"] = sum(normalized.values())
         return normalized
 
-    print("Measuring ChunkedFLARE implementation...", end=" ", flush=True)
+    print("Measuring AutoRegressiveFLARE implementation...", end=" ", flush=True)
     causalflare_variants = [
-        ("ChunkedFLARE (ieee)", "ieee", "triton3_ieee"),
-        ("ChunkedFLARE (tf32)", "tf32", "triton3_tf32"),
-        ("ChunkedFLARE (tf32x3)", "tf32x3", "triton3_tf32x3"),
+        ("AutoRegressiveFLARE (ieee)", "ieee", "triton3_ieee"),
+        ("AutoRegressiveFLARE (tf32)", "tf32", "triton3_tf32"),
+        ("AutoRegressiveFLARE (tf32x3)", "tf32x3", "triton3_tf32x3"),
     ]
     causalflare_results = {}
     triton3_avg_timings_by_variant = {}
     for row_name, precision_mode, err_prefix in causalflare_variants:
         with _temp_env_var("FLARE_INPUT_PRECISION", precision_mode):
-            compile_ms = _probe_compile(lambda: flare_chunk_triton(Q, K, V, scale))
-            Y_t3, t3_mem = measure_memory(flare_chunk_triton, Q, K, V, scale)
-            t3_ms = triton.testing.do_bench(lambda: flare_chunk_triton(Q, K, V, scale))
+            compile_ms = _probe_compile(lambda: flare_autoregressive_triton(Q, K, V, scale))
+            Y_t3, t3_mem = measure_memory(flare_autoregressive_triton, Q, K, V, scale)
+            t3_ms = triton.testing.do_bench(lambda: flare_autoregressive_triton(Q, K, V, scale))
             t3_errors = compute_errors(Y_t3, Y_reference, err_prefix) if N <= 4096 and ref_fp32_enabled else {}
             causalflare_results[row_name] = {
                 "Y": Y_t3,
@@ -456,9 +655,9 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
             timings_list = []
             with torch.no_grad():
                 for _ in range(25):
-                    flare_chunk_triton(Q, K, V, scale)
+                    flare_autoregressive_triton(Q, K, V, scale)
                 for _ in range(100):
-                    _, timings = flare_chunk_triton(Q, K, V, scale, None, None, True)
+                    _, timings = flare_autoregressive_triton(Q, K, V, scale, None, None, True)
                     normalized_timings = _normalize_chunked_forward_timings(timings)
                     if normalized_timings:
                         timings_list.append(normalized_timings)
@@ -475,9 +674,9 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
                     variant_timings["Total"] = t3_ms
                 triton3_avg_timings_by_variant[row_name] = variant_timings
     # Preserve old aliases for downstream logic/profiling text.
-    triton3_ms = causalflare_results["ChunkedFLARE (ieee)"]["ms"]
-    triton3_mem = causalflare_results["ChunkedFLARE (ieee)"]["mem"]
-    triton3_errors = causalflare_results["ChunkedFLARE (ieee)"]["errors"]
+    triton3_ms = causalflare_results["AutoRegressiveFLARE (ieee)"]["ms"]
+    triton3_mem = causalflare_results["AutoRegressiveFLARE (ieee)"]["mem"]
+    triton3_errors = causalflare_results["AutoRegressiveFLARE (ieee)"]["errors"]
     print(
         "Done "
         + ", ".join(
@@ -729,7 +928,7 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
         print(f"{'DenseFLARE1':<20} {dense1_triton_ms:<10.2f} {dense1_triton_speedup_str:<10} {dense1_triton_mem:<15.2e} "
               f"{dense1_triton_abs_err_str:<20} {dense1_triton_rel_err_str:<20}")
 
-    # ChunkedFLARE rows (input_precision variants)
+    # AutoRegressiveFLARE rows (input_precision variants)
     for row_name, _, err_prefix in causalflare_variants:
         row = causalflare_results[row_name]
         row_errors = row["errors"]
@@ -820,11 +1019,11 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
         print(f"{'Phase 3 (W,Y)':<28} {dense1_phase3_ms:>7.3f}ms / {p3:>5.1f}%")
 
     #======================================================================#
-    # Print ChunkedFLARE Forward Phase Profiling
+    # Print AutoRegressiveFLARE Forward Phase Profiling
     #======================================================================#
     if triton3_avg_timings_by_variant:
         print("="*100)
-        print("ChunkedFLARE Forward Phase Profiling Comparison")
+        print("AutoRegressiveFLARE Forward Phase Profiling Comparison")
         print("="*100)
 
         # Collect all unique phase names across all variants
@@ -1078,9 +1277,9 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
         bwd_results["PyTorch2 full-chunk"] = (float("nan"), 0.0)
 
     for cf_name, precision_mode, grad_prefix in [
-        ("ChunkedFLARE (ieee)", "ieee", "triton3_ieee"),
-        ("ChunkedFLARE (tf32)", "tf32", "triton3_tf32"),
-        ("ChunkedFLARE (tf32x3)", "tf32x3", "triton3_tf32x3"),
+        ("AutoRegressiveFLARE (ieee)", "ieee", "triton3_ieee"),
+        ("AutoRegressiveFLARE (tf32)", "tf32", "triton3_tf32"),
+        ("AutoRegressiveFLARE (tf32x3)", "tf32x3", "triton3_tf32x3"),
     ]:
         Q_t3 = Q.detach().requires_grad_(True)
         K_t3 = K.detach().requires_grad_(True)
@@ -1088,9 +1287,9 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
         try:
             print(f"Measuring backward {cf_name}...", end=" ", flush=True)
             with _temp_env_var("FLARE_INPUT_PRECISION", precision_mode):
-                cf_compile_ms = _probe_backward_compile(flare_chunk_triton, Q, K, V, scale)
+                cf_compile_ms = _probe_backward_compile(flare_autoregressive_triton, Q, K, V, scale)
                 print(f"[compile done {cf_compile_ms:.2f} ms]", end=" ", flush=True)
-                bwd_results[cf_name] = _bench_backward(flare_chunk_triton, Q_t3, K_t3, V_t3, scale)
+                bwd_results[cf_name] = _bench_backward(flare_autoregressive_triton, Q_t3, K_t3, V_t3, scale)
                 print("[bench done]", end=" ", flush=True)
                 mode_key = f"triton3_{precision_mode}"
                 if torch.cuda.is_available():
@@ -1098,12 +1297,12 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
                     reps = int(os.environ.get("FLARE_BWD_PROFILE_REPS", "50"))
                     print(f"[profiling warmup={warmup}]", end=" ", flush=True)
                     for _ in range(warmup):
-                        _run_backward(flare_chunk_triton, Q_t3, K_t3, V_t3, scale)
+                        _run_backward(flare_autoregressive_triton, Q_t3, K_t3, V_t3, scale)
                     timings_list = []
                     print(f"[profiling reps={reps}]", end=" ", flush=True)
                     for _ in range(reps):
                         _set_bwd_profile_mode(mode_key)
-                        _run_backward(flare_chunk_triton, Q_t3, K_t3, V_t3, scale)
+                        _run_backward(flare_autoregressive_triton, Q_t3, K_t3, V_t3, scale)
                         timings_list.append(dict(_BWD_PROFILE_TIMINGS.get(mode_key, {})))
                         _set_bwd_profile_mode(None)
                     if timings_list:
@@ -1116,7 +1315,7 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
                         _BWD_PROFILE_TIMINGS[mode_key] = avg_timings
                 else:
                     _set_bwd_profile_mode(mode_key)
-                    _run_backward(flare_chunk_triton, Q_t3, K_t3, V_t3, scale)
+                    _run_backward(flare_autoregressive_triton, Q_t3, K_t3, V_t3, scale)
                     _set_bwd_profile_mode(None)
             print(f"Done{_compile_suffix(cf_compile_ms)}")
             bwd_grad_errors[cf_name] = _grad_errors(grad_prefix, Q_t3.grad, K_t3.grad, V_t3.grad, qg_ref, kg_ref, vg_ref)
@@ -1211,9 +1410,9 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
         "PyTorch 2",
         "PCVR-AR-like impl",
         "PyTorch2 full-chunk",
-        "ChunkedFLARE (ieee)",
-        "ChunkedFLARE (tf32)",
-        "ChunkedFLARE (tf32x3)",
+        "AutoRegressiveFLARE (ieee)",
+        "AutoRegressiveFLARE (tf32)",
+        "AutoRegressiveFLARE (tf32x3)",
         "Recurrent Orig",
         "Recurrent Triton",
         "PyTorch Dense",
@@ -1250,15 +1449,15 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
 
     if _BWD_PROFILE_TIMINGS:
         print("="*100)
-        print("ChunkedFLARE Backward Phase Profiling")
+        print("AutoRegressiveFLARE Backward Phase Profiling")
         print("="*100)
         phase_col_w = 34
         variant_col_w = 21
         header = f"{'Phase':<{phase_col_w}}"
         bwd_profile_cols = [
-            ("ChunkedFLARE (ieee)", "triton3_ieee"),
-            ("ChunkedFLARE (tf32)", "triton3_tf32"),
-            ("ChunkedFLARE (tf32x3)", "triton3_tf32x3"),
+            ("AutoRegressiveFLARE (ieee)", "triton3_ieee"),
+            ("AutoRegressiveFLARE (tf32)", "triton3_tf32"),
+            ("AutoRegressiveFLARE (tf32x3)", "triton3_tf32x3"),
         ]
         for label, mode_key in bwd_profile_cols:
             if mode_key in _BWD_PROFILE_TIMINGS:
@@ -1272,9 +1471,9 @@ def run_module_main(B: int = 1, H: int = 8, M: int = 128, N: int = 2048, D: int 
 
         # Normalize phase timings to match benchmark total time (do_bench) per precision mode.
         for label, mode_key in [
-            ("ChunkedFLARE (ieee)", "triton3_ieee"),
-            ("ChunkedFLARE (tf32)", "triton3_tf32"),
-            ("ChunkedFLARE (tf32x3)", "triton3_tf32x3"),
+            ("AutoRegressiveFLARE (ieee)", "triton3_ieee"),
+            ("AutoRegressiveFLARE (tf32)", "triton3_tf32"),
+            ("AutoRegressiveFLARE (tf32x3)", "triton3_tf32x3"),
         ]:
             if mode_key in _BWD_PROFILE_TIMINGS and label in bwd_results:
                 bench_ms = bwd_results[label][0]

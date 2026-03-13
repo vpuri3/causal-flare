@@ -64,7 +64,7 @@ def _trainlike_multistep_parity():
                     v_new = torch.einsum("bnhd,hde->bnhe", hidden, wv_new)
                     k_old = torch.einsum("bnhd,hde->bnhe", hidden, wk_old)
                     v_old = torch.einsum("bnhd,hde->bnhe", hidden, wv_old)
-                    y_new = flare_chunk_triton(latent_q_new, k_new, v_new, scale)
+                    y_new = flare_autoregressive_triton(latent_q_new, k_new, v_new, scale)
                     y_old = flare_causal_chunked(latent_q_old, k_old, v_old, scale=scale, chunk_size=k_old.size(1))
 
                     loss_new = y_new.float().pow(2).mean()

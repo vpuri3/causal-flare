@@ -1,8 +1,9 @@
 # Testing Overview
 
-This directory has two testing layers:
+This directory has three testing layers:
 
-- Pytest-collected test modules in `testing/test_*.py` (unit/parity/reference/finite-difference plus regression wrappers).
+- Pytest-collected branch-specific test modules in `testing/autoregressive/test_*.py` and `testing/semi_autoregressive/test_*.py`.
+- Pytest-collected top-level infrastructure tests in `testing/test_*.py`.
 - Extracted suite implementations in `testing/suite_runners/*.py` used by regression/stress wrappers.
 
 ## Pytest Entry Point and Collection
@@ -16,6 +17,16 @@ pytest testing -q
 - Pytest options and markers are configured in `pyproject.toml` (`[tool.pytest.ini_options]`) and `testing/conftest.py`.
 - `testing/suite_runners/*.py` are helper/suite modules; pytest does not collect them directly because they do not define `test_*` functions.
 - Regression/stress tests are still collected from `testing/test_*.py`, but skipped unless opt-in flags are supplied.
+
+## Branch Layout
+
+- `testing/autoregressive/`
+  - next-token-prediction FLARE tests
+  - correctness, cached inference, finite-difference, and regression wrappers
+- `testing/semi_autoregressive/`
+  - next token-block prediction FLARE tests
+- `testing/test_*.py`
+  - shared or infrastructure-focused tests that are not tied to one branch
 
 ## Run Commands
 
@@ -91,11 +102,11 @@ The suite implementations below were extracted into `testing/suite_runners/` (on
 
 Pytest wrappers that currently call these suites:
 
-- `testing/test_regression_suites.py`:
+- `testing/autoregressive/test_regression_suites.py`:
   - direct wrappers: `_run_correctness_suite`, `_run_grad_checks_suite`, `_autotune_launch_coverage_suite`, `_regression_test`
   - stress wrappers: `_sharp_softmax_bwd_regression_suite`, `_long_context_accuracy_suite`, `_chunk_size_sensitivity_suite`
   - note: `_parity_tests`, `_trainlike_sanity`, and `_trainlike_multistep_parity` are run via `_regression_test` (bundle), not direct top-level wrappers.
-- `testing/test_cached_suites.py`:
+- `testing/autoregressive/test_cached_suites.py`:
   - additional regression-marked pytest module (not in `testing/suite_runners/`)
 
 Suite implementation currently not wired into collected pytest wrappers:
@@ -122,7 +133,7 @@ Legacy env-flag entrypoints in `testing/test.py` (`FLARE_DEBUG_*`, `FLARE_RECURR
   - Training-like optimization-loop sanity checks, gradient finiteness, and bounded drift behavior.
 - `_trainlike_projected`
   - Projected trainlike update behavior with explicit projection parameterization.
-  - Not currently invoked by `testing/test_regression_suites.py` or `testing/test_cached_suites.py`.
+  - Not currently invoked by `testing/autoregressive/test_regression_suites.py` or `testing/autoregressive/test_cached_suites.py`.
 - `_long_context_accuracy_suite`
   - Accuracy/gradient behavior at long sequence lengths and precision modes.
   - Pytest wrapper shards this suite into 8 independent nodeids (`longctx1` ... `longctx8`).
@@ -222,7 +233,7 @@ Below are the key matrix dimensions each suite exercises. Most are configurable 
 
 ## Wrapper Defaults (Short vs Full)
 
-`testing/test_regression_suites.py` is a wrapper layer:
+`testing/autoregressive/test_regression_suites.py` is a wrapper layer:
 
 - Without `--full-matrix`:
   - Applies reduced defaults for faster iteration.
@@ -248,7 +259,7 @@ Below are the key matrix dimensions each suite exercises. Most are configurable 
   - `--run-regression`
   - `--run-stress`
   - `--full-matrix` (disables reduced bounded defaults in wrappers)
-- The wrappers that expose these suites as pytest tests are in `testing/test_regression_suites.py`.
+- The wrappers that expose these suites as pytest tests are in `testing/autoregressive/test_regression_suites.py`.
 - Test runs no longer carry a separate reduced-autotune mode, because the default runtime path is already heuristic-only and does not run Triton autotune searches.
 - The distributed runner keeps `autotune_launch_coverage` shards on worker `0` of each GPU so these explicitly expensive full-search checks do not get oversubscribed when `--workers-per-gpu > 1`.
 - For chunked-path numerical debugging, especially sharp-softmax backward regressions, treat

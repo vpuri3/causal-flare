@@ -94,7 +94,7 @@ def _sharp_softmax_bwd_regression_suite(*, shard_index: int | None = None, num_s
         Qdr = Q_dec_base.detach().clone().requires_grad_(True) if separate_q_dec else None
         Kdr = K_dec_base.detach().clone().requires_grad_(True) if separate_k_dec else None
 
-        Yn = flare_chunk_triton(Qn, Kn, Vn, scale, None, None, False, Qdn, Kdn)
+        Yn = flare_autoregressive_triton(Qn, Kn, Vn, scale, None, None, False, Qdn, Kdn)
         Yr = flare_causal_reference(Qr, Kr, Vr, Q_dec=Qdr, K_dec=Kdr, scale=scale)
         (Yn.float() * g.float()).sum().backward()
         (Yr.float() * g.float()).sum().backward()

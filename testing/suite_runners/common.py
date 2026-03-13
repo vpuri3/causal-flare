@@ -1,11 +1,11 @@
 import causal_flare._common as _common_impl
-import causal_flare.chunked as _chunked_impl
+import causal_flare.autoregressive.training as _chunked_impl
 from causal_flare._common import *
-from causal_flare.chunked import *
-from causal_flare.dense import *
-from causal_flare.inference import *
-from causal_flare.recurrent import *
-from causal_flare.torch import *
+from causal_flare.autoregressive.training import *
+from causal_flare.autoregressive.dense import *
+from causal_flare.autoregressive.inference import *
+from causal_flare.autoregressive.recurrent import *
+from causal_flare.autoregressive.reference import *
 from benchmark.implementations.reference_ops import causal_SDPA
 
 def _denseflare1_phase_bench(Q, K, V, scale=1.0):

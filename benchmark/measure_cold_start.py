@@ -28,7 +28,7 @@ def build_child_code(mode: str, anchor: dict[str, int], dtype: str, input_precis
         import time
         import torch
 
-        from causal_flare import flare_chunk_triton, flare_decode_triton, flare_prefill_triton
+        from causal_flare import flare_autoregressive_triton, flare_decode_triton, flare_prefill_triton
 
         torch.manual_seed(0)
         device = torch.device("cuda")
@@ -49,14 +49,14 @@ def build_child_code(mode: str, anchor: dict[str, int], dtype: str, input_precis
         """
     )
     if mode == "chunked_forward":
-        body = "Y = flare_chunk_triton(Q, K, V, scale=scale, input_precision=input_precision)"
+        body = "Y = flare_autoregressive_triton(Q, K, V, scale=scale, input_precision=input_precision)"
     elif mode == "chunked_train":
         body = textwrap.dedent(
             """
             Q.requires_grad_(True)
             K.requires_grad_(True)
             V.requires_grad_(True)
-            Y = flare_chunk_triton(Q, K, V, scale=scale, input_precision=input_precision)
+            Y = flare_autoregressive_triton(Q, K, V, scale=scale, input_precision=input_precision)
             loss = Y.square().mean()
             loss.backward()
             """

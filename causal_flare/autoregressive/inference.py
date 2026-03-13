@@ -1,6 +1,6 @@
-from ._common import *
-from .chunked import *
-from .chunked import (
+from causal_flare._common import *
+from causal_flare.autoregressive.training import *
+from causal_flare.autoregressive.training import (
     _block_k_divisor,
     _get_chunked_forward_config,
     _profiled_call,
@@ -11,7 +11,7 @@ from .chunked import (
     _run_chunked_prepare_phase,
     _snap_block_d_default,
 )
-from .torch import _resolve_flare_causal_decode_inputs as _resolve_inference_decode_inputs
+from causal_flare._reference_utils import resolve_flare_causal_decode_inputs as _resolve_inference_decode_inputs
 
 
 def _get_decode_step_config(M: int, D_score: int, D_value: int) -> dict[str, int]:
@@ -894,8 +894,3 @@ def flare_decode(
             attention_mask=attention_mask,
         )
     raise ValueError(f"Unsupported impl={impl}. Expected 'triton' or 'pytorch'.")
-
-
-#======================================================================#
-# PyTorch Implementations
-#======================================================================#

@@ -22,11 +22,11 @@ The current policy therefore follows the `72394e2d2a109be2d8464147c17f10b28f423f
 
 ## Current Policy
 
-### Chunked
+### Autoregressive
 
 Runtime entry point:
 
-- [`causal_flare/chunked.py`](../causal_flare/chunked.py)
+- [`causal_flare/autoregressive/training.py`](../causal_flare/autoregressive/training.py)
 
 Benchmark tools:
 
@@ -36,7 +36,7 @@ Benchmark tools:
 - [`tune_chunked_flare_matrix.py`](./tune_chunked_flare_matrix.py)
 - [`chunked_flare_matrix_workflow.md`](./chunked_flare_matrix_workflow.md)
 
-Chunked is tuned offline, then promoted back into runtime heuristics.
+The autoregressive chunked path is tuned offline, then promoted back into runtime heuristics.
 
 - The matrix runner owns the knob search.
 - Runtime consumes the promoted bucket policy plus optional env overrides.
@@ -82,7 +82,7 @@ Practical implication:
 
 Runtime entry point:
 
-- [`causal_flare/inference.py`](../causal_flare/inference.py)
+- [`causal_flare/autoregressive/inference.py`](../causal_flare/autoregressive/inference.py)
 
 Benchmark tools:
 

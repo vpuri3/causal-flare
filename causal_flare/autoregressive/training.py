@@ -1,5 +1,5 @@
-from ._common import *
-from .torch import _resolve_flare_causal_decode_inputs as _resolve_chunked_decode_inputs
+from causal_flare._common import *
+from causal_flare._reference_utils import resolve_flare_causal_decode_inputs as _resolve_chunked_decode_inputs
 
 def _maybe_record_kernel_resource(bucket: dict[str, dict[str, int]] | None, key: str, result) -> None:
     if bucket is None or result is None:
@@ -728,7 +728,7 @@ def _run_chunked_output_phase(
     return O_out, LSE_enc, LSE_dec
 
 
-class ChunkedFLARE(autograd.Function):
+class AutoRegressiveFLARE(autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -4918,7 +4918,7 @@ def _chunked_flare_lse_backward_impl(ctx, dO, dTimings=None):
     return dQ_out, dK_out, dV_out, None, None, None, None, dQ_dec_out, dK_dec_out
 
 
-def flare_chunk_triton(
+def flare_autoregressive_triton(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -4929,4 +4929,9 @@ def flare_chunk_triton(
     Q_dec: torch.Tensor | None = None,
     K_dec: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, object]]:
-    return ChunkedFLARE.apply(Q, K, V, scale, chunk_size, input_precision, profile, Q_dec, K_dec)
+    return AutoRegressiveFLARE.apply(Q, K, V, scale, chunk_size, input_precision, profile, Q_dec, K_dec)
+
+
+# Backward-compatible aliases while downstream callers migrate.
+ChunkedFLARE = AutoRegressiveFLARE
+flare_chunk_triton = flare_autoregressive_triton

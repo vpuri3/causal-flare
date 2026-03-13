@@ -61,7 +61,7 @@ def _trainlike_projected():
             if impl == "pytorch2":
                 Y = flare_causal_chunked(latent_q, K, V, scale=scale)
             else:
-                Y = flare_chunk_triton(latent_q, K, V, scale)
+                Y = flare_autoregressive_triton(latent_q, K, V, scale)
 
             loss = Y.float().pow(2).mean()
             loss.backward()

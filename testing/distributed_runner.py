@@ -48,11 +48,11 @@ class WorkerSlot:
 def _is_autotune_coverage_task(task: Task) -> bool:
     return (
         task.kind == "pytest"
-        and task.name.startswith("testing/test_regression_suites.py::test_autotune_launch_coverage_suite[")
+        and task.name.startswith("testing/autoregressive/test_regression_suites.py::test_autotune_launch_coverage_suite[")
     )
 
 
-_BUNDLE_NODEID = "testing/test_regression_suites.py::test_regression_bundle"
+_BUNDLE_NODEID = "testing/autoregressive/test_regression_suites.py::test_regression_bundle"
 _DEFAULT_PYTEST_ARGS = ["testing", "-q"]
 
 _SUITE_RUNNERS: dict[str, Callable[[], None]] = {
@@ -62,7 +62,7 @@ _SUITE_RUNNERS: dict[str, Callable[[], None]] = {
 }
 
 _WEIGHT_OVERRIDES = {
-    "testing/test_cached_suites.py::test_cached_prefill_decode_regression_suite": 6,
+    "testing/autoregressive/test_cached_suites.py::test_cached_prefill_decode_regression_suite": 6,
 }
 
 _PYTEST_OPTIONS_WITH_VALUE = {
@@ -212,17 +212,17 @@ def _expand_tasks(nodeids: list[str], *, full_matrix: bool) -> list[Task]:
 def _weight_for_nodeid(nodeid: str) -> int:
     if nodeid in _WEIGHT_OVERRIDES:
         return _WEIGHT_OVERRIDES[nodeid]
-    if nodeid.startswith("testing/test_regression_suites.py::test_correctness_suite["):
+    if nodeid.startswith("testing/autoregressive/test_regression_suites.py::test_correctness_suite["):
         return 3
-    if nodeid.startswith("testing/test_regression_suites.py::test_grad_checks_suite["):
+    if nodeid.startswith("testing/autoregressive/test_regression_suites.py::test_grad_checks_suite["):
         return 3
-    if nodeid.startswith("testing/test_regression_suites.py::test_autotune_launch_coverage_suite["):
+    if nodeid.startswith("testing/autoregressive/test_regression_suites.py::test_autotune_launch_coverage_suite["):
         return 2
-    if nodeid.startswith("testing/test_regression_suites.py::test_long_context_accuracy_suite["):
+    if nodeid.startswith("testing/autoregressive/test_regression_suites.py::test_long_context_accuracy_suite["):
         return 3
-    if nodeid.startswith("testing/test_regression_suites.py::test_chunk_size_sensitivity_suite["):
+    if nodeid.startswith("testing/autoregressive/test_regression_suites.py::test_chunk_size_sensitivity_suite["):
         return 2
-    if nodeid.startswith("testing/test_regression_suites.py::test_sharp_softmax_bwd_regression_suite["):
+    if nodeid.startswith("testing/autoregressive/test_regression_suites.py::test_sharp_softmax_bwd_regression_suite["):
         return 2
     if "test_finite_difference.py::" in nodeid:
         return 3

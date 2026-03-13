@@ -4,7 +4,7 @@ Current source of truth for which knobs are owned by offline tuning and then pro
 
 - [`README.md`](./README.md)
 
-This workflow exists because runtime Triton autotune on the chunked user path proved too expensive in practice. We tried it, but cold-cache compile and first-use latency became extremely large, so the project moved back to offline matrix sweeps plus promoted heuristic buckets in `causal_flare/chunked.py`.
+This workflow exists because runtime Triton autotune on the chunked user path proved too expensive in practice. We tried it, but cold-cache compile and first-use latency became extremely large, so the project moved back to offline matrix sweeps plus promoted heuristic buckets in `causal_flare/autoregressive/training.py`.
 
 This workflow turns launch-config tuning into a repeatable sweep over the expected deployment matrix:
 
@@ -28,7 +28,7 @@ Use three passes:
 
 1. Seed `D` families at one representative `(M, N, BH)` point.
 2. Refine `BLOCK_M`, width-dependent tile choices, and launch presets over the wider `M x N` anchor matrix using the seeded width families.
-3. Confirm the promoted configs across the full matrix, then update the heuristic buckets in `causal_flare/chunked.py`.
+3. Confirm the promoted configs across the full matrix, then update the heuristic buckets in `causal_flare/autoregressive/training.py`.
 
 `BH` is usually held fixed at one representative multiple of 4 because the kernels parallelize over `B * H`. If a regression appears BH-sensitive, rerun the same stage with a different `--batch-size` / `--bh-values` factorization.
 
@@ -127,7 +127,7 @@ python benchmark/tune_chunked_flare_matrix.py \
 
 Goal:
 
-- validate the small set of configs that are candidates for promotion into `chunked.py`
+- validate the small set of configs that are candidates for promotion into `training.py`
 - keep the promoted defaults narrow and evidence-based
 
 ## Families
@@ -173,7 +173,7 @@ Important:
 
 - The runtime path is heuristic-only by default.
 - That is intentional. We previously tried runtime Triton autotune, but the compile/autotune cost was too high for acceptable user experience.
-- These families are the place where tile and launch alternatives are explored before promoting winners back into `causal_flare/chunked.py`.
+- These families are the place where tile and launch alternatives are explored before promoting winners back into `causal_flare/autoregressive/training.py`.
 
 ## Reading The Results
 

@@ -1,11 +1,14 @@
-from ._common import *
-from .torch import _resolve_flare_causal_decode_inputs as _resolve_recurrent_decode_inputs
+"""Experimental recurrent autoregressive FLARE variants."""
+
+from causal_flare._common import *
+from causal_flare._reference_utils import resolve_flare_causal_decode_inputs as _resolve_recurrent_decode_inputs
 
 # NOTE:
 # - This file does not implement sequence-length (N-axis) chunking.
 # - It is used to prototype inner methods that may later be used inside
 #   chunked algorithms.
-# - Keep this module self-contained: do not import kernels from chunked.py.
+# - Keep this module self-contained: do not import kernels from training.py.
+# - This path is experimental and is not exported from the default package API.
 
 
 def _get_recurrent_block_d_k(D: int, block_d=None) -> tuple[int, int]:
@@ -1151,5 +1154,5 @@ def flare_recurrent_triton(
     K_dec: torch.Tensor | None = None,
     block_t: int | None = None,
 ):
-    """Public wrapper for the Triton-backed recurrent FLARE autograd path."""
+    """Experimental wrapper for the Triton-backed recurrent FLARE autograd path."""
     return RecurrentFLARE.apply(Q, K, V, scale, block_m, block_d, Q_dec, K_dec, block_t)

@@ -220,7 +220,7 @@ def _get_allow_tf32() -> bool:
 
 
 def _get_input_precision() -> str:
-    """Preferred precision selector for ChunkedFLARE Triton dots."""
+    """Preferred precision selector for AutoRegressiveFLARE Triton dots."""
     env = os.environ.get("FLARE_INPUT_PRECISION", "").strip().lower()
     if env in ("tf32", "tf32x3", "ieee"):
         return env
@@ -509,13 +509,13 @@ class PhaseProfiler:
 
 #======================================================================#
 # NOTE:
-# Recurrent mode (`ChunkedFLARE`) is the recommended path for production use.
+# Recurrent mode (`AutoRegressiveFLARE`) is the recommended path for production use.
 # The dense formulation has shown fundamental numerical instability in our
 # sharp/long-context regimes.
 #
 # We continue to run separate dense experiments in `DenseFLARE` and
 # `DenseFLARE1`, but latest results indicate both are currently worse than
-# recurrent `ChunkedFLARE` (stability and quality).
+# recurrent `AutoRegressiveFLARE` (stability and quality).
 
 
 __all__ = [name for name in globals() if name != "__builtins__"]

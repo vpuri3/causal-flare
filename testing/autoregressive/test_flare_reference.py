@@ -1,6 +1,6 @@
 import torch
 
-from causal_flare.torch import flare_causal_chunked, flare_causal_reference, flare_recurrent_pytorch
+from causal_flare.autoregressive.reference import flare_causal_chunked, flare_causal_reference, flare_recurrent_pytorch
 
 
 def _run_impl(name, q_enc, k_enc, v_enc, *, q_dec=None, k_dec=None, scale=None):

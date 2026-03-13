@@ -3,6 +3,11 @@
 
 Standalone experimental packaging of `fla/models/flare/causal_flare` from the flash-linear-attention project.
 
+The repo is split into two branches:
+
+- `causal_flare.autoregressive`: standard next-token-prediction FLARE
+- `causal_flare.semi_autoregressive`: next token-block prediction FLARE
+
 ## Related reading
 
 - Blog post: [From Encoder to Decoder: Extending FLARE to Memory-Efficient Causal Attention](https://vpuri3.github.io/blog/from-encoder-to-decoder-extending-flare-to-memory-efficient-causal-attention/)
@@ -28,14 +33,20 @@ pip install -e .[dev,test,benchmark]
 
 ```python
 import torch
-from causal_flare import flare_chunk_triton
+from causal_flare import flare_autoregressive_triton
 
 B, N, H, M, D = 1, 256, 8, 64, 32
 q = torch.randn(H, M, D, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(B, N, H, D, device="cuda", dtype=torch.bfloat16)
 v = torch.randn(B, N, H, D, device="cuda", dtype=torch.bfloat16)
-y = flare_chunk_triton(q, k, v)
+y = flare_autoregressive_triton(q, k, v)
 ```
+
+Branch docs:
+
+- [`causal_flare/docs.md`](./causal_flare/docs.md)
+- [`causal_flare/autoregressive/docs.md`](./causal_flare/autoregressive/docs.md)
+- [`causal_flare/semi_autoregressive/docs.md`](./causal_flare/semi_autoregressive/docs.md)
 
 ## Benchmarks
 
@@ -77,7 +88,7 @@ Short vs full:
 - Short (`--run-regression`, optional `--run-stress`): wrapper applies bounded defaults (smaller shapes/configs) for quick gating.
 - Full (`--full-matrix`): wrapper does not apply bounded overrides and enables extended regression coverage; this is the multi-minute heavy run.
 
-Extracted regression/stress suite implementations live in `testing/suite_runners/` (one file per suite, including `grad_checks.py`), plus additional regression-only pytest suites in `testing/test_cached_suites.py`.
+Extracted regression/stress suite implementations live in `testing/suite_runners/` (one file per suite, including `grad_checks.py`), plus additional regression-only pytest suites in `testing/autoregressive/test_cached_suites.py`.
 See `testing/README.md` for the full suite list and coverage summary.
 
 ## Notes
