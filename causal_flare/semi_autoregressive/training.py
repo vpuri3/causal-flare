@@ -33,29 +33,29 @@ def _get_semi_ar_forward_config(
     if block_t % 16 != 0:
         raise ValueError(f"SemiAutoRegressiveFLARE requires BLOCK_T to be a multiple of 16. Got BLOCK_T={block_t}.")
 
-    prepare_warps, prepare_stages = _resolve_forward_launch(
-        "semi_ar_prepare",
-        default_num_warps=4 if block_m <= 32 and block_d <= 32 else 8,
-        default_num_stages=2,
-    )
-    reduce_warps, reduce_stages = _resolve_forward_launch(
-        "semi_ar_block_reduce",
-        default_num_warps=4 if block_m <= 32 and block_d <= 32 else 8,
-        default_num_stages=2,
-    )
-    prefix_warps, prefix_stages = _resolve_forward_launch(
-        "semi_ar_scan",
+    block_prepare_warps, block_prepare_stages = _resolve_forward_launch(
+        "semi_ar_block_prepare",
         default_num_warps=4,
+        default_num_stages=4,
+    )
+    scan_warps, scan_stages = _resolve_forward_launch(
+        "semi_ar_scan",
+        default_num_warps=8,
         default_num_stages=2,
+    )
+    block_z_warps, block_z_stages = _resolve_forward_launch(
+        "semi_ar_block_z",
+        default_num_warps=4,
+        default_num_stages=1,
     )
     decoder_warps, decoder_stages = _resolve_forward_launch(
         "semi_ar_decoder_lse",
-        default_num_warps=4 if block_m <= 32 else 8,
-        default_num_stages=2,
+        default_num_warps=2,
+        default_num_stages=1,
     )
-    output_warps, output_stages = _resolve_forward_launch(
-        "semi_ar_output_from_z",
-        default_num_warps=4 if block_d <= 32 else 8,
+    lse_output_warps, lse_output_stages = _resolve_forward_launch(
+        "semi_ar_lse_output",
+        default_num_warps=4,
         default_num_stages=2,
     )
 
@@ -72,16 +72,16 @@ def _get_semi_ar_forward_config(
         "NUM_M_TILES": triton.cdiv(M, block_m),
         "NUM_D_VALUE_BLOCKS": triton.cdiv(D_value, block_d),
         "input_precision": _normalize_input_precision(input_precision, None),
-        "prepare_num_warps": prepare_warps,
-        "prepare_num_stages": prepare_stages,
-        "reduce_num_warps": reduce_warps,
-        "reduce_num_stages": reduce_stages,
-        "prefix_num_warps": prefix_warps,
-        "prefix_num_stages": prefix_stages,
+        "block_prepare_num_warps": block_prepare_warps,
+        "block_prepare_num_stages": block_prepare_stages,
+        "scan_num_warps": scan_warps,
+        "scan_num_stages": scan_stages,
+        "block_z_num_warps": block_z_warps,
+        "block_z_num_stages": block_z_stages,
         "decoder_num_warps": decoder_warps,
         "decoder_num_stages": decoder_stages,
-        "output_num_warps": output_warps,
-        "output_num_stages": output_stages,
+        "lse_output_num_warps": lse_output_warps,
+        "lse_output_num_stages": lse_output_stages,
     }
 
 
@@ -732,13 +732,12 @@ def semi_ar_block_z_kernel(
 
 
 @triton.jit
-def semi_ar_output_from_z_kernel(
+def semi_ar_lse_output_kernel(
     K_ptr,
     Q_ptr,
     QDec_ptr,
     KDec_ptr,
     ZBlock_ptr,
-    LSEDec_ptr,
     O_ptr,
     stride_k_b,
     stride_k_n,
@@ -758,8 +757,6 @@ def semi_ar_output_from_z_kernel(
     stride_z_blk,
     stride_z_m,
     stride_z_d,
-    stride_lsed_bh,
-    stride_lsed_n,
     stride_o_b,
     stride_o_n,
     stride_o_h,
@@ -770,48 +767,29 @@ def semi_ar_output_from_z_kernel(
     D_SCORE: tl.constexpr,
     D_VALUE: tl.constexpr,
     scale,
-    BLOCK_SIZE,
-    CHUNK_SIZE: tl.constexpr,
     CHUNKS_PER_BLOCK,
+    CHUNK_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_T: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    SINGLE_M_TILE: tl.constexpr,
     WEIGHT_SHARING_ENC_DEC: tl.constexpr,
     H: tl.constexpr,
 ):
     pid_bh = tl.program_id(0)
     global_q_chunk = tl.program_id(1)
-    pid_md = tl.program_id(2)
+    pid_d = tl.program_id(2)
     if pid_bh >= BH:
         return
-
-    num_d_tiles = tl.cdiv(D_VALUE, BLOCK_D)
-    pid_m = pid_md // num_d_tiles
-    pid_d = pid_md - pid_m * num_d_tiles
 
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
     block_idx = global_q_chunk // CHUNKS_PER_BLOCK
     q_chunk_start = global_q_chunk * CHUNK_SIZE
 
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    mask_m = m_offsets < M
     mask_d = d_offsets < D_VALUE
-    mask_md = mask_m[:, None] & mask_d[None, :]
-
-    z_md = tl.load(
-        ZBlock_ptr
-        + pid_bh * stride_z_bh
-        + block_idx * stride_z_blk
-        + m_offsets[:, None] * stride_z_m
-        + d_offsets[None, :] * stride_z_d,
-        mask=mask_md,
-        other=0.0,
-    ).to(tl.float32)
 
     t0 = 0
     while t0 < CHUNK_SIZE:
@@ -819,60 +797,74 @@ def semi_ar_output_from_z_kernel(
         token_idx = q_chunk_start + t_offsets
         token_mask = token_idx < N
 
-        ###
-        ### Compute SCORES_DEC[BLOCK_M, BLOCK_T]
-        ###
-        scores_dec = tl.zeros((BLOCK_M, BLOCK_T), dtype=tl.float32)
-        for k0 in tl.static_range(0, D_SCORE, BLOCK_K):
-            d_k = k0 + tl.arange(0, BLOCK_K)
-            mask_k = d_k < D_SCORE
-            if WEIGHT_SHARING_ENC_DEC:
-                q_tok = tl.load(
-                    K_ptr + pid_b * stride_k_b + token_idx[:, None] * stride_k_n + pid_h * stride_k_h + d_k[None, :] * stride_k_d,
-                    mask=token_mask[:, None] & mask_k[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                k_bank = tl.load(
-                    Q_ptr + pid_h * stride_q_h + m_offsets[:, None] * stride_q_m + d_k[None, :] * stride_q_d,
-                    mask=mask_m[:, None] & mask_k[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-            else:
-                q_tok = tl.load(
-                    QDec_ptr + pid_b * stride_qdb + token_idx[:, None] * stride_qdn + pid_h * stride_qdh + d_k[None, :] * stride_qdd,
-                    mask=token_mask[:, None] & mask_k[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                k_bank = tl.load(
-                    KDec_ptr + pid_h * stride_kdh + m_offsets[:, None] * stride_kdm + d_k[None, :] * stride_kdd,
-                    mask=mask_m[:, None] & mask_k[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-            scores_dec += tl.dot(k_bank, tl.trans(q_tok), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        scores_dec = scores_dec * scale
-        scores_dec = tl.where(mask_m[:, None] & token_mask[None, :], scores_dec, -float("inf"))
+        lse_max = tl.full((BLOCK_T,), -float("inf"), tl.float32)
+        lse_sum = tl.zeros((BLOCK_T,), tl.float32)
+        y_num = tl.zeros((BLOCK_T, BLOCK_D), tl.float32)
 
-        ###
-        ### LOAD LSE_DEC[BLOCK_T]
-        ###
-        lse_dec = tl.load(
-            LSEDec_ptr + pid_bh * stride_lsed_bh + token_idx * stride_lsed_n,
-            mask=token_mask,
-            other=0.0,
-        ).to(tl.float32)
+        m0 = 0
+        while m0 < M:
+            m_offsets = m0 + tl.arange(0, BLOCK_M)
+            mask_m = m_offsets < M
+            mask_md = mask_m[:, None] & mask_d[None, :]
 
-        ###
-        ### W_DEC[BLOCK_M, BLOCK_T] = EXP(SCORES_DEC[BLOCK_M, BLOCK_T] - LSE_DEC[BLOCK_T])
-        ###
-        w_dec_mt = tl.exp(scores_dec - lse_dec[None, :])
-        w_dec_mt = tl.where(mask_m[:, None] & token_mask[None, :], w_dec_mt, 0.0)
-        w_dec_tm = tl.trans(w_dec_mt)
+            scores_dec = tl.zeros((BLOCK_M, BLOCK_T), dtype=tl.float32)
+            for k0 in tl.static_range(0, D_SCORE, BLOCK_K):
+                d_k = k0 + tl.arange(0, BLOCK_K)
+                mask_k = d_k < D_SCORE
+                if WEIGHT_SHARING_ENC_DEC:
+                    q_tok = tl.load(
+                        K_ptr + pid_b * stride_k_b + token_idx[:, None] * stride_k_n + pid_h * stride_k_h + d_k[None, :] * stride_k_d,
+                        mask=token_mask[:, None] & mask_k[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    k_bank = tl.load(
+                        Q_ptr + pid_h * stride_q_h + m_offsets[:, None] * stride_q_m + d_k[None, :] * stride_q_d,
+                        mask=mask_m[:, None] & mask_k[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                else:
+                    q_tok = tl.load(
+                        QDec_ptr + pid_b * stride_qdb + token_idx[:, None] * stride_qdn + pid_h * stride_qdh + d_k[None, :] * stride_qdd,
+                        mask=token_mask[:, None] & mask_k[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                    k_bank = tl.load(
+                        KDec_ptr + pid_h * stride_kdh + m_offsets[:, None] * stride_kdm + d_k[None, :] * stride_kdd,
+                        mask=mask_m[:, None] & mask_k[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
+                scores_dec += tl.dot(k_bank, tl.trans(q_tok), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            scores_dec = scores_dec * scale
+            scores_dec = tl.where(mask_m[:, None] & token_mask[None, :], scores_dec, -float("inf"))
 
-        ###
-        ### Y[BLOCK_T, BLOCK_D] = W_DEC[BLOCK_T, BLOCK_M] @ Z[BLOCK_M, BLOCK_D]
-        ###
-        y_tile = tl.dot(w_dec_tm, z_md, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            z_md = tl.load(
+                ZBlock_ptr
+                + pid_bh * stride_z_bh
+                + block_idx * stride_z_blk
+                + m_offsets[:, None] * stride_z_m
+                + d_offsets[None, :] * stride_z_d,
+                mask=mask_md,
+                other=0.0,
+            ).to(tl.float32)
 
+            block_max = tl.max(scores_dec, axis=0)
+            new_max = tl.maximum(lse_max, block_max)
+            new_max_safe = tl.where(new_max == -float("inf"), 0.0, new_max)
+            rescale_prev = tl.where(lse_max == -float("inf"), 0.0, tl.exp(lse_max - new_max_safe))
+            both_inf = new_max == -float("inf")
+            rescale_prev = tl.where(both_inf & (lse_max == -float("inf")), 1.0, rescale_prev)
+            exp_scores = tl.exp(scores_dec - new_max_safe[None, :])
+            exp_scores = tl.where(mask_m[:, None] & token_mask[None, :], exp_scores, 0.0)
+
+            y_num = y_num * rescale_prev[:, None] + tl.dot(
+                tl.trans(exp_scores), z_md, out_dtype=tl.float32, input_precision=INPUT_PRECISION
+            )
+            lse_sum = lse_sum * rescale_prev + tl.sum(exp_scores, axis=0)
+            lse_max = new_max
+            m0 += BLOCK_M
+
+        inv_den = 1.0 / tl.where(lse_sum > 0, lse_sum, 1.0)
+        y_tile = y_num * inv_den[:, None]
         o_ptr = (
             O_ptr
             + pid_b * stride_o_b
@@ -880,11 +872,76 @@ def semi_ar_output_from_z_kernel(
             + pid_h * stride_o_h
             + d_offsets[None, :] * stride_o_d
         )
-        if SINGLE_M_TILE:
-            tl.store(o_ptr, y_tile, mask=token_mask[:, None] & mask_d[None, :])
-        else:
-            tl.atomic_add(o_ptr, y_tile, mask=token_mask[:, None] & mask_d[None, :])
+        tl.store(o_ptr, y_tile, mask=token_mask[:, None] & mask_d[None, :])
         t0 += BLOCK_T
+
+
+def _run_semi_ar_lse_output_phase(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    *,
+    Q_dec: torch.Tensor,
+    K_dec: torch.Tensor,
+    z_block: torch.Tensor,
+    H: int,
+    M: int,
+    N: int,
+    D_score: int,
+    D_value: int,
+    scale: float,
+    config: dict[str, object],
+    weight_sharing_enc_dec: bool,
+    out_dtype: torch.dtype,
+    kernel_timings: dict[str, float] | None = None,
+):
+    B = K.size(0)
+    BH = B * H
+    device = K.device
+
+    def alloc_output():
+        return torch.empty((B, N, H, D_value), device=device, dtype=torch.float32)
+
+    O = _profiled_call(device, kernel_timings, "alloc_output", alloc_output)
+
+    def grid(meta):
+        return (BH, config["NUM_GLOBAL_CHUNKS"], config["NUM_D_VALUE_BLOCKS"])
+
+    def launch():
+        semi_ar_lse_output_kernel[grid](
+            K,
+            Q,
+            Q_dec,
+            K_dec,
+            z_block,
+            O,
+            *K.stride(),
+            *Q.stride(),
+            *Q_dec.stride(),
+            *K_dec.stride(),
+            *z_block.stride(),
+            *O.stride(),
+            BH,
+            M,
+            N,
+            D_score,
+            D_value,
+            scale,
+            config["CHUNKS_PER_BLOCK"],
+            CHUNK_SIZE=config["CHUNK_SIZE"],
+            BLOCK_M=config["BLOCK_M"],
+            BLOCK_D=config["BLOCK_D"],
+            BLOCK_K=config["BLOCK_K"],
+            BLOCK_T=config["BLOCK_T"],
+            INPUT_PRECISION=config["input_precision"],
+            WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
+            H=H,
+            num_warps=config["lse_output_num_warps"],
+            num_stages=config["lse_output_num_stages"],
+        )
+
+    _profiled_call(device, kernel_timings, "semi_ar_lse_output", launch)
+    Y = _profiled_call(device, kernel_timings, "output_cast", lambda: O.to(out_dtype))
+    return Y
 
 
 def _run_semi_ar_prepare_phase(
@@ -996,8 +1053,8 @@ def _run_semi_ar_block_reduce_phase(
             config["CHUNKS_PER_BLOCK"],
             BLOCK_M=config["BLOCK_M"],
             BLOCK_D=config["BLOCK_D"],
-            num_warps=config["reduce_num_warps"],
-            num_stages=config["reduce_num_stages"],
+            num_warps=config["block_prepare_num_warps"],
+            num_stages=config["block_prepare_num_stages"],
         )
 
     _profiled_call(device, kernel_timings, "semi_ar_block_reduce_from_chunks", launch)
@@ -1061,8 +1118,8 @@ def _run_semi_ar_block_prepare_phase(
             BLOCK_K=config["BLOCK_K"],
             INPUT_PRECISION=config["input_precision"],
             H=H,
-            num_warps=config["reduce_num_warps"],
-            num_stages=config["reduce_num_stages"],
+            num_warps=config["block_prepare_num_warps"],
+            num_stages=config["block_prepare_num_stages"],
         )
 
     _profiled_call(device, kernel_timings, "semi_ar_block_prepare", launch)
@@ -1119,8 +1176,8 @@ def _run_semi_ar_block_scan_phase(
             config["NUM_BLOCKS"],
             BLOCK_M=config["BLOCK_M"],
             BLOCK_D=config["BLOCK_D"],
-            num_warps=config["prefix_num_warps"],
-            num_stages=config["prefix_num_stages"],
+            num_warps=config["scan_num_warps"],
+            num_stages=config["scan_num_stages"],
         )
 
     _profiled_call(device, kernel_timings, "semi_ar_block_scan", launch)
@@ -1170,8 +1227,8 @@ def _run_semi_ar_block_z_phase(
             config["NUM_BLOCKS"],
             BLOCK_M=config["BLOCK_M"],
             BLOCK_D=config["BLOCK_D"],
-            num_warps=config["prefix_num_warps"],
-            num_stages=config["prefix_num_stages"],
+            num_warps=config["block_z_num_warps"],
+            num_stages=config["block_z_num_stages"],
         )
 
     _profiled_call(device, kernel_timings, "semi_ar_block_z", launch)
@@ -1233,79 +1290,6 @@ def _run_semi_ar_decode_lse_phase(
     return lse_dec
 
 
-def _run_semi_ar_output_from_z_phase(
-    Q: torch.Tensor,
-    K: torch.Tensor,
-    *,
-    Q_dec: torch.Tensor,
-    K_dec: torch.Tensor,
-    z_block: torch.Tensor,
-    lse_dec: torch.Tensor,
-    H: int,
-    M: int,
-    N: int,
-    D_score: int,
-    D_value: int,
-    scale: float,
-    config: dict[str, object],
-    weight_sharing_enc_dec: bool,
-    out_dtype: torch.dtype,
-    kernel_timings: dict[str, float] | None = None,
-):
-    B = K.size(0)
-    BH = B * H
-    device = K.device
-
-    def alloc_output():
-        return torch.zeros((B, N, H, D_value), device=device, dtype=torch.float32)
-
-    O = _profiled_call(device, kernel_timings, "alloc_output", alloc_output)
-
-    def grid(meta):
-        return (BH, config["NUM_GLOBAL_CHUNKS"], config["NUM_M_TILES"] * config["NUM_D_VALUE_BLOCKS"])
-
-    def launch():
-        semi_ar_output_from_z_kernel[grid](
-            K,
-            Q,
-            Q_dec,
-            K_dec,
-            z_block,
-            lse_dec,
-            O,
-            *K.stride(),
-            *Q.stride(),
-            *Q_dec.stride(),
-            *K_dec.stride(),
-            *z_block.stride(),
-            *lse_dec.stride(),
-            *O.stride(),
-            BH,
-            M,
-            N,
-            D_score,
-            D_value,
-            scale,
-            config["BLOCK_SIZE"],
-            CHUNK_SIZE=config["CHUNK_SIZE"],
-            CHUNKS_PER_BLOCK=config["CHUNKS_PER_BLOCK"],
-            BLOCK_M=config["BLOCK_M"],
-            BLOCK_D=config["BLOCK_D"],
-            BLOCK_K=config["BLOCK_K"],
-            BLOCK_T=config["BLOCK_T"],
-            INPUT_PRECISION=config["input_precision"],
-            SINGLE_M_TILE=config["NUM_M_TILES"] == 1,
-            WEIGHT_SHARING_ENC_DEC=weight_sharing_enc_dec,
-            H=H,
-            num_warps=config["output_num_warps"],
-            num_stages=config["output_num_stages"],
-        )
-
-    _profiled_call(device, kernel_timings, "semi_ar_output_from_z", launch)
-    Y = _profiled_call(device, kernel_timings, "output_cast", lambda: O.to(out_dtype))
-    return Y
-
-
 def _semi_autoregressive_forward_triton(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -1316,7 +1300,6 @@ def _semi_autoregressive_forward_triton(
     scale: float | None = None,
     input_precision=None,
     profile: bool = False,
-    save_chunk_stats: bool = True,
     Q_dec: torch.Tensor | None = None,
     K_dec: torch.Tensor | None = None,
     return_aux: bool = False,
@@ -1348,43 +1331,19 @@ def _semi_autoregressive_forward_triton(
     profile_data = {"forward": {}, "backward": {}} if profile else None
     timing_bucket = profile_data["forward"] if profile_data is not None else None
 
-    if save_chunk_stats:
-        chunk_max, chunk_den, chunk_num = _run_semi_ar_prepare_phase(
-            Q,
-            K,
-            V,
-            H=H,
-            M=M,
-            N=N,
-            D_score=D_score,
-            D_value=D_value,
-            scale=scale,
-            config=cfg,
-            kernel_timings=timing_bucket,
-        )
-        block_max, block_den, block_num = _run_semi_ar_block_reduce_phase(
-            chunk_max,
-            chunk_den,
-            chunk_num,
-            M=M,
-            D_value=D_value,
-            config=cfg,
-            kernel_timings=timing_bucket,
-        )
-    else:
-        block_max, block_den, block_num = _run_semi_ar_block_prepare_phase(
-            Q,
-            K,
-            V,
-            H=H,
-            M=M,
-            N=N,
-            D_score=D_score,
-            D_value=D_value,
-            scale=scale,
-            config=cfg,
-            kernel_timings=timing_bucket,
-        )
+    block_max, block_den, block_num = _run_semi_ar_block_prepare_phase(
+        Q,
+        K,
+        V,
+        H=H,
+        M=M,
+        N=N,
+        D_score=D_score,
+        D_value=D_value,
+        scale=scale,
+        config=cfg,
+        kernel_timings=timing_bucket,
+    )
 
     prefix_max, prefix_den, prefix_num, lse_enc = _run_semi_ar_block_scan_phase(
         block_max,
@@ -1409,28 +1368,28 @@ def _semi_autoregressive_forward_triton(
 
     q_dec_tensor = K if weight_sharing_enc_dec else Q_dec
     k_dec_tensor = Q if weight_sharing_enc_dec else K_dec
-    lse_dec = _run_semi_ar_decode_lse_phase(
-        Q,
-        K,
-        Q_dec=q_dec_tensor,
-        K_dec=k_dec_tensor,
-        H=H,
-        M=M,
-        N=N,
-        D_score=D_score,
-        scale=scale,
-        config=cfg,
-        weight_sharing_enc_dec=weight_sharing_enc_dec,
-        kernel_timings=timing_bucket,
-    )
-
-    Y = _run_semi_ar_output_from_z_phase(
+    lse_dec = None
+    if return_aux:
+        lse_dec = _run_semi_ar_decode_lse_phase(
+            Q,
+            K,
+            Q_dec=q_dec_tensor,
+            K_dec=k_dec_tensor,
+            H=H,
+            M=M,
+            N=N,
+            D_score=D_score,
+            scale=scale,
+            config=cfg,
+            weight_sharing_enc_dec=weight_sharing_enc_dec,
+            kernel_timings=timing_bucket,
+        )
+    Y = _run_semi_ar_lse_output_phase(
         Q,
         K,
         Q_dec=q_dec_tensor,
         K_dec=k_dec_tensor,
         z_block=z_block,
-        lse_dec=lse_dec,
         H=H,
         M=M,
         N=N,
@@ -1446,11 +1405,10 @@ def _semi_autoregressive_forward_triton(
     aux = None
     if return_aux:
         aux = {
-            "LSE_dec": lse_dec.view(B, H, N),
+            "LSE_dec": None if lse_dec is None else lse_dec.view(B, H, N),
             "LSE_enc": lse_enc.view(B, H, cfg["NUM_BLOCKS"], M),
             "prefix_max": prefix_max.view(B, H, cfg["NUM_BLOCKS"], M),
             "prefix_den": prefix_den.view(B, H, cfg["NUM_BLOCKS"], M),
-            "save_chunk_stats": save_chunk_stats,
         }
 
     if profile_data is not None:
@@ -1475,7 +1433,6 @@ class SemiAutoRegressiveFLARE(autograd.Function):
         chunk_size=None,
         input_precision=None,
         profile=False,
-        save_chunk_stats=True,
         Q_dec=None,
         K_dec=None,
     ):
@@ -1489,7 +1446,6 @@ class SemiAutoRegressiveFLARE(autograd.Function):
             scale=scale,
             input_precision=input_precision,
             profile=profile,
-            save_chunk_stats=save_chunk_stats,
             Q_dec=Q_dec,
             K_dec=K_dec,
         )
@@ -1510,7 +1466,6 @@ def flare_semi_autoregressive_trition(
     scale=None,
     input_precision=None,
     profile: bool = False,
-    save_chunk_stats: bool = True,
     Q_dec=None,
     K_dec=None,
     return_aux: bool = False,
@@ -1525,7 +1480,6 @@ def flare_semi_autoregressive_trition(
             scale=scale,
             input_precision=input_precision,
             profile=profile,
-            save_chunk_stats=save_chunk_stats,
             Q_dec=Q_dec,
             K_dec=K_dec,
             return_aux=True,
@@ -1539,7 +1493,6 @@ def flare_semi_autoregressive_trition(
         chunk_size,
         input_precision,
         profile,
-        save_chunk_stats,
         Q_dec,
         K_dec,
     )

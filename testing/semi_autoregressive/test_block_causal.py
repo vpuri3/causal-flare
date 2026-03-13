@@ -41,17 +41,16 @@ def test_block_causal_validation_rejects_non_block_aligned_sequence_length():
 
 
 @pytest.mark.parametrize(
-    ("block_size", "chunk_size", "seq_len", "expected_save_chunk_stats"),
+    ("block_size", "chunk_size", "seq_len"),
     [
-        (16, 16, 48, True),
-        (32, 16, 64, True),
+        (16, 16, 48),
+        (32, 16, 64),
     ],
 )
 def test_block_causal_forward_matches_sdpa_reference(
     block_size: int,
     chunk_size: int,
     seq_len: int,
-    expected_save_chunk_stats: bool,
 ):
     torch.manual_seed(0)
 
@@ -76,15 +75,13 @@ def test_block_causal_forward_matches_sdpa_reference(
         return_aux=True,
     )
 
-    assert aux["save_chunk_stats"] is expected_save_chunk_stats
     assert aux["LSE_dec"].shape == (B, H, seq_len)
     assert aux["LSE_enc"].shape == (B, H, (seq_len + block_size - 1) // block_size, M)
     torch.testing.assert_close(y_impl, y_ref, rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton path")
-@pytest.mark.parametrize("save_chunk_stats", [True, False])
-def test_block_causal_training_wrapper_matches_reference_on_cuda(save_chunk_stats: bool):
+def test_block_causal_training_wrapper_matches_reference_on_cuda():
     torch.manual_seed(2)
 
     B = 1
@@ -107,7 +104,6 @@ def test_block_causal_training_wrapper_matches_reference_on_cuda(save_chunk_stat
         block_size=block_size,
         chunk_size=chunk_size,
         scale=scale,
-        save_chunk_stats=save_chunk_stats,
     )
     y_ref = _block_causal_forward_pytorch(
         q,
@@ -116,7 +112,7 @@ def test_block_causal_training_wrapper_matches_reference_on_cuda(save_chunk_stat
         block_size=block_size,
         chunk_size=chunk_size,
         scale=scale,
-        save_chunk_stats=save_chunk_stats,
+        save_chunk_stats=False,
     )
 
     torch.testing.assert_close(y, y_ref, rtol=2e-2, atol=2e-2)

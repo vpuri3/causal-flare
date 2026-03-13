@@ -113,7 +113,7 @@ def optimize_for_h100() -> None:
 def run_semi_autoregressive_main(
     B: int = 4,
     H: int = 16,
-    M: int = 64,
+    M: int = 256,
     N: int = 65536,
     D: int = 32,
     dtype: str = "bfloat16",
@@ -275,9 +275,9 @@ def run_semi_autoregressive_main(
 
     triton_skip_reason = None if device.type == "cuda" else "requires CUDA"
 
-    print("Measuring SemiAutoRegressiveFLARE Triton chunk-stats...", end=" ", flush=True)
-    semi_ar_triton_chunk_result = _run_impl(
-        "SemiAutoRegressiveFLARE Triton chunk-stats",
+    print("Measuring SemiAutoRegressiveFLARE Triton...", end=" ", flush=True)
+    semi_ar_triton_result = _run_impl(
+        "SemiAutoRegressiveFLARE Triton",
         lambda: flare_semi_autoregressive_trition(
             Q_flare,
             K_flare,
@@ -285,31 +285,12 @@ def run_semi_autoregressive_main(
             block_size=block_size,
             chunk_size=chunk_size,
             scale=scale,
-            save_chunk_stats=True,
         ),
         ref=flare_ref_output,
-        ref_prefix="semi_ar_triton_chunk_stats",
+        ref_prefix="semi_ar_triton",
         skip_reason=triton_skip_reason,
     )
-    print(semi_ar_triton_chunk_result["status"] + _compile_suffix(semi_ar_triton_chunk_result["compile_ms"]))
-
-    print("Measuring SemiAutoRegressiveFLARE Triton block-stats...", end=" ", flush=True)
-    semi_ar_triton_block_result = _run_impl(
-        "SemiAutoRegressiveFLARE Triton block-stats",
-        lambda: flare_semi_autoregressive_trition(
-            Q_flare,
-            K_flare,
-            V_flare,
-            block_size=block_size,
-            chunk_size=chunk_size,
-            scale=scale,
-            save_chunk_stats=False,
-        ),
-        ref=flare_ref_output,
-        ref_prefix="semi_ar_triton_block_stats",
-        skip_reason=triton_skip_reason,
-    )
-    print(semi_ar_triton_block_result["status"] + _compile_suffix(semi_ar_triton_block_result["compile_ms"]))
+    print(semi_ar_triton_result["status"] + _compile_suffix(semi_ar_triton_result["compile_ms"]))
 
     print("Measuring causal SDPA via flash_attn...", end=" ", flush=True)
     sdpa_causal_result = _run_impl(
@@ -327,28 +308,15 @@ def run_semi_autoregressive_main(
     )
     print(sdpa_causal_fa2_result["status"] + _compile_suffix(sdpa_causal_fa2_result["compile_ms"]))
 
-    triton_chunk_profile = None
-    triton_block_profile = None
-    if device.type == "cuda" and semi_ar_triton_chunk_result["status"] == "OK":
-        _, triton_chunk_profile = flare_semi_autoregressive_trition(
+    triton_profile = None
+    if device.type == "cuda" and semi_ar_triton_result["status"] == "OK":
+        _, triton_profile = flare_semi_autoregressive_trition(
             Q_flare,
             K_flare,
             V_flare,
             block_size=block_size,
             chunk_size=chunk_size,
             scale=scale,
-            save_chunk_stats=True,
-            profile=True,
-        )
-    if device.type == "cuda" and semi_ar_triton_block_result["status"] == "OK":
-        _, triton_block_profile = flare_semi_autoregressive_trition(
-            Q_flare,
-            K_flare,
-            V_flare,
-            block_size=block_size,
-            chunk_size=chunk_size,
-            scale=scale,
-            save_chunk_stats=False,
             profile=True,
         )
 
@@ -359,8 +327,7 @@ def run_semi_autoregressive_main(
         (flare_ref_result, None),
         (flare_chunk_stats_result, "semi_ar_chunk_stats"),
         (flare_block_stats_result, "semi_ar_block_stats"),
-        (semi_ar_triton_chunk_result, "semi_ar_triton_chunk_stats"),
-        (semi_ar_triton_block_result, "semi_ar_triton_block_stats"),
+        (semi_ar_triton_result, "semi_ar_triton"),
         (sdpa_causal_result, None),
         (sdpa_causal_fa2_result, None),
     ]
@@ -374,19 +341,16 @@ def run_semi_autoregressive_main(
             f"{row['status']}"
         )
 
-    if triton_chunk_profile is not None or triton_block_profile is not None:
-        chunk_forward = triton_chunk_profile.get("forward", {}) if triton_chunk_profile is not None else {}
-        block_forward = triton_block_profile.get("forward", {}) if triton_block_profile is not None else {}
-        kernel_names = sorted(set(chunk_forward.keys()) | set(block_forward.keys()))
+    if triton_profile is not None:
+        forward = triton_profile.get("forward", {})
+        kernel_names = sorted(forward.keys())
         print("\n" + "=" * 96)
-        print(f"{'SemiAutoRegressiveFLARE Forward Kernel':<44} {'Chunk-stats (ms)':<20} {'Block-stats (ms)':<20}")
+        print(f"{'SemiAutoRegressiveFLARE Forward Kernel':<44} {'Time (ms)':<20}")
         print("-" * 96)
         for kernel_name in kernel_names:
-            chunk_ms = chunk_forward.get(kernel_name)
-            block_ms = block_forward.get(kernel_name)
-            chunk_ms_str = f"{chunk_ms:.3f}" if chunk_ms is not None else "N/A"
-            block_ms_str = f"{block_ms:.3f}" if block_ms is not None else "N/A"
-            print(f"{kernel_name:<44} {chunk_ms_str:<20} {block_ms_str:<20}")
+            kernel_ms = forward.get(kernel_name)
+            kernel_ms_str = f"{kernel_ms:.3f}" if kernel_ms is not None else "N/A"
+            print(f"{kernel_name:<44} {kernel_ms_str:<20}")
 
     return
 
