@@ -44,7 +44,7 @@ def _get_semi_ar_forward_config(
         default_num_stages=2,
     )
     prefix_warps, prefix_stages = _resolve_forward_launch(
-        "semi_ar_prefix",
+        "semi_ar_scan",
         default_num_warps=4,
         default_num_stages=2,
     )
@@ -54,7 +54,7 @@ def _get_semi_ar_forward_config(
         default_num_stages=2,
     )
     output_warps, output_stages = _resolve_forward_launch(
-        "semi_ar_output",
+        "semi_ar_output_from_z",
         default_num_warps=4 if block_d <= 32 else 8,
         default_num_stages=2,
     )
@@ -429,7 +429,7 @@ def semi_ar_block_prepare_kernel(
 
 
 @triton.jit
-def semi_ar_block_prefix_kernel(
+def semi_ar_block_scan_kernel(
     BlockMax_ptr,
     BlockDen_ptr,
     BlockNum_ptr,
@@ -636,35 +636,20 @@ def semi_ar_decode_lse_kernel(
 
 
 @triton.jit
-def semi_ar_output_kernel(
-    K_ptr,
-    Q_ptr,
-    V_ptr,
-    QDec_ptr,
-    KDec_ptr,
+def semi_ar_block_z_kernel(
+    BlockMax_ptr,
+    BlockNum_ptr,
     PrefixMax_ptr,
     PrefixNum_ptr,
     LSEEnc_ptr,
-    LSEDec_ptr,
-    O_ptr,
-    stride_k_b,
-    stride_k_n,
-    stride_k_h,
-    stride_k_d,
-    stride_q_h,
-    stride_q_m,
-    stride_q_d,
-    stride_v_b,
-    stride_v_n,
-    stride_v_h,
-    stride_v_d,
-    stride_qdb,
-    stride_qdn,
-    stride_qdh,
-    stride_qdd,
-    stride_kdh,
-    stride_kdm,
-    stride_kdd,
+    ZBlock_ptr,
+    stride_bmax_bh,
+    stride_bmax_blk,
+    stride_bmax_m,
+    stride_bnum_bh,
+    stride_bnum_blk,
+    stride_bnum_m,
+    stride_bnum_d,
     stride_pmax_bh,
     stride_pmax_blk,
     stride_pmax_m,
@@ -675,6 +660,104 @@ def semi_ar_output_kernel(
     stride_lsee_bh,
     stride_lsee_blk,
     stride_lsee_m,
+    stride_z_bh,
+    stride_z_blk,
+    stride_z_m,
+    stride_z_d,
+    BH,
+    M,
+    D_VALUE: tl.constexpr,
+    NUM_BLOCKS,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_bh = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    pid_md = tl.program_id(2)
+    if pid_bh >= BH:
+        return
+
+    num_d_tiles = tl.cdiv(D_VALUE, BLOCK_D)
+    pid_m = pid_md // num_d_tiles
+    pid_d = pid_md - pid_m * num_d_tiles
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_m = m_offsets < M
+    mask_d = d_offsets < D_VALUE
+    mask_md = mask_m[:, None] & mask_d[None, :]
+
+    block_max = tl.load(
+        BlockMax_ptr + pid_bh * stride_bmax_bh + block_idx * stride_bmax_blk + m_offsets * stride_bmax_m,
+        mask=mask_m,
+        other=-float("inf"),
+    ).to(tl.float32)
+    block_num = tl.load(
+        BlockNum_ptr
+        + pid_bh * stride_bnum_bh
+        + block_idx * stride_bnum_blk
+        + m_offsets[:, None] * stride_bnum_m
+        + d_offsets[None, :] * stride_bnum_d,
+        mask=mask_md,
+        other=0.0,
+    ).to(tl.float32)
+    prefix_max = tl.load(
+        PrefixMax_ptr + pid_bh * stride_pmax_bh + block_idx * stride_pmax_blk + m_offsets * stride_pmax_m,
+        mask=mask_m,
+        other=-float("inf"),
+    ).to(tl.float32)
+    prefix_num = tl.load(
+        PrefixNum_ptr
+        + pid_bh * stride_pnum_bh
+        + block_idx * stride_pnum_blk
+        + m_offsets[:, None] * stride_pnum_m
+        + d_offsets[None, :] * stride_pnum_d,
+        mask=mask_md,
+        other=0.0,
+    ).to(tl.float32)
+    lse_enc = tl.load(
+        LSEEnc_ptr + pid_bh * stride_lsee_bh + block_idx * stride_lsee_blk + m_offsets * stride_lsee_m,
+        mask=mask_m,
+        other=-float("inf"),
+    ).to(tl.float32)
+
+    prefix_scale = tl.exp(prefix_max - lse_enc)
+    prefix_scale = tl.where(prefix_max == -float("inf"), 0.0, prefix_scale)
+    block_scale = tl.exp(block_max - lse_enc)
+    block_scale = tl.where(block_max == -float("inf"), 0.0, block_scale)
+    z_md = prefix_num * prefix_scale[:, None] + block_num * block_scale[:, None]
+
+    z_ptr = ZBlock_ptr + pid_bh * stride_z_bh + block_idx * stride_z_blk
+    tl.store(z_ptr + m_offsets[:, None] * stride_z_m + d_offsets[None, :] * stride_z_d, z_md, mask=mask_md)
+
+
+@triton.jit
+def semi_ar_output_from_z_kernel(
+    K_ptr,
+    Q_ptr,
+    QDec_ptr,
+    KDec_ptr,
+    ZBlock_ptr,
+    LSEDec_ptr,
+    O_ptr,
+    stride_k_b,
+    stride_k_n,
+    stride_k_h,
+    stride_k_d,
+    stride_q_h,
+    stride_q_m,
+    stride_q_d,
+    stride_qdb,
+    stride_qdn,
+    stride_qdh,
+    stride_qdd,
+    stride_kdh,
+    stride_kdm,
+    stride_kdd,
+    stride_z_bh,
+    stride_z_blk,
+    stride_z_m,
+    stride_z_d,
     stride_lsed_bh,
     stride_lsed_n,
     stride_o_b,
@@ -720,34 +803,15 @@ def semi_ar_output_kernel(
     mask_d = d_offsets < D_VALUE
     mask_md = mask_m[:, None] & mask_d[None, :]
 
-    prefix_max = tl.load(
-        PrefixMax_ptr + pid_bh * stride_pmax_bh + block_idx * stride_pmax_blk + m_offsets * stride_pmax_m,
-        mask=mask_m,
-        other=-float("inf"),
-    ).to(tl.float32)
-    lse_enc_block = tl.load(
-        LSEEnc_ptr + pid_bh * stride_lsee_bh + block_idx * stride_lsee_blk + m_offsets * stride_lsee_m,
-        mask=mask_m,
-        other=-float("inf"),
-    ).to(tl.float32)
-    prefix_num = tl.load(
-        PrefixNum_ptr
-        + pid_bh * stride_pnum_bh
-        + block_idx * stride_pnum_blk
-        + m_offsets[:, None] * stride_pnum_m
-        + d_offsets[None, :] * stride_pnum_d,
+    z_md = tl.load(
+        ZBlock_ptr
+        + pid_bh * stride_z_bh
+        + block_idx * stride_z_blk
+        + m_offsets[:, None] * stride_z_m
+        + d_offsets[None, :] * stride_z_d,
         mask=mask_md,
         other=0.0,
     ).to(tl.float32)
-
-    # Phase 4 uses the exact same decomposition as the PyTorch reference:
-    #   1. prefix contribution from all previous blocks
-    #   2. exact within-block replay for each source chunk in the current block
-    # The prefix state is stored as a latent-space numerator, so convert it back
-    # into normalized latent values once per (block, M-tile, D-tile).
-    prefix_scale = tl.exp(prefix_max - lse_enc_block)
-    prefix_scale = tl.where(prefix_max == -float("inf"), 0.0, prefix_scale)
-    prefix_value = prefix_num * prefix_scale[:, None]
 
     t0 = 0
     while t0 < CHUNK_SIZE:
@@ -800,72 +864,14 @@ def semi_ar_output_kernel(
         ###
         ### W_DEC[BLOCK_M, BLOCK_T] = EXP(SCORES_DEC[BLOCK_M, BLOCK_T] - LSE_DEC[BLOCK_T])
         ###
-        # W_DEC[t, m] = exp(scores_dec[t, m] - LSE_dec[t]) with shape [T, M].
         w_dec_mt = tl.exp(scores_dec - lse_dec[None, :])
         w_dec_mt = tl.where(mask_m[:, None] & token_mask[None, :], w_dec_mt, 0.0)
         w_dec_tm = tl.trans(w_dec_mt)
 
         ###
-        ### Prefix contrib
-        ### Y[BLOCK_T, BLOCK_D] = W_DEC[BLOCK_T, BLOCK_M] @ SumExpV[BLOCK_M, BLOCK_D]
+        ### Y[BLOCK_T, BLOCK_D] = W_DEC[BLOCK_T, BLOCK_M] @ Z[BLOCK_M, BLOCK_D]
         ###
-        prefix_contrib_td = tl.dot(w_dec_tm, prefix_value, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        y_tile = prefix_contrib_td
-
-        ###
-        ### Loop over all tokens in block to compute full attn for this token tile.
-        ###
-        local_src = 0
-        while local_src < CHUNKS_PER_BLOCK:
-            src_start = block_idx * BLOCK_SIZE + local_src * CHUNK_SIZE
-            src_offsets = tl.arange(0, CHUNK_SIZE)
-            src_idx = src_start + src_offsets
-            src_mask = src_idx < N
-
-            ###
-            ### Compute SCORES_ENC[CHUNK_SIZE, BLOCK_M]
-            ###
-            scores_enc = tl.zeros((CHUNK_SIZE, BLOCK_M), dtype=tl.float32)
-            for k0 in tl.static_range(0, D_SCORE, BLOCK_K):
-                d_k = k0 + tl.arange(0, BLOCK_K)
-                mask_k = d_k < D_SCORE
-                q_bank = tl.load(
-                    Q_ptr + pid_h * stride_q_h + m_offsets[:, None] * stride_q_m + d_k[None, :] * stride_q_d,
-                    mask=mask_m[:, None] & mask_k[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                k_src = tl.load(
-                    K_ptr + pid_b * stride_k_b + src_idx[:, None] * stride_k_n + pid_h * stride_k_h + d_k[None, :] * stride_k_d,
-                    mask=src_mask[:, None] & mask_k[None, :],
-                    other=0.0,
-                ).to(tl.float32)
-                scores_enc += tl.dot(k_src, tl.trans(q_bank), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            scores_enc = scores_enc * scale
-            scores_enc = tl.where(src_mask[:, None] & mask_m[None, :], scores_enc, -float("inf"))
-
-            ###
-            ### W_ENC[BLOCK_M, BLOCK_T] = EXP(SCORES_ENC[BLOCK_M, BLOCK_T] - LSE_ENC[BLOCK_M])
-            ###
-            # W_ENC[m, tau] = exp(scores_enc[m, tau] - LSE_enc_blk[m]) with shape [M, T].
-            w_enc_mt = tl.trans(tl.exp(scores_enc - lse_enc_block[None, :]))
-            w_enc_mt = tl.where(mask_m[:, None] & src_mask[None, :], w_enc_mt, 0.0)
-
-            ###
-            ### W[BLOCK_T, BLOCK_T] = W_DEC[BLOCK_T, BLOCK_M] @ W_ENC[BLOCK_M, BLOCK_T]
-            ###
-            # W_tt = W_DEC @ W_ENC, then Y += W_tt @ V_src.
-            w_tt = tl.dot(w_dec_tm, w_enc_mt, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
-            ###
-            ### Y[BLOCK_T, BLOCK_D] += W[BLOCK_T, BLOCK_T] @ V[BLOCK_T, BLOCK_D]
-            ###
-            v_src = tl.load(
-                V_ptr + pid_b * stride_v_b + src_idx[:, None] * stride_v_n + pid_h * stride_v_h + d_offsets[None, :] * stride_v_d,
-                mask=src_mask[:, None] & mask_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            y_tile += tl.dot(w_tt, v_src, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            local_src += 1
+        y_tile = tl.dot(w_dec_tm, z_md, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
         o_ptr = (
             O_ptr
@@ -1063,7 +1069,7 @@ def _run_semi_ar_block_prepare_phase(
     return block_max, block_den, block_num
 
 
-def _run_semi_ar_prefix_phase(
+def _run_semi_ar_block_scan_phase(
     block_max: torch.Tensor,
     block_den: torch.Tensor,
     block_num: torch.Tensor,
@@ -1085,14 +1091,14 @@ def _run_semi_ar_prefix_phase(
         )
 
     prefix_max, prefix_den, prefix_num, lse_enc = _profiled_call(
-        device, kernel_timings, "alloc_prefix_stats", alloc_prefix_stats
+        device, kernel_timings, "alloc_scan_stats", alloc_prefix_stats
     )
 
     def grid(_meta):
         return (BH, config["NUM_M_TILES"], config["NUM_D_VALUE_BLOCKS"])
 
     def launch():
-        semi_ar_block_prefix_kernel[grid](
+        semi_ar_block_scan_kernel[grid](
             block_max,
             block_den,
             block_num,
@@ -1117,8 +1123,59 @@ def _run_semi_ar_prefix_phase(
             num_stages=config["prefix_num_stages"],
         )
 
-    _profiled_call(device, kernel_timings, "semi_ar_block_prefix", launch)
+    _profiled_call(device, kernel_timings, "semi_ar_block_scan", launch)
     return prefix_max, prefix_den, prefix_num, lse_enc
+
+
+def _run_semi_ar_block_z_phase(
+    block_max: torch.Tensor,
+    block_num: torch.Tensor,
+    prefix_max: torch.Tensor,
+    prefix_num: torch.Tensor,
+    lse_enc: torch.Tensor,
+    *,
+    M: int,
+    D_value: int,
+    config: dict[str, object],
+    kernel_timings: dict[str, float] | None = None,
+):
+    BH = block_max.size(0)
+    device = block_max.device
+
+    def alloc_block_z():
+        return torch.empty((BH, config["NUM_BLOCKS"], M, D_value), device=device, dtype=torch.float32)
+
+    z_block = _profiled_call(device, kernel_timings, "alloc_block_z", alloc_block_z)
+
+    def grid(_meta):
+        return (BH, config["NUM_BLOCKS"], config["NUM_M_TILES"] * config["NUM_D_VALUE_BLOCKS"])
+
+    def launch():
+        semi_ar_block_z_kernel[grid](
+            block_max,
+            block_num,
+            prefix_max,
+            prefix_num,
+            lse_enc,
+            z_block,
+            *block_max.stride(),
+            *block_num.stride(),
+            *prefix_max.stride(),
+            *prefix_num.stride(),
+            *lse_enc.stride(),
+            *z_block.stride(),
+            BH,
+            M,
+            D_value,
+            config["NUM_BLOCKS"],
+            BLOCK_M=config["BLOCK_M"],
+            BLOCK_D=config["BLOCK_D"],
+            num_warps=config["prefix_num_warps"],
+            num_stages=config["prefix_num_stages"],
+        )
+
+    _profiled_call(device, kernel_timings, "semi_ar_block_z", launch)
+    return z_block
 
 
 def _run_semi_ar_decode_lse_phase(
@@ -1176,16 +1233,13 @@ def _run_semi_ar_decode_lse_phase(
     return lse_dec
 
 
-def _run_semi_ar_output_phase(
+def _run_semi_ar_output_from_z_phase(
     Q: torch.Tensor,
     K: torch.Tensor,
-    V: torch.Tensor,
     *,
     Q_dec: torch.Tensor,
     K_dec: torch.Tensor,
-    prefix_max: torch.Tensor,
-    prefix_num: torch.Tensor,
-    lse_enc: torch.Tensor,
+    z_block: torch.Tensor,
     lse_dec: torch.Tensor,
     H: int,
     M: int,
@@ -1211,25 +1265,19 @@ def _run_semi_ar_output_phase(
         return (BH, config["NUM_GLOBAL_CHUNKS"], config["NUM_M_TILES"] * config["NUM_D_VALUE_BLOCKS"])
 
     def launch():
-        semi_ar_output_kernel[grid](
+        semi_ar_output_from_z_kernel[grid](
             K,
             Q,
-            V,
             Q_dec,
             K_dec,
-            prefix_max,
-            prefix_num,
-            lse_enc,
+            z_block,
             lse_dec,
             O,
             *K.stride(),
             *Q.stride(),
-            *V.stride(),
             *Q_dec.stride(),
             *K_dec.stride(),
-            *prefix_max.stride(),
-            *prefix_num.stride(),
-            *lse_enc.stride(),
+            *z_block.stride(),
             *lse_dec.stride(),
             *O.stride(),
             BH,
@@ -1253,7 +1301,7 @@ def _run_semi_ar_output_phase(
             num_stages=config["output_num_stages"],
         )
 
-    _profiled_call(device, kernel_timings, "semi_ar_output", launch)
+    _profiled_call(device, kernel_timings, "semi_ar_output_from_z", launch)
     Y = _profiled_call(device, kernel_timings, "output_cast", lambda: O.to(out_dtype))
     return Y
 
@@ -1338,10 +1386,21 @@ def _semi_autoregressive_forward_triton(
             kernel_timings=timing_bucket,
         )
 
-    prefix_max, prefix_den, prefix_num, lse_enc = _run_semi_ar_prefix_phase(
+    prefix_max, prefix_den, prefix_num, lse_enc = _run_semi_ar_block_scan_phase(
         block_max,
         block_den,
         block_num,
+        M=M,
+        D_value=D_value,
+        config=cfg,
+        kernel_timings=timing_bucket,
+    )
+    z_block = _run_semi_ar_block_z_phase(
+        block_max,
+        block_num,
+        prefix_max,
+        prefix_num,
+        lse_enc,
         M=M,
         D_value=D_value,
         config=cfg,
@@ -1365,15 +1424,12 @@ def _semi_autoregressive_forward_triton(
         kernel_timings=timing_bucket,
     )
 
-    Y = _run_semi_ar_output_phase(
+    Y = _run_semi_ar_output_from_z_phase(
         Q,
         K,
-        V,
         Q_dec=q_dec_tensor,
         K_dec=k_dec_tensor,
-        prefix_max=prefix_max,
-        prefix_num=prefix_num,
-        lse_enc=lse_enc,
+        z_block=z_block,
         lse_dec=lse_dec,
         H=H,
         M=M,
