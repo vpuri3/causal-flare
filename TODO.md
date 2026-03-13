@@ -1,5 +1,9 @@
 # TODO
 
+- [ ] Before publishing the repo, move all nonessential code out of `causal_flare/` and into `benchmark/`, `testing/`, or other non-package support directories so the package only contains essential runtime/user-facing implementation code.
+
+- [ ] Add a Triton reference implementation of block-causal SDPA by modifying the FlashAttention 2 Triton path so we have a non-FlexAttention GPU baseline for strict block upper-triangular masking.
+
 - [ ] Restore heuristic/offline tuning workflow from `72394e2d2a109be2d8464147c17f10b28f423fcc` so normal user execution no longer pays runtime Triton autotune costs, with:
   - [x] inventory current tuning ownership versus `72394e2` across `causal_flare/chunked.py`, `causal_flare/inference.py`, and the benchmark workflow docs; write down which knobs must move back out of runtime autotune.
   - [x] restore heuristic config selection as the default runtime path for chunked training and inference prefill/decode, using narrow promoted bucket rules instead of runtime search.

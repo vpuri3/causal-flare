@@ -5,6 +5,8 @@
 - Before starting opportunistic refactors or side quests, check whether the request aligns with current `TODO.md` priorities.
 
 ## Workflow Expectations
+- This is an experimental repo. Do not write extra code purely to preserve backward compatibility unless the user explicitly asks for it.
+- When the user asks for refactors that move code, prefer moving entire function definitions intact rather than splitting one function across files unless the user explicitly asks for that.
 - For complex tasks, state key assumptions early when behavior, masking semantics, shapes, or numerical expectations are ambiguous.
 - For complex user queries, consider writing a short task list up front so progress and completion status are clear.
 - Prefer the smallest safe change that solves the requested problem; avoid incidental refactors unless they are required for correctness, maintainability, or testability.
