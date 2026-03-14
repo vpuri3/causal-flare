@@ -131,8 +131,7 @@ def run_semi_autoregressive_main(
     from torch.nn.attention import SDPBackend, sdpa_kernel
     from causal_flare.semi_autoregressive import flare_semi_autoregressive_trition
     from causal_flare.semi_autoregressive.reference import (
-        _block_causal_forward_pytorch_block_stats,
-        _block_causal_forward_pytorch_chunk_stats,
+        _block_causal_forward_pytorch,
         semi_autoregressive_flare_reference,
     )
     from testing.suite_runners.common import compute_errors, measure_memory
@@ -251,23 +250,10 @@ def run_semi_autoregressive_main(
     if flare_ref_result["status"] == "OK":
         flare_ref_output = semi_autoregressive_flare_reference(Q_flare, K_flare, V_flare, block_size=block_size, scale=scale)
 
-    print("Measuring semi-AR chunk-stats PyTorch reference...", end=" ", flush=True)
-    flare_chunk_stats_result = _run_impl(
-        "FLARE chunk-stats",
-        lambda: _block_causal_forward_pytorch_chunk_stats(
-            Q_flare, K_flare, V_flare, block_size=block_size, chunk_size=chunk_size, scale=scale
-        ),
-        ref=flare_ref_output,
-        ref_prefix="semi_ar_chunk_stats",
-    )
-    print(flare_chunk_stats_result["status"] + _compile_suffix(flare_chunk_stats_result["compile_ms"]))
-
     print("Measuring semi-AR block-stats PyTorch reference...", end=" ", flush=True)
     flare_block_stats_result = _run_impl(
         "FLARE block-stats",
-        lambda: _block_causal_forward_pytorch_block_stats(
-            Q_flare, K_flare, V_flare, block_size=block_size, chunk_size=chunk_size, scale=scale
-        ),
+        lambda: _block_causal_forward_pytorch(Q_flare, K_flare, V_flare, block_size=block_size, chunk_size=chunk_size, scale=scale),
         ref=flare_ref_output,
         ref_prefix="semi_ar_block_stats",
     )
@@ -325,7 +311,6 @@ def run_semi_autoregressive_main(
     print("-" * 136)
     rows = [
         (flare_ref_result, None),
-        (flare_chunk_stats_result, "semi_ar_chunk_stats"),
         (flare_block_stats_result, "semi_ar_block_stats"),
         (semi_ar_triton_result, "semi_ar_triton"),
         (sdpa_causal_result, None),

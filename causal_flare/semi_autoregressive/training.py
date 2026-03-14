@@ -7,6 +7,95 @@ from causal_flare.autoregressive.training import _profiled_call, _refresh_profil
 from causal_flare.semi_autoregressive.reference import _validate_block_causal_config
 
 
+def _get_semi_ar_forward_bucket_defaults(
+    *,
+    M: int,
+    D_score: int,
+    D_value: int,
+    block_size: int,
+    chunk_size: int,
+) -> dict[str, object]:
+    max_d = max(D_score, D_value)
+    mixed_d = D_score != D_value
+
+    if chunk_size <= 16:
+        block_t = chunk_size
+    elif chunk_size <= 32:
+        block_t = 16
+    elif mixed_d:
+        block_t = 16
+    elif max_d > 64 and M >= 192:
+        block_t = 32
+    else:
+        block_t = min(64, chunk_size)
+
+    if block_size <= 32:
+        return {
+            "block_t": block_t,
+            "prepare_launch": (2, 2),
+            "lse_output_launch": (2, 2),
+        }
+
+    if max_d <= 64:
+        if M > 256:
+            return {
+                "block_t": min(64, chunk_size),
+                "prepare_launch": (8, 2),
+                "lse_output_launch": (4, 3),
+            }
+        if block_size <= 64:
+            return {
+                "block_t": block_t,
+                "prepare_launch": (4, 1),
+                "lse_output_launch": (4, 1),
+            }
+        if block_size > 256:
+            return {
+                "block_t": min(64, chunk_size),
+                "prepare_launch": (8, 2),
+                "lse_output_launch": (4, 1),
+            }
+        return {
+            "prepare_launch": (4, 4),
+            "lse_output_launch": (4, 2),
+            "block_t": block_t,
+        }
+
+    if M > 256:
+        return {
+            "block_t": block_t,
+            "prepare_launch": (8, 2),
+            "lse_output_launch": (4, 3),
+        }
+
+    if mixed_d:
+        return {
+            "block_t": block_t,
+            "prepare_launch": (8, 2) if D_score > D_value else (4, 1),
+            "lse_output_launch": (2, 2) if D_score > D_value else (4, 2),
+        }
+
+    if M >= 256:
+        return {
+            "block_t": block_t,
+            "prepare_launch": (8, 2),
+            "lse_output_launch": (4, 4),
+        }
+
+    if block_size > 128:
+        return {
+            "block_t": block_t,
+            "prepare_launch": (4, 1),
+            "lse_output_launch": (4, 4),
+        }
+
+    return {
+        "block_t": block_t,
+        "prepare_launch": (4, 2),
+        "lse_output_launch": (4, 1),
+    }
+
+
 def _get_semi_ar_forward_config(
     *,
     M: int,
@@ -20,11 +109,18 @@ def _get_semi_ar_forward_config(
     block_m = min(64, max(16, triton.next_power_of_2(M)))
     block_d = min(64, max(16, triton.next_power_of_2(D_value)))
     block_k = min(64, max(16, triton.next_power_of_2(D_score)))
+    bucket_defaults = _get_semi_ar_forward_bucket_defaults(
+        M=M,
+        D_score=D_score,
+        D_value=D_value,
+        block_size=block_size,
+        chunk_size=chunk_size,
+    )
     block_t_env = os.environ.get("FLARE_SEMI_AR_BLOCK_T", "").strip()
     if block_t_env:
         block_t = int(block_t_env)
     else:
-        block_t = min(64, chunk_size)
+        block_t = int(bucket_defaults["block_t"])
     if block_t <= 0 or block_t > chunk_size or chunk_size % block_t != 0:
         raise ValueError(
             "SemiAutoRegressiveFLARE requires BLOCK_T to be a positive divisor of chunk_size. "
@@ -35,8 +131,8 @@ def _get_semi_ar_forward_config(
 
     block_prepare_warps, block_prepare_stages = _resolve_forward_launch(
         "semi_ar_block_prepare",
-        default_num_warps=4,
-        default_num_stages=4,
+        default_num_warps=int(bucket_defaults["prepare_launch"][0]),
+        default_num_stages=int(bucket_defaults["prepare_launch"][1]),
     )
     scan_warps, scan_stages = _resolve_forward_launch(
         "semi_ar_scan",
@@ -55,8 +151,8 @@ def _get_semi_ar_forward_config(
     )
     lse_output_warps, lse_output_stages = _resolve_forward_launch(
         "semi_ar_lse_output",
-        default_num_warps=4,
-        default_num_stages=2,
+        default_num_warps=int(bucket_defaults["lse_output_launch"][0]),
+        default_num_stages=int(bucket_defaults["lse_output_launch"][1]),
     )
 
     return {

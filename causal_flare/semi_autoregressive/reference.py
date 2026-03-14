@@ -61,7 +61,6 @@ def _block_causal_forward_pytorch(
     scale=None,
     Q_dec=None,
     K_dec=None,
-    save_chunk_stats: bool = True,
     return_aux: bool = False,
 ):
     """Reference semi-autoregressive / block-causal forward pass.
@@ -91,10 +90,10 @@ def _block_causal_forward_pytorch(
     #
     # Phase 0: validate shapes, canonicalize decode inputs, and reshape K/V into
     #          block-aligned chunk views.
-    # Phase 1: compute chunk-local encoder statistics for every source chunk inside
-    #          each block. These are the basic chunk summaries the later phases scan.
-    # Phase 2: merge chunk-local summaries into per-block summaries, then prefix-scan
-    #          those block summaries so each block sees all strictly previous blocks.
+    # Phase 1: iterate through source chunks inside each block and reduce them directly
+    #          into one per-block encoder summary.
+    # Phase 2: prefix-scan those block summaries so each block sees all strictly
+    #          previous blocks.
     # Phase 3: finish the encoder and decoder normalizers. For the encoder this means
     #          the full within-block cumulative log-sum-exp. For the decoder this means
     #          one log-sum-exp over the latent axis for each query token chunk.
@@ -153,81 +152,41 @@ def _block_causal_forward_pytorch(
     Vc = Vc  # [B, H, num_blocks, chunks_per_block, chunk_size, D_value]
 
     BHB = B * H
-    if save_chunk_stats:
-        # Phase 1 (large-block regime): materialize chunk-local stats so later phases can
-        # reuse them instead of recomputing. This better models kernels that prefer extra
-        # HBM traffic over repeated chunk replay when blocks contain many chunks.
-        score_chunk = scale * torch.einsum("bhgxcd,hmd->bhgxcm", Kc, Q_f)  # [B, H, num_blocks, chunks_per_block, chunk_size, M]
-        chunk_max = score_chunk.max(dim=4).values.to(stats_dtype)  # [B, H, num_blocks, chunks_per_block, M]
-        chunk_exp = torch.exp(score_chunk - chunk_max.to(compute_dtype).unsqueeze(4))  # [B, H, num_blocks, chunks_per_block, chunk_size, M]
-        chunk_den = chunk_exp.to(stats_dtype).sum(dim=4)  # [B, H, num_blocks, chunks_per_block, M]
-        chunk_num = torch.bmm(
-            chunk_exp.reshape(B * H * num_blocks * chunks_per_block, chunk_size, M).transpose(1, 2),
-            Vc.reshape(B * H * num_blocks * chunks_per_block, chunk_size, D_value),
-        ).reshape(B, H, num_blocks, chunks_per_block, M, D_value)  # [B, H, num_blocks, chunks_per_block, M, D_value]
+    # Chunking is only the internal reduction schedule used to build one encoder summary
+    # per block. The reference stores only block-level summaries.
+    block_max = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
+    block_den = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
+    block_num = torch.empty((B, H, num_blocks, M, D_value), device=Q.device, dtype=compute_dtype)
+    for block_idx in range(num_blocks):
+        max_block = torch.full((B, H, M), -float("inf"), device=Q.device, dtype=stats_dtype)  # [B, H, M]
+        den_block = torch.zeros((B, H, M), device=Q.device, dtype=stats_dtype)  # [B, H, M]
+        num_block = torch.zeros((B, H, M, D_value), device=Q.device, dtype=compute_dtype)  # [B, H, M, D_value]
 
-        # Phase 2 (large-block regime): merge chunk summaries into block summaries, then
-        # scan those block summaries across blocks.
-        block_max = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
-        block_den = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
-        block_num = torch.empty((B, H, num_blocks, M, D_value), device=Q.device, dtype=compute_dtype)
-        for block_idx in range(num_blocks):
-            max_block = torch.full((B, H, M), -float("inf"), device=Q.device, dtype=stats_dtype)  # [B, H, M]
-            den_block = torch.zeros((B, H, M), device=Q.device, dtype=stats_dtype)  # [B, H, M]
-            num_block = torch.zeros((B, H, M, D_value), device=Q.device, dtype=compute_dtype)  # [B, H, M, D_value]
-            for local_chunk in range(chunks_per_block):
-                cm = chunk_max[:, :, block_idx, local_chunk, :]
-                cd = chunk_den[:, :, block_idx, local_chunk, :]
-                cn = chunk_num[:, :, block_idx, local_chunk, :, :]
-                max_new = torch.maximum(max_block, cm)
-                rescale_prev = torch.exp(max_block - max_new)
-                rescale_chunk = torch.exp(cm - max_new)
-                den_block = den_block * rescale_prev + cd * rescale_chunk
-                num_block = (
-                    num_block * rescale_prev.to(compute_dtype).unsqueeze(-1)
-                    + cn * rescale_chunk.to(compute_dtype).unsqueeze(-1)
-                )
-                max_block = max_new
-            block_max[:, :, block_idx, :] = max_block
-            block_den[:, :, block_idx, :] = den_block
-            block_num[:, :, block_idx, :, :] = num_block
-    else:
-        # Phase 1 (small-block regime): chunking is only the internal reduction schedule
-        # used to build one encoder summary per block. A kernel-faithful implementation can
-        # keep chunk-local work on-chip and materialize only block summaries to HBM.
-        block_max = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
-        block_den = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
-        block_num = torch.empty((B, H, num_blocks, M, D_value), device=Q.device, dtype=compute_dtype)
-        for block_idx in range(num_blocks):
-            max_block = torch.full((B, H, M), -float("inf"), device=Q.device, dtype=stats_dtype)  # [B, H, M]
-            den_block = torch.zeros((B, H, M), device=Q.device, dtype=stats_dtype)  # [B, H, M]
-            num_block = torch.zeros((B, H, M, D_value), device=Q.device, dtype=compute_dtype)  # [B, H, M, D_value]
+        for local_chunk in range(chunks_per_block):
+            k_chunk = Kc[:, :, block_idx, local_chunk, :, :]  # [B, H, chunk_size, D_score]
+            v_chunk = Vc[:, :, block_idx, local_chunk, :, :]  # [B, H, chunk_size, D_value]
+            score_chunk = scale * torch.einsum("bhcd,hmd->bhcm", k_chunk, Q_f)  # [B, H, chunk_size, M]
+            chunk_max = score_chunk.max(dim=2).values.to(stats_dtype)  # [B, H, M]
+            chunk_exp = torch.exp(score_chunk - chunk_max.to(compute_dtype).unsqueeze(2))  # [B, H, chunk_size, M]
+            chunk_den = chunk_exp.to(stats_dtype).sum(dim=2)  # [B, H, M]
+            chunk_num = torch.bmm(
+                chunk_exp.reshape(BHB, chunk_size, M).transpose(1, 2),
+                v_chunk.reshape(BHB, chunk_size, D_value),
+            ).reshape(B, H, M, D_value)  # [B, H, M, D_value]
 
-            for local_chunk in range(chunks_per_block):
-                k_chunk = Kc[:, :, block_idx, local_chunk, :, :]  # [B, H, chunk_size, D_score]
-                v_chunk = Vc[:, :, block_idx, local_chunk, :, :]  # [B, H, chunk_size, D_value]
-                score_chunk = scale * torch.einsum("bhcd,hmd->bhcm", k_chunk, Q_f)  # [B, H, chunk_size, M]
-                chunk_max = score_chunk.max(dim=2).values.to(stats_dtype)  # [B, H, M]
-                chunk_exp = torch.exp(score_chunk - chunk_max.to(compute_dtype).unsqueeze(2))  # [B, H, chunk_size, M]
-                chunk_den = chunk_exp.to(stats_dtype).sum(dim=2)  # [B, H, M]
-                chunk_num = torch.bmm(
-                    chunk_exp.reshape(BHB, chunk_size, M).transpose(1, 2),
-                    v_chunk.reshape(BHB, chunk_size, D_value),
-                ).reshape(B, H, M, D_value)  # [B, H, M, D_value]
+            max_new = torch.maximum(max_block, chunk_max)
+            rescale_prev = torch.exp(max_block - max_new)
+            rescale_chunk = torch.exp(chunk_max - max_new)
+            den_block = den_block * rescale_prev + chunk_den * rescale_chunk
+            num_block = (
+                num_block * rescale_prev.to(compute_dtype).unsqueeze(-1)
+                + chunk_num * rescale_chunk.to(compute_dtype).unsqueeze(-1)
+            )
+            max_block = max_new
 
-                max_new = torch.maximum(max_block, chunk_max)
-                rescale_prev = torch.exp(max_block - max_new)
-                rescale_chunk = torch.exp(chunk_max - max_new)
-                den_block = den_block * rescale_prev + chunk_den * rescale_chunk
-                num_block = (
-                    num_block * rescale_prev.to(compute_dtype).unsqueeze(-1)
-                    + chunk_num * rescale_chunk.to(compute_dtype).unsqueeze(-1)
-                )
-                max_block = max_new
-
-            block_max[:, :, block_idx, :] = max_block
-            block_den[:, :, block_idx, :] = den_block
-            block_num[:, :, block_idx, :, :] = num_block
+        block_max[:, :, block_idx, :] = max_block
+        block_den[:, :, block_idx, :] = den_block
+        block_num[:, :, block_idx, :, :] = num_block
 
     # Phase 2: prefix-scan the per-block summaries. This is the first saved-summary level
     # the eventual Triton path would likely write, since block summaries are sufficient to
@@ -264,10 +223,7 @@ def _block_causal_forward_pytorch(
     # Phase 3a: compute all decode-side scores in block/chunk layout, then one logsumexp
     # over the latent axis produces the decoder normalizer for every query token.
     if weight_sharing_enc_dec:
-        if save_chunk_stats:
-            dec_scores = score_chunk  # [B, H, num_blocks, chunks_per_block, chunk_size, M]
-        else:
-            dec_scores = scale * torch.einsum("bhgxcd,hmd->bhgxcm", Kc, Q_f)  # [B, H, num_blocks, chunks_per_block, chunk_size, M]
+        dec_scores = scale * torch.einsum("bhgxcd,hmd->bhgxcm", Kc, Q_f)  # [B, H, num_blocks, chunks_per_block, chunk_size, M]
     else:
         Q_dec_chunks = Q_dec_f.reshape(B, H, num_blocks, chunks_per_block, chunk_size, D_score)
         Kc_dec = K_dec_f.unsqueeze(2).unsqueeze(3).expand(-1, -1, num_blocks, chunks_per_block, -1, -1)
@@ -305,12 +261,9 @@ def _block_causal_forward_pytorch(
 
             y_chunk = torch.einsum("bhcm,bhmd->bhcd", alpha, prefix_value)  # [B, H, chunk_size, D_value]
             for local_src_chunk in range(chunks_per_block):
-                if save_chunk_stats:
-                    enc_scores_chunk = score_chunk[:, :, block_idx, local_src_chunk, :, :]
-                else:
-                    enc_scores_chunk = scale * torch.einsum(
-                        "bhcd,hmd->bhcm", Kc[:, :, block_idx, local_src_chunk, :, :], Q_f
-                    )  # [B, H, chunk_size, M]
+                enc_scores_chunk = scale * torch.einsum(
+                    "bhcd,hmd->bhcm", Kc[:, :, block_idx, local_src_chunk, :, :], Q_f
+                )  # [B, H, chunk_size, M]
                 enc_weights = torch.exp(
                     enc_scores_chunk - lse_enc_block.to(compute_dtype).unsqueeze(2)
                 )  # [B, H, chunk_size, M]
@@ -324,59 +277,7 @@ def _block_causal_forward_pytorch(
     Y = Yc.reshape(B, H, N, D_value).permute(0, 2, 1, 3).to(out_dtype)  # [B, N, H, D_value]
     if not return_aux:
         return Y
-    return Y, {"LSE_dec": LSE_dec, "LSE_enc": LSE_enc, "save_chunk_stats": save_chunk_stats}
-
-
-def _block_causal_forward_pytorch_chunk_stats(
-    Q,
-    K,
-    V,
-    *,
-    block_size,
-    chunk_size,
-    scale=None,
-    Q_dec=None,
-    K_dec=None,
-    return_aux: bool = False,
-):
-    return _block_causal_forward_pytorch(
-        Q,
-        K,
-        V,
-        block_size=block_size,
-        chunk_size=chunk_size,
-        scale=scale,
-        Q_dec=Q_dec,
-        K_dec=K_dec,
-        save_chunk_stats=True,
-        return_aux=return_aux,
-    )
-
-
-def _block_causal_forward_pytorch_block_stats(
-    Q,
-    K,
-    V,
-    *,
-    block_size,
-    chunk_size,
-    scale=None,
-    Q_dec=None,
-    K_dec=None,
-    return_aux: bool = False,
-):
-    return _block_causal_forward_pytorch(
-        Q,
-        K,
-        V,
-        block_size=block_size,
-        chunk_size=chunk_size,
-        scale=scale,
-        Q_dec=Q_dec,
-        K_dec=K_dec,
-        save_chunk_stats=False,
-        return_aux=return_aux,
-    )
+    return Y, {"LSE_dec": LSE_dec, "LSE_enc": LSE_enc}
 
 
 def _benchmark_callable(fn, *, warmup: int, iters: int, device: torch.device):
@@ -447,7 +348,6 @@ def benchmark_block_causal_torch(
     *,
     block_size,
     chunk_size,
-    save_chunk_stats: bool = True,
     scale=None,
     warmup: int = 2,
     iters: int = 5,
@@ -457,9 +357,7 @@ def benchmark_block_causal_torch(
     device = K.device
 
     def run_impl():
-        return _block_causal_forward_pytorch(
-            Q, K, V, block_size=block_size, chunk_size=chunk_size, scale=scale, save_chunk_stats=save_chunk_stats
-        )
+        return _block_causal_forward_pytorch(Q, K, V, block_size=block_size, chunk_size=chunk_size, scale=scale)
 
     y_impl, impl_ms = _benchmark_callable(run_impl, warmup=warmup, iters=iters, device=device)
     results = {

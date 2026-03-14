@@ -112,7 +112,6 @@ def test_block_causal_training_wrapper_matches_reference_on_cuda():
         block_size=block_size,
         chunk_size=chunk_size,
         scale=scale,
-        save_chunk_stats=False,
     )
 
     torch.testing.assert_close(y, y_ref, rtol=2e-2, atol=2e-2)
