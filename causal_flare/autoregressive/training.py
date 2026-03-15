@@ -943,6 +943,7 @@ def flare_chunk_prepare(
 
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
+    RCP_LN2: tl.constexpr = 1.4426950408889634
 
     m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     d_offsets_out = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -985,13 +986,14 @@ def flare_chunk_prepare(
             other=0.0,
         ).to(state_dtype)
         S += tl.dot(k_tile, tl.trans(q_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    S = S * scale  # [C, BM]
+    score_scale = scale * RCP_LN2
+    S = S * score_scale  # [C, BM] in log2 units
     S = tl.where(token_mask[:, None] & mask_m[None, :], S, -float("inf"))
 
     # Compute the chunk-local scalar softmax stats from the fully reduced scores.
     chunk_max = tl.max(S, axis=0)  # [BM]
     chunk_max = tl.where(mask_m, chunk_max, 0.0)
-    expS = tl.exp(S - chunk_max[None, :])
+    expS = tl.math.exp2(S - chunk_max[None, :])
     expS = tl.where(token_mask[:, None] & mask_m[None, :], expS, 0.0)
     expS_dot = expS if USE_FP32_STATS else (expS.to(tl.bfloat16) if USE_BF16 else (expS.to(tl.float16) if USE_FP16 else expS))
     chunk_den = tl.sum(expS, axis=0)  # [BM]
@@ -1095,8 +1097,8 @@ def flare_chunk_prefix(
         # Merge current chunk statistics with prefix state using numerically stable softmax combination
         # This updates prefix_state to include chunks 0 to chunk_idx (for next iteration)
         max_new = tl.maximum(prefix_max_state, chunk_cm)
-        scale_prev = tl.exp((prefix_max_state - max_new).to(tl.float32)).to(state_dtype)
-        scale_chunk = tl.exp((chunk_cm - max_new).to(tl.float32)).to(state_dtype)
+        scale_prev = tl.math.exp2((prefix_max_state - max_new).to(tl.float32)).to(state_dtype)
+        scale_chunk = tl.math.exp2((chunk_cm - max_new).to(tl.float32)).to(state_dtype)
 
         prefix_den_state = (prefix_den_state * scale_prev + chunk_cd * scale_chunk).to(state_dtype)
         prefix_num_state = (prefix_num_state * scale_prev[:, None] + chunk_cs * scale_chunk[:, None]).to(state_dtype)
@@ -1125,6 +1127,8 @@ def flare_chunk_decoder_lse(
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
     chunk_start = chunk_idx * CHUNK_SIZE
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    score_scale = scale * RCP_LN2
 
     m_local = tl.arange(0, BLOCK_M)
     t_local = tl.arange(0, BLOCK_T)
@@ -1164,20 +1168,20 @@ def flare_chunk_decoder_lse(
                 ).to(tl.float32)
                 s_sub += tl.dot(k_dec, tl.trans(q_dec), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
-            s_sub = s_sub * scale
+            s_sub = s_sub * score_scale
             s_sub = tl.where(mask_m[:, None] & token_mask_t[None, :], s_sub, -float("inf"))
             block_max = tl.max(s_sub, axis=0)
             new_max = tl.maximum(lse_max, block_max)
             same_inf = (lse_max == -float("inf")) & (new_max == -float("inf"))
-            rescale_prev = tl.where(same_inf, 1.0, tl.exp(lse_max - new_max))
+            rescale_prev = tl.where(same_inf, 1.0, tl.math.exp2(lse_max - new_max))
             rescale_prev = tl.where(token_mask_t, rescale_prev, 1.0)
-            block_exp = tl.exp(s_sub - new_max[None, :])
+            block_exp = tl.math.exp2(s_sub - new_max[None, :])
             block_exp = tl.where(mask_m[:, None] & token_mask_t[None, :], block_exp, 0.0)
             lse_sum = lse_sum * rescale_prev + tl.sum(block_exp, axis=0)
             lse_max = new_max
             m0 += BLOCK_M
 
-        lse_m = lse_max + tl.log(lse_sum + 1e-20)
+        lse_m = lse_max + tl.math.log2(lse_sum + 1e-20)
         tl.store(
             LSE_dec_ptr + pid_bh * stride_lsed_bh + token_idx * stride_lsed_n,
             lse_m,
@@ -1230,6 +1234,8 @@ def flare_chunk_fwd(
     pid_d = pid_md - pid_m * num_d_blocks
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    score_scale = scale * RCP_LN2
 
     chunk_start = chunk_idx * CHUNK_SIZE
 
@@ -1305,7 +1311,7 @@ def flare_chunk_fwd(
                 other=0.0,
             ).to(tl.float32)
             s_sub += tl.dot(q_k, tl.trans(k_sub), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        s_sub = s_sub * scale
+        s_sub = s_sub * score_scale
         s_sub = tl.where(mask_m[:, None] & token_mask_t[None, :], s_sub, -float("inf"))
         s_sub = tl.where(s_sub == s_sub, s_sub, -float("inf"))
 
@@ -1327,7 +1333,7 @@ def flare_chunk_fwd(
                     other=0.0,
                 ).to(tl.float32)
                 decode_scores += tl.dot(k_dec, tl.trans(q_dec), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            decode_scores = decode_scores * scale
+            decode_scores = decode_scores * score_scale
             decode_scores = tl.where(mask_m[:, None] & token_mask_t[None, :], decode_scores, -float("inf"))
             decode_scores = tl.where(decode_scores == decode_scores, decode_scores, -float("inf"))
 
@@ -1336,7 +1342,7 @@ def flare_chunk_fwd(
             mask=token_mask_t,
             other=0.0,
         ).to(tl.float32)
-        exp_decode_sub = tl.exp(decode_scores - lse_block[None, :])
+        exp_decode_sub = tl.math.exp2(decode_scores - lse_block[None, :])
         exp_decode_sub = tl.where(mask_m[:, None] & token_mask_t[None, :], exp_decode_sub, 0.0)
 
         t_idx = tl.arange(0, BLOCK_T)
@@ -1356,9 +1362,9 @@ def flare_chunk_fwd(
             exp_prev = tl.where(
                 is_m_state_inf & is_m_new_inf,
                 1.0,
-                tl.where(is_m_state_inf, 0.0, tl.exp(m_state - m_new_safe)),
+                tl.where(is_m_state_inf, 0.0, tl.math.exp2(m_state - m_new_safe)),
             )
-            exp_s = tl.where(is_m_new_inf, 0.0, tl.exp(s_t - m_new_safe))
+            exp_s = tl.where(is_m_new_inf, 0.0, tl.math.exp2(s_t - m_new_safe))
 
             v_t = tl.load(
                 V_base_ptr + (t0 + j) * stride_v_n + d_offsets * stride_v_d,
@@ -1379,7 +1385,7 @@ def flare_chunk_fwd(
                 tl.store(o_ptr, o_t, mask=token_valid & mask_d)
             else:
                 tl.atomic_add(o_ptr, o_t, mask=token_valid & mask_d)
-            lse_t = m_state + tl.log(tl.maximum(l_state, 1e-20))
+            lse_t = m_state + tl.math.log2(tl.maximum(l_state, 1e-20))
             tl.store(
                 LSE_enc_ptr
                 + pid_b * stride_lsee_b
@@ -2035,6 +2041,8 @@ def _chunk_decode_score_vec(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    score_scale = scale * RCP_LN2
     a_t = tl.zeros([BLOCK_M], tl.float32)
     for d0 in tl.static_range(0, D_SCORE, BLOCK_K):
         d_offsets = d0 + tl.arange(0, BLOCK_K)
@@ -2050,7 +2058,7 @@ def _chunk_decode_score_vec(
             other=0.0,
         ).to(tl.float32)
         a_t += tl.sum(k_dec * q_dec[None, :], axis=1)
-    return tl.where(mask_m, a_t * scale, -float("inf"))
+    return tl.where(mask_m, a_t * score_scale, -float("inf"))
 
 
 @triton.jit
@@ -2101,6 +2109,8 @@ def flare_chunk_bwd_lse_p_part(
     pid_bh = tl.program_id(0)
     pid_cm = tl.program_id(1)
     pid_d = tl.program_id(2)
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    score_scale = scale * RCP_LN2
 
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
@@ -2171,7 +2181,7 @@ def flare_chunk_bwd_lse_p_part(
                     other=0.0,
                 ).to(tl.float32)
                 s_block += tl.dot(q_tile, tl.trans(k_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            s_block = s_block * scale
+            s_block = s_block * score_scale
             s_block = tl.where(mask_m[:, None] & token_mask_t[None, :], s_block, -float("inf"))
 
             t_idx = tl.arange(0, BLOCK_T)
@@ -2181,8 +2191,8 @@ def flare_chunk_bwd_lse_p_part(
                 s_t = tl.where(token_valid & mask_m, s_t, -float("inf"))
 
                 m_new = tl.maximum(m_run, s_t)
-                alpha = tl.exp(m_run - m_new)
-                beta = tl.exp(s_t - m_new)
+                alpha = tl.math.exp2(m_run - m_new)
+                beta = tl.math.exp2(s_t - m_new)
                 d_new = alpha * d_run + beta
                 inv_d = 1.0 / tl.maximum(d_new, 1e-20)
                 coeff_old = alpha * d_run * inv_d
@@ -2223,7 +2233,11 @@ def flare_chunk_bwd_lse_p_part(
                         )
                 else:
                     dec_score_t = tl.full([BLOCK_M], -float("inf"), tl.float32)
-                g_t = tl.where(token_valid & mask_m, tl.exp(tl.minimum(dec_score_t - lse_dec_t, 0.0)), 0.0)
+                g_t = tl.where(
+                    token_valid & mask_m,
+                    tl.math.exp2(tl.minimum(dec_score_t - lse_dec_t, 0.0)),
+                    0.0,
+                )
                 tl.store(
                     G_ptr + pid_bh * stride_g_bh + (t + j) * stride_g_t + m_offsets * stride_g_m,
                     g_t,
@@ -2443,16 +2457,16 @@ def flare_chunk_bwd_lse_p_part(
                             input_precision=INPUT_PRECISION,
                         )
 
-                s_block_0 = s_block_0 * scale
+                s_block_0 = s_block_0 * score_scale
                 s_block_0 = tl.where(mask_m_sub_0[:, None] & token_mask_t[None, :], s_block_0, -float("inf"))
                 if NUM_REPLAY_TILES > 1:
-                    s_block_1 = s_block_1 * scale
+                    s_block_1 = s_block_1 * score_scale
                     s_block_1 = tl.where(mask_m_sub_1[:, None] & token_mask_t[None, :], s_block_1, -float("inf"))
                 if NUM_REPLAY_TILES > 2:
-                    s_block_2 = s_block_2 * scale
+                    s_block_2 = s_block_2 * score_scale
                     s_block_2 = tl.where(mask_m_sub_2[:, None] & token_mask_t[None, :], s_block_2, -float("inf"))
                 if NUM_REPLAY_TILES > 3:
-                    s_block_3 = s_block_3 * scale
+                    s_block_3 = s_block_3 * score_scale
                     s_block_3 = tl.where(mask_m_sub_3[:, None] & token_mask_t[None, :], s_block_3, -float("inf"))
 
                 for j in tl.static_range(0, BLOCK_T):
@@ -2472,8 +2486,8 @@ def flare_chunk_bwd_lse_p_part(
                     s_t_0 = tl.sum(tl.where(select_j[None, :], s_block_0, 0.0), axis=1)
                     s_t_0 = tl.where(token_valid & mask_m_sub_0, s_t_0, -float("inf"))
                     m_new_0 = tl.maximum(m_run_sub_0, s_t_0)
-                    alpha_0 = tl.exp(m_run_sub_0 - m_new_0)
-                    beta_0 = tl.exp(s_t_0 - m_new_0)
+                    alpha_0 = tl.math.exp2(m_run_sub_0 - m_new_0)
+                    beta_0 = tl.math.exp2(s_t_0 - m_new_0)
                     d_new_0 = alpha_0 * d_run_sub_0 + beta_0
                     inv_d_0 = 1.0 / tl.maximum(d_new_0, 1e-20)
                     coeff_old_0 = alpha_0 * d_run_sub_0 * inv_d_0
@@ -2503,7 +2517,11 @@ def flare_chunk_bwd_lse_p_part(
                             )
                     else:
                         dec_score_0 = tl.full([BLOCK_M_REPLAY], -float("inf"), tl.float32)
-                    g_t_0 = tl.where(token_valid & mask_m_sub_0, tl.exp(tl.minimum(dec_score_0 - lse_dec_t, 0.0)), 0.0)
+                    g_t_0 = tl.where(
+                        token_valid & mask_m_sub_0,
+                        tl.math.exp2(tl.minimum(dec_score_0 - lse_dec_t, 0.0)),
+                        0.0,
+                    )
                     tl.store(
                         G_ptr + pid_bh * stride_g_bh + token_idx * stride_g_t + sub_offsets_0 * stride_g_m,
                         g_t_0,
@@ -2523,8 +2541,8 @@ def flare_chunk_bwd_lse_p_part(
                         s_t_1 = tl.sum(tl.where(select_j[None, :], s_block_1, 0.0), axis=1)
                         s_t_1 = tl.where(token_valid & mask_m_sub_1, s_t_1, -float("inf"))
                         m_new_1 = tl.maximum(m_run_sub_1, s_t_1)
-                        alpha_1 = tl.exp(m_run_sub_1 - m_new_1)
-                        beta_1 = tl.exp(s_t_1 - m_new_1)
+                        alpha_1 = tl.math.exp2(m_run_sub_1 - m_new_1)
+                        beta_1 = tl.math.exp2(s_t_1 - m_new_1)
                         d_new_1 = alpha_1 * d_run_sub_1 + beta_1
                         inv_d_1 = 1.0 / tl.maximum(d_new_1, 1e-20)
                         coeff_old_1 = alpha_1 * d_run_sub_1 * inv_d_1
@@ -2554,7 +2572,11 @@ def flare_chunk_bwd_lse_p_part(
                                 )
                         else:
                             dec_score_1 = tl.full([BLOCK_M_REPLAY], -float("inf"), tl.float32)
-                        g_t_1 = tl.where(token_valid & mask_m_sub_1, tl.exp(tl.minimum(dec_score_1 - lse_dec_t, 0.0)), 0.0)
+                        g_t_1 = tl.where(
+                            token_valid & mask_m_sub_1,
+                            tl.math.exp2(tl.minimum(dec_score_1 - lse_dec_t, 0.0)),
+                            0.0,
+                        )
                         tl.store(
                             G_ptr + pid_bh * stride_g_bh + token_idx * stride_g_t + sub_offsets_1 * stride_g_m,
                             g_t_1,
@@ -2573,8 +2595,8 @@ def flare_chunk_bwd_lse_p_part(
                         s_t_2 = tl.sum(tl.where(select_j[None, :], s_block_2, 0.0), axis=1)
                         s_t_2 = tl.where(token_valid & mask_m_sub_2, s_t_2, -float("inf"))
                         m_new_2 = tl.maximum(m_run_sub_2, s_t_2)
-                        alpha_2 = tl.exp(m_run_sub_2 - m_new_2)
-                        beta_2 = tl.exp(s_t_2 - m_new_2)
+                        alpha_2 = tl.math.exp2(m_run_sub_2 - m_new_2)
+                        beta_2 = tl.math.exp2(s_t_2 - m_new_2)
                         d_new_2 = alpha_2 * d_run_sub_2 + beta_2
                         inv_d_2 = 1.0 / tl.maximum(d_new_2, 1e-20)
                         coeff_old_2 = alpha_2 * d_run_sub_2 * inv_d_2
@@ -2604,7 +2626,11 @@ def flare_chunk_bwd_lse_p_part(
                                 )
                         else:
                             dec_score_2 = tl.full([BLOCK_M_REPLAY], -float("inf"), tl.float32)
-                        g_t_2 = tl.where(token_valid & mask_m_sub_2, tl.exp(tl.minimum(dec_score_2 - lse_dec_t, 0.0)), 0.0)
+                        g_t_2 = tl.where(
+                            token_valid & mask_m_sub_2,
+                            tl.math.exp2(tl.minimum(dec_score_2 - lse_dec_t, 0.0)),
+                            0.0,
+                        )
                         tl.store(
                             G_ptr + pid_bh * stride_g_bh + token_idx * stride_g_t + sub_offsets_2 * stride_g_m,
                             g_t_2,
@@ -2623,8 +2649,8 @@ def flare_chunk_bwd_lse_p_part(
                         s_t_3 = tl.sum(tl.where(select_j[None, :], s_block_3, 0.0), axis=1)
                         s_t_3 = tl.where(token_valid & mask_m_sub_3, s_t_3, -float("inf"))
                         m_new_3 = tl.maximum(m_run_sub_3, s_t_3)
-                        alpha_3 = tl.exp(m_run_sub_3 - m_new_3)
-                        beta_3 = tl.exp(s_t_3 - m_new_3)
+                        alpha_3 = tl.math.exp2(m_run_sub_3 - m_new_3)
+                        beta_3 = tl.math.exp2(s_t_3 - m_new_3)
                         d_new_3 = alpha_3 * d_run_sub_3 + beta_3
                         inv_d_3 = 1.0 / tl.maximum(d_new_3, 1e-20)
                         coeff_old_3 = alpha_3 * d_run_sub_3 * inv_d_3
@@ -2654,7 +2680,11 @@ def flare_chunk_bwd_lse_p_part(
                                 )
                         else:
                             dec_score_3 = tl.full([BLOCK_M_REPLAY], -float("inf"), tl.float32)
-                        g_t_3 = tl.where(token_valid & mask_m_sub_3, tl.exp(tl.minimum(dec_score_3 - lse_dec_t, 0.0)), 0.0)
+                        g_t_3 = tl.where(
+                            token_valid & mask_m_sub_3,
+                            tl.math.exp2(tl.minimum(dec_score_3 - lse_dec_t, 0.0)),
+                            0.0,
+                        )
                         tl.store(
                             G_ptr + pid_bh * stride_g_bh + token_idx * stride_g_t + sub_offsets_3 * stride_g_m,
                             g_t_3,
@@ -2688,11 +2718,11 @@ def flare_chunk_bwd_lse_p_part(
                         other=0.0,
                     ).to(tl.float32)
                     s_t += tl.sum(q_tile * k_tile[None, :], axis=1)
-                s_t = tl.where(mask_m, s_t * scale, -float("inf"))
+                s_t = tl.where(mask_m, s_t * score_scale, -float("inf"))
 
                 m_new = tl.maximum(m_run, s_t)
-                alpha = tl.exp(m_run - m_new)
-                beta = tl.exp(s_t - m_new)
+                alpha = tl.math.exp2(m_run - m_new)
+                beta = tl.math.exp2(s_t - m_new)
                 d_new = alpha * d_run + beta
                 inv_d = 1.0 / tl.maximum(d_new, 1e-20)
                 coeff_old = alpha * d_run * inv_d
@@ -2726,7 +2756,7 @@ def flare_chunk_bwd_lse_p_part(
                         BLOCK_M=BLOCK_M,
                         BLOCK_K=BLOCK_K,
                     )
-                g_t = tl.where(mask_m, tl.exp(tl.minimum(dec_score_t - lse_dec_t, 0.0)), 0.0)
+                g_t = tl.where(mask_m, tl.math.exp2(tl.minimum(dec_score_t - lse_dec_t, 0.0)), 0.0)
                 tl.store(G_ptr + pid_bh * stride_g_bh + t * stride_g_t + m_offsets * stride_g_m, g_t, mask=mask_m)
                 a_t = tl.where(mask_m, coeff_new, 0.0)
                 tl.store(A_ptr + pid_bh * stride_a_bh + t * stride_a_t + m_offsets * stride_a_m, a_t, mask=mask_m)
@@ -3003,7 +3033,6 @@ def flare_chunk_bwd_lse_chunk_summary(
     pid_bh = tl.program_id(0)
     chunk_idx = tl.program_id(1)
     pid_md = tl.program_id(2)
-
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
     pid_m = pid_md // NUM_DV_TILES
@@ -3062,7 +3091,7 @@ def flare_chunk_bwd_lse_chunk_summary(
             # vector in one broadcast instead of a token loop.
             weights = tl.where(
                 mask_m[:, None] & token_valid[None, :],
-                tl.exp(tl.minimum(lse_start[:, None] - lse_curr, 0.0)) * g_block,
+                tl.math.exp2(tl.minimum(lse_start[:, None] - lse_curr, 0.0)) * g_block,
                 0.0,
             )
             if t < chunk_end:
@@ -3071,7 +3100,7 @@ def flare_chunk_bwd_lse_chunk_summary(
                     mask=mask_m,
                     other=0.0,
                 ).to(tl.float32)
-                scale_prefix = tl.exp(tl.minimum(lse_start - lse_boundary, 0.0))
+                scale_prefix = tl.math.exp2(tl.minimum(lse_start - lse_boundary, 0.0))
             else:
                 # The last microblock in the chunk has no intra-chunk future
                 # carry. The incoming local carry is zero on that iteration, so
@@ -3095,7 +3124,7 @@ def flare_chunk_bwd_lse_chunk_summary(
             if (t + 1) < chunk_end:
                 lse_next_ptr = LSE_ptr + pid_b * stride_lse_b + pid_h * stride_lse_h + (t + 1) * stride_lse_n + m_offsets * stride_lse_m
                 lse_next = tl.load(lse_next_ptr, mask=mask_m, other=0.0).to(tl.float32)
-                carry_scale = tl.exp(tl.minimum(lse_curr - lse_next, 0.0))
+                carry_scale = tl.math.exp2(tl.minimum(lse_curr - lse_next, 0.0))
                 b_carry = carry_scale[:, None] * b_carry
                 a_carry = carry_scale * a_carry
 
@@ -3142,7 +3171,7 @@ def flare_chunk_bwd_lse_chunk_summary(
             mask=mask_m,
             other=0.0,
         ).to(tl.float32)
-        scale_out = tl.exp(tl.minimum(lse_start - lse_next, 0.0))
+        scale_out = tl.math.exp2(tl.minimum(lse_start - lse_next, 0.0))
     else:
         scale_out = tl.zeros([BLOCK_M], tl.float32)
     tl.store(
@@ -3264,7 +3293,6 @@ def flare_chunk_bwd_lse_chunk_apply_part(
     pid_bh = tl.program_id(0)
     chunk_idx = tl.program_id(1)
     pid_md = tl.program_id(2)
-
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
     pid_m = pid_md // NUM_DV_TILES
@@ -3342,11 +3370,11 @@ def flare_chunk_bwd_lse_chunk_apply_part(
                 v_j = tl.sum(tl.where(select_j[:, None], v_block, 0.0), axis=0)
 
                 if t < N:
-                    scale_j = tl.exp(tl.minimum(lse_j - lse_boundary, 0.0))
+                    scale_j = tl.math.exp2(tl.minimum(lse_j - lse_boundary, 0.0))
                 else:
                     scale_j = tl.zeros([BLOCK_M], tl.float32)
 
-                weight_j = tl.exp(tl.minimum(lse_j[:, None] - lse_block, 0.0))
+                weight_j = tl.math.exp2(tl.minimum(lse_j[:, None] - lse_block, 0.0))
                 weight_j = tl.where(mask_m[:, None] & token_valid[None, :], weight_j * g_block, 0.0)
                 weight_j = tl.where(t_local[None, :] >= j, weight_j, 0.0)
 
@@ -3380,10 +3408,10 @@ def flare_chunk_bwd_lse_chunk_apply_part(
             select_first = t_local == 0
             lse_first = tl.sum(tl.where(select_first[None, :], lse_block, 0.0), axis=1)
             if t < N:
-                scale_first = tl.exp(tl.minimum(lse_first - lse_boundary, 0.0))
+                scale_first = tl.math.exp2(tl.minimum(lse_first - lse_boundary, 0.0))
             else:
                 scale_first = tl.zeros([BLOCK_M], tl.float32)
-            weight_first = tl.exp(tl.minimum(lse_first[:, None] - lse_block, 0.0))
+            weight_first = tl.math.exp2(tl.minimum(lse_first[:, None] - lse_block, 0.0))
             weight_first = tl.where(mask_m[:, None] & token_valid[None, :], weight_first * g_block, 0.0)
             b_carry = tl.dot(weight_first, u_block, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             b_carry = b_carry + scale_first[:, None] * b_boundary
@@ -3406,7 +3434,7 @@ def flare_chunk_bwd_lse_chunk_apply_part(
             ).to(tl.float32)
 
             if t + 1 < N:
-                carry_scale = tl.exp(tl.minimum(lse_curr - lse_next, 0.0))
+                carry_scale = tl.math.exp2(tl.minimum(lse_curr - lse_next, 0.0))
                 b_carry = carry_scale[:, None] * b_carry
 
             g_t = tl.load(
@@ -3491,7 +3519,6 @@ def flare_chunk_bwd_lse_chunk_apply_finalize(
     pid_bh = tl.program_id(0)
     chunk_idx = tl.program_id(1)
     pid_m = tl.program_id(2)
-
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
     m_start = pid_m * BLOCK_M
@@ -3580,11 +3607,11 @@ def flare_chunk_bwd_lse_chunk_apply_finalize(
                 vb_j = tl.sum(tl.where(select_j[:, None], vb_block, 0.0), axis=0)
 
                 if t < N:
-                    scale_j = tl.exp(tl.minimum(lse_j - lse_boundary, 0.0))
+                    scale_j = tl.math.exp2(tl.minimum(lse_j - lse_boundary, 0.0))
                 else:
                     scale_j = tl.zeros([BLOCK_M], tl.float32)
 
-                weight_j = tl.exp(tl.minimum(lse_j[:, None] - lse_block, 0.0))
+                weight_j = tl.math.exp2(tl.minimum(lse_j[:, None] - lse_block, 0.0))
                 weight_j = tl.where(mask_m[:, None] & token_valid[None, :], weight_j * g_block, 0.0)
                 weight_j = tl.where(t_local[None, :] >= j, weight_j, 0.0)
 
@@ -3624,10 +3651,10 @@ def flare_chunk_bwd_lse_chunk_apply_finalize(
             select_first = t_local == 0
             lse_first = tl.sum(tl.where(select_first[None, :], lse_block, 0.0), axis=1)
             if t < N:
-                scale_first = tl.exp(tl.minimum(lse_first - lse_boundary, 0.0))
+                scale_first = tl.math.exp2(tl.minimum(lse_first - lse_boundary, 0.0))
             else:
                 scale_first = tl.zeros([BLOCK_M], tl.float32)
-            weight_first = tl.exp(tl.minimum(lse_first[:, None] - lse_block, 0.0))
+            weight_first = tl.math.exp2(tl.minimum(lse_first[:, None] - lse_block, 0.0))
             weight_first = tl.where(mask_m[:, None] & token_valid[None, :], weight_first * g_block, 0.0)
             a_carry = tl.sum(weight_first * p_block, axis=1) + scale_first * a_boundary
             t = t_start
@@ -3649,7 +3676,7 @@ def flare_chunk_bwd_lse_chunk_apply_finalize(
             ).to(tl.float32)
 
             if t + 1 < N:
-                carry_scale = tl.exp(tl.minimum(lse_curr - lse_next, 0.0))
+                carry_scale = tl.math.exp2(tl.minimum(lse_curr - lse_next, 0.0))
                 a_carry = carry_scale * a_carry
 
             p_local = tl.load(
@@ -3765,7 +3792,6 @@ def flare_chunk_bwd_lse_chunk_apply_fused_single_dv(
     pid_bh = tl.program_id(0)
     chunk_idx = tl.program_id(1)
     pid_m = tl.program_id(2)
-
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
     m_start = pid_m * BLOCK_M
@@ -3855,11 +3881,11 @@ def flare_chunk_bwd_lse_chunk_apply_fused_single_dv(
                     mask=mask_m,
                     other=0.0,
                 ).to(tl.float32)
-                scale_first = tl.exp(tl.minimum(lse_first - lse_boundary, 0.0))
+                scale_first = tl.math.exp2(tl.minimum(lse_first - lse_boundary, 0.0))
             else:
                 scale_first = tl.zeros([BLOCK_M], tl.float32)
 
-            weight_first = tl.exp(tl.minimum(lse_first[:, None] - lse_block, 0.0))
+            weight_first = tl.math.exp2(tl.minimum(lse_first[:, None] - lse_block, 0.0))
             weight_first = tl.where(mask_m[:, None] & token_valid[None, :], weight_first * g_block, 0.0)
             b_first = tl.dot(weight_first, u_block, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             b_first = b_first + scale_first[:, None] * b_boundary
@@ -3923,11 +3949,11 @@ def flare_chunk_bwd_lse_chunk_apply_fused_single_dv(
                 v_j = tl.sum(tl.where(select_j[:, None], v_block, 0.0), axis=0)
 
                 if t < N:
-                    scale_j = tl.exp(tl.minimum(lse_j - lse_boundary, 0.0))
+                    scale_j = tl.math.exp2(tl.minimum(lse_j - lse_boundary, 0.0))
                 else:
                     scale_j = tl.zeros([BLOCK_M], tl.float32)
 
-                weight_j = tl.exp(tl.minimum(lse_j[:, None] - lse_block, 0.0))
+                weight_j = tl.math.exp2(tl.minimum(lse_j[:, None] - lse_block, 0.0))
                 weight_j = tl.where(mask_m[:, None] & token_valid[None, :], weight_j * g_block, 0.0)
                 weight_j = tl.where(t_local[None, :] >= j, weight_j, 0.0)
 
@@ -4043,7 +4069,7 @@ def flare_chunk_bwd_lse_chunk_apply_fused_single_dv(
                 v_t = tl.sum(tl.where(select_j[:, None], v_block, 0.0), axis=0)
 
                 if panel_t + 1 < N:
-                    carry_scale = tl.exp(tl.minimum(lse_curr - lse_next, 0.0))
+                    carry_scale = tl.math.exp2(tl.minimum(lse_curr - lse_next, 0.0))
                     b_carry = carry_scale[:, None] * b_carry
                     a_carry = carry_scale * a_carry
 
@@ -4105,7 +4131,7 @@ def flare_chunk_bwd_lse_chunk_apply_fused_single_dv(
                 other=0.0,
             ).to(tl.float32)
             if t + 1 < N:
-                carry_scale = tl.exp(tl.minimum(lse_curr - lse_next, 0.0))
+                carry_scale = tl.math.exp2(tl.minimum(lse_curr - lse_next, 0.0))
                 b_carry = carry_scale[:, None] * b_carry
                 a_carry = carry_scale * a_carry
 
@@ -4210,7 +4236,6 @@ def flare_chunk_bwd_lse_scan_apply_fused_single_dv(
 ):
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
-
     pid_b = pid_bh // H
     pid_h = pid_bh - pid_b * H
     m_start = pid_m * BLOCK_M
@@ -4248,7 +4273,7 @@ def flare_chunk_bwd_lse_scan_apply_fused_single_dv(
                 other=0.0,
             ).to(tl.float32)
             if t + 1 < N:
-                carry_scale = tl.exp(tl.minimum(lse_curr - lse_next, 0.0))
+                carry_scale = tl.math.exp2(tl.minimum(lse_curr - lse_next, 0.0))
                 b_carry = carry_scale[:, None] * b_carry
                 a_carry = carry_scale * a_carry
 

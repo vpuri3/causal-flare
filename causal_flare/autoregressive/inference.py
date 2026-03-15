@@ -215,12 +215,12 @@ def _merge_flare_stats(
     scale_a = torch.where(
         is_a_inf & is_new_inf,
         torch.ones_like(m_new),
-        torch.where(is_a_inf, torch.zeros_like(m_new), torch.exp(m_a - m_safe)),
+        torch.where(is_a_inf, torch.zeros_like(m_new), torch.exp2(m_a - m_safe)),
     )
     scale_b = torch.where(
         is_b_inf & is_new_inf,
         torch.ones_like(m_new),
-        torch.where(is_b_inf, torch.zeros_like(m_new), torch.exp(m_b - m_safe)),
+        torch.where(is_b_inf, torch.zeros_like(m_new), torch.exp2(m_b - m_safe)),
     )
 
     d_new = d_a * scale_a + d_b * scale_b
@@ -270,12 +270,13 @@ def flare_prefill_pytorch(
     m = st["m"]
     d = st["d"]
     u = st["u"]
+    score_scale = float(scale) * 1.4426950408889634
 
     Y = torch.empty((B, H, T, D_value), device=K.device, dtype=torch.float32)
     for t in range(T):
         k_t = K_f[:, :, t, :]
         v_t = V_f[:, :, t, :]
-        s_t = torch.einsum("bhmd,bhd->bhm", Q_f, k_t) * float(scale)
+        s_t = torch.einsum("bhmd,bhd->bhm", Q_f, k_t) * score_scale
         if attention_mask is not None:
             valid = attention_mask[:, t].to(torch.bool).view(B, 1, 1)
             s_t = torch.where(valid, s_t, torch.full_like(s_t, -float("inf")))
@@ -289,9 +290,9 @@ def flare_prefill_pytorch(
         gamma = torch.where(
             is_m_inf & is_m_new_inf,
             torch.ones_like(m_new),
-            torch.where(is_m_inf, torch.zeros_like(m_new), torch.exp(m - m_new_safe)),
+            torch.where(is_m_inf, torch.zeros_like(m_new), torch.exp2(m - m_new_safe)),
         )
-        eta = torch.where(is_m_new_inf, torch.zeros_like(s_t), torch.exp(s_t - m_new_safe))
+        eta = torch.where(is_m_new_inf, torch.zeros_like(s_t), torch.exp2(s_t - m_new_safe))
 
         d = d * gamma + eta
         u = u * gamma[..., None] + eta[..., None] * v_t[:, :, None, :]
@@ -304,10 +305,13 @@ def flare_prefill_pytorch(
             a_t = s_t
         else:
             q_t_dec = Q_dec_f[:, :, t, :]
-            a_t = torch.einsum("bhd,bhmd->bhm", q_t_dec, K_dec_f) * float(scale)
+            a_t = torch.einsum("bhd,bhmd->bhm", q_t_dec, K_dec_f) * score_scale
 
         s_decode = torch.where(valid, a_t, torch.zeros_like(a_t))
-        alpha = torch.softmax(s_decode, dim=-1) * valid.float()
+        s_max = s_decode.amax(dim=-1, keepdim=True)
+        s_exp = torch.exp2(s_decode - s_max) * valid.float()
+        s_sum = torch.where(s_exp.sum(dim=-1, keepdim=True) > 0, s_exp.sum(dim=-1, keepdim=True), torch.ones_like(s_max))
+        alpha = s_exp / s_sum
         y_t = torch.einsum("bhm,bhmd->bhd", alpha, z_t)
         Y[:, :, t, :] = y_t
 
@@ -382,8 +386,10 @@ def flare_recurrent_step_kernel(
     bh = B * H
     if pid_bh >= bh:
         return
+    RCP_LN2: tl.constexpr = 1.4426950408889634
     b = pid_bh // H
     h = pid_bh - b * H
+    score_scale = scale * RCP_LN2
 
     m_offsets = tl.arange(0, BLOCK_M)
     d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -431,7 +437,7 @@ def flare_recurrent_step_kernel(
         ).to(tl.float32)
         k_k = tl.load(k_base + d_offsets_k * stride_kd, mask=mask_d_k, other=0.0).to(tl.float32)
         s_raw += tl.sum(q_k * k_k[None, :], axis=1)
-    s_raw = s_raw * scale
+    s_raw = s_raw * score_scale
     s_t = tl.where(valid_t & mask_m, s_raw, -float("inf"))
 
     m_new = tl.maximum(m_state, s_t)
@@ -441,9 +447,9 @@ def flare_recurrent_step_kernel(
     gamma = tl.where(
         is_m_state_inf & is_m_new_inf,
         1.0,
-        tl.where(is_m_state_inf, 0.0, tl.exp(m_state - m_new_safe)),
+        tl.where(is_m_state_inf, 0.0, tl.math.exp2(m_state - m_new_safe)),
     )
-    eta = tl.where(is_m_new_inf, 0.0, tl.exp(s_t - m_new_safe))
+    eta = tl.where(is_m_new_inf, 0.0, tl.math.exp2(s_t - m_new_safe))
 
     d_state = d_state * gamma + eta
     u_state = u_state * gamma[:, None] + eta[:, None] * v[None, :]
@@ -466,11 +472,11 @@ def flare_recurrent_step_kernel(
                 other=0.0,
             ).to(tl.float32)
             a_raw += tl.sum(k_dec_k * q_dec_k[None, :], axis=1)
-        a_raw = a_raw * scale
+        a_raw = a_raw * score_scale
 
     s_decode = tl.where(valid_t & mask_m, a_raw, 0.0)
     s_max = tl.max(s_decode, axis=0)
-    s_exp = tl.exp(s_decode - s_max)
+    s_exp = tl.math.exp2(s_decode - s_max)
     s_exp = tl.where(valid_t & mask_m, s_exp, 0.0)
     s_sum = tl.sum(s_exp, axis=0)
     s_sum = tl.where(s_sum > 0, s_sum, 1.0)

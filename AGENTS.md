@@ -6,6 +6,7 @@
 
 ## Workflow Expectations
 - This is an experimental repo. Do not write extra code purely to preserve backward compatibility unless the user explicitly asks for it.
+- Do not treat package-internal helper/state conventions as API boundaries by default. The API boundary that matters unless the user says otherwise is between this package's exported functions and the rest of world (ROW).
 - When the user asks for refactors that move code, prefer moving entire function definitions intact rather than splitting one function across files unless the user explicitly asks for that.
 - For complex tasks, state key assumptions early when behavior, masking semantics, shapes, or numerical expectations are ambiguous.
 - For complex user queries, consider writing a short task list up front so progress and completion status are clear.
