@@ -65,15 +65,7 @@ def test_block_causal_forward_matches_sdpa_reference(
     v = torch.randn((B, seq_len, H, D), dtype=torch.float32)
 
     y_ref = semi_autoregressive_flare_reference(q, k, v, block_size=block_size, scale=scale)
-    y_impl, aux = _block_causal_forward_pytorch(
-        q,
-        k,
-        v,
-        block_size=block_size,
-        chunk_size=chunk_size,
-        scale=scale,
-        return_aux=True,
-    )
+    y_impl, aux = _block_causal_forward_pytorch(q, k, v, block_size=block_size, chunk_size=chunk_size, scale=scale)
 
     assert aux["LSE_dec"].shape == (B, H, seq_len)
     assert aux["LSE_enc"].shape == (B, H, (seq_len + block_size - 1) // block_size, M)
@@ -85,11 +77,11 @@ def test_block_causal_training_wrapper_matches_reference_on_cuda():
     torch.manual_seed(2)
 
     B = 1
-    N = 32
+    N = 128
     H = 2
     M = 16
     D = 16
-    block_size = 16
+    block_size = 64
     chunk_size = 16
     scale = D ** -0.5
 
@@ -97,7 +89,7 @@ def test_block_causal_training_wrapper_matches_reference_on_cuda():
     k = torch.randn((B, N, H, D), device="cuda", dtype=torch.bfloat16)
     v = torch.randn((B, N, H, D), device="cuda", dtype=torch.bfloat16)
 
-    y = flare_semi_autoregressive_trition(
+    y, aux = flare_semi_autoregressive_trition(
         q,
         k,
         v,
@@ -105,7 +97,7 @@ def test_block_causal_training_wrapper_matches_reference_on_cuda():
         chunk_size=chunk_size,
         scale=scale,
     )
-    y_ref = _block_causal_forward_pytorch(
+    y_ref, _ = _block_causal_forward_pytorch(
         q,
         k,
         v,
@@ -115,6 +107,8 @@ def test_block_causal_training_wrapper_matches_reference_on_cuda():
     )
 
     torch.testing.assert_close(y, y_ref, rtol=2e-2, atol=2e-2)
+    assert aux["LSE_dec"].shape == (B, H, N)
+    assert y.dtype == v.dtype
 
 
 def test_block_causal_prefill_wrapper_is_not_implemented():
@@ -152,9 +146,99 @@ def test_block_causal_reference_forward_matches_reference():
     v_ref = torch.randn((B, N, H, D), dtype=torch.float32)
 
     y_ref = semi_autoregressive_flare_reference(q_ref, k_ref, v_ref, block_size=block_size, scale=scale)
-    y_impl = _block_causal_forward_pytorch(q_ref, k_ref, v_ref, block_size=block_size, chunk_size=chunk_size, scale=scale)
+    y_impl, _ = _block_causal_forward_pytorch(
+        q_ref, k_ref, v_ref, block_size=block_size, chunk_size=chunk_size, scale=scale
+    )
 
     torch.testing.assert_close(y_impl, y_ref, rtol=1e-4, atol=1e-5)
+
+
+def test_block_causal_forward_matches_reference_with_separate_decode_weights():
+    torch.manual_seed(4)
+
+    B = 2
+    N = 32
+    H = 2
+    M = 4
+    D = 16
+    block_size = 32
+    chunk_size = 16
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), dtype=torch.float32)
+    k = torch.randn((B, N, H, D), dtype=torch.float32)
+    v = torch.randn((B, N, H, D), dtype=torch.float32)
+    q_dec = torch.randn((B, N, H, D), dtype=torch.float32)
+    k_dec = torch.randn((H, M, D), dtype=torch.float32)
+
+    y_ref = semi_autoregressive_flare_reference(
+        q,
+        k,
+        v,
+        block_size=block_size,
+        scale=scale,
+        Q_dec=q_dec,
+        K_dec=k_dec,
+    )
+    y_impl, aux = _block_causal_forward_pytorch(
+        q,
+        k,
+        v,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+        Q_dec=q_dec,
+        K_dec=k_dec,
+    )
+
+    assert aux["LSE_dec"].shape == (B, H, N)
+    assert aux["LSE_enc"].shape == (B, H, 1, M)
+    torch.testing.assert_close(y_impl, y_ref, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton path")
+def test_block_causal_training_wrapper_matches_reference_on_cuda_with_separate_decode_weights():
+    torch.manual_seed(5)
+
+    B = 1
+    N = 128
+    H = 2
+    M = 16
+    D = 16
+    block_size = 64
+    chunk_size = 16
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((B, N, H, D), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((B, N, H, D), device="cuda", dtype=torch.bfloat16)
+    q_dec = torch.randn((B, N, H, D), device="cuda", dtype=torch.bfloat16)
+    k_dec = torch.randn((H, M, D), device="cuda", dtype=torch.bfloat16)
+
+    y, aux = flare_semi_autoregressive_trition(
+        q,
+        k,
+        v,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+        Q_dec=q_dec,
+        K_dec=k_dec,
+    )
+    y_ref, _ = _block_causal_forward_pytorch(
+        q,
+        k,
+        v,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+        Q_dec=q_dec,
+        K_dec=k_dec,
+    )
+
+    torch.testing.assert_close(y, y_ref, rtol=2e-2, atol=2e-2)
+    assert aux["LSE_dec"].shape == (B, H, N)
+    assert y.dtype == v.dtype
 
 @pytest.mark.skipif(
     os.environ.get("FLARE_RUN_BLOCK_CAUSAL_PERF", "0") != "1" or not torch.cuda.is_available(),
@@ -181,10 +265,11 @@ def test_block_causal_perf_check_block256_chunk128():
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    y = _block_causal_forward_pytorch(q, k, v, block_size=block_size, chunk_size=chunk_size)
+    y, aux = _block_causal_forward_pytorch(q, k, v, block_size=block_size, chunk_size=chunk_size)
     end.record()
     torch.cuda.synchronize()
 
     assert y.shape == (batch_size, num_tokens, num_heads, head_dim)
     assert torch.isfinite(y).all()
+    assert aux["LSE_dec"].shape == (batch_size, num_heads, num_tokens)
     print(f"[block-causal perf] block={block_size} chunk={chunk_size} elapsed_ms={start.elapsed_time(end):.3f}")

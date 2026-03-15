@@ -144,6 +144,8 @@ def run_semi_autoregressive_main(
     Q_flare = torch.randn((H, M, D), device=device, dtype=dtype_obj)
     K_flare = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
     V_flare = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
+    Q_dec_flare = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
+    K_dec_flare = torch.randn((H, M, D), device=device, dtype=dtype_obj)
     Q_sdpa = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
     K_sdpa = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
     V_sdpa = torch.randn((B, N, H, D), device=device, dtype=dtype_obj)
@@ -234,36 +236,100 @@ def run_semi_autoregressive_main(
     def _run_flash_attn(q, k, v, *, is_causal: bool):
         return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=is_causal)
 
+    def _print_profile_table(title: str, profile_data: dict | None):
+        if profile_data is None:
+            return
+        forward = profile_data.get("forward", {})
+        kernel_names = sorted(forward.keys())
+        print("\n" + "=" * 96)
+        print(f"{title:<60} {'Time (ms)':<20}")
+        print("-" * 96)
+        for kernel_name in kernel_names:
+            kernel_ms = forward.get(kernel_name)
+            kernel_ms_str = f"{kernel_ms:.3f}" if kernel_ms is not None else "N/A"
+            print(f"{kernel_name:<60} {kernel_ms_str:<20}")
+
     print(
         f"Testing Semi-Autoregressive FLARE Forward Pass "
         f"(B={B}, H={H}, M={M}, N={N}, D={D}, block_size={block_size}, chunk_size={chunk_size}, dtype={dtype_obj}, device={device})"
     )
 
-    print("Measuring semi-AR FLARE reference...", end=" ", flush=True)
-    flare_ref_result = _run_impl(
-        "FLARE Semi AR Reference",
+    print("Measuring semi-AR FLARE reference (shared decode)...", end=" ", flush=True)
+    flare_ref_shared_result = _run_impl(
+        "FLARE Semi AR Reference (shared decode)",
         lambda: semi_autoregressive_flare_reference(Q_flare, K_flare, V_flare, block_size=block_size, scale=scale),
     )
-    print(flare_ref_result["status"] + _compile_suffix(flare_ref_result["compile_ms"]))
+    print(flare_ref_shared_result["status"] + _compile_suffix(flare_ref_shared_result["compile_ms"]))
 
-    flare_ref_output = None
-    if flare_ref_result["status"] == "OK":
-        flare_ref_output = semi_autoregressive_flare_reference(Q_flare, K_flare, V_flare, block_size=block_size, scale=scale)
+    flare_ref_shared_output = None
+    if flare_ref_shared_result["status"] == "OK":
+        flare_ref_shared_output = semi_autoregressive_flare_reference(
+            Q_flare, K_flare, V_flare, block_size=block_size, scale=scale
+        )
 
-    print("Measuring semi-AR block-stats PyTorch reference...", end=" ", flush=True)
-    flare_block_stats_result = _run_impl(
-        "FLARE block-stats",
-        lambda: _block_causal_forward_pytorch(Q_flare, K_flare, V_flare, block_size=block_size, chunk_size=chunk_size, scale=scale),
-        ref=flare_ref_output,
-        ref_prefix="semi_ar_block_stats",
+    print("Measuring semi-AR FLARE reference (separate decode)...", end=" ", flush=True)
+    flare_ref_separate_result = _run_impl(
+        "FLARE Semi AR Reference (separate decode)",
+        lambda: semi_autoregressive_flare_reference(
+            Q_flare,
+            K_flare,
+            V_flare,
+            block_size=block_size,
+            scale=scale,
+            Q_dec=Q_dec_flare,
+            K_dec=K_dec_flare,
+        ),
     )
-    print(flare_block_stats_result["status"] + _compile_suffix(flare_block_stats_result["compile_ms"]))
+    print(flare_ref_separate_result["status"] + _compile_suffix(flare_ref_separate_result["compile_ms"]))
+
+    flare_ref_separate_output = None
+    if flare_ref_separate_result["status"] == "OK":
+        flare_ref_separate_output = semi_autoregressive_flare_reference(
+            Q_flare,
+            K_flare,
+            V_flare,
+            block_size=block_size,
+            scale=scale,
+            Q_dec=Q_dec_flare,
+            K_dec=K_dec_flare,
+        )
+
+    print("Measuring semi-AR block-stats PyTorch reference (shared decode)...", end=" ", flush=True)
+    flare_block_stats_shared_result = _run_impl(
+        "FLARE block-stats (shared decode)",
+        lambda: _block_causal_forward_pytorch(
+            Q_flare, K_flare, V_flare, block_size=block_size, chunk_size=chunk_size, scale=scale
+        )[0],
+        ref=flare_ref_shared_output,
+        ref_prefix="semi_ar_block_stats_shared",
+    )
+    print(flare_block_stats_shared_result["status"] + _compile_suffix(flare_block_stats_shared_result["compile_ms"]))
+
+    print("Measuring semi-AR block-stats PyTorch reference (separate decode)...", end=" ", flush=True)
+    flare_block_stats_separate_result = _run_impl(
+        "FLARE block-stats (separate decode)",
+        lambda: _block_causal_forward_pytorch(
+            Q_flare,
+            K_flare,
+            V_flare,
+            block_size=block_size,
+            chunk_size=chunk_size,
+            scale=scale,
+            Q_dec=Q_dec_flare,
+            K_dec=K_dec_flare,
+        )[0],
+        ref=flare_ref_separate_output,
+        ref_prefix="semi_ar_block_stats_separate",
+    )
+    print(
+        flare_block_stats_separate_result["status"] + _compile_suffix(flare_block_stats_separate_result["compile_ms"])
+    )
 
     triton_skip_reason = None if device.type == "cuda" else "requires CUDA"
 
-    print("Measuring SemiAutoRegressiveFLARE Triton...", end=" ", flush=True)
-    semi_ar_triton_result = _run_impl(
-        "SemiAutoRegressiveFLARE Triton",
+    print("Measuring SemiAutoRegressiveFLARE Triton (shared decode)...", end=" ", flush=True)
+    semi_ar_triton_shared_result = _run_impl(
+        "SemiAutoRegressiveFLARE Triton (shared decode)",
         lambda: flare_semi_autoregressive_trition(
             Q_flare,
             K_flare,
@@ -271,12 +337,33 @@ def run_semi_autoregressive_main(
             block_size=block_size,
             chunk_size=chunk_size,
             scale=scale,
-        ),
-        ref=flare_ref_output,
-        ref_prefix="semi_ar_triton",
+        )[0],
+        ref=flare_ref_shared_output,
+        ref_prefix="semi_ar_triton_shared",
         skip_reason=triton_skip_reason,
     )
-    print(semi_ar_triton_result["status"] + _compile_suffix(semi_ar_triton_result["compile_ms"]))
+    print(semi_ar_triton_shared_result["status"] + _compile_suffix(semi_ar_triton_shared_result["compile_ms"]))
+
+    print("Measuring SemiAutoRegressiveFLARE Triton (separate decode)...", end=" ", flush=True)
+    semi_ar_triton_separate_result = _run_impl(
+        "SemiAutoRegressiveFLARE Triton (separate decode)",
+        lambda: flare_semi_autoregressive_trition(
+            Q_flare,
+            K_flare,
+            V_flare,
+            block_size=block_size,
+            chunk_size=chunk_size,
+            scale=scale,
+            Q_dec=Q_dec_flare,
+            K_dec=K_dec_flare,
+        )[0],
+        ref=flare_ref_separate_output,
+        ref_prefix="semi_ar_triton_separate",
+        skip_reason=triton_skip_reason,
+    )
+    print(
+        semi_ar_triton_separate_result["status"] + _compile_suffix(semi_ar_triton_separate_result["compile_ms"])
+    )
 
     print("Measuring causal SDPA via flash_attn...", end=" ", flush=True)
     sdpa_causal_result = _run_impl(
@@ -294,9 +381,9 @@ def run_semi_autoregressive_main(
     )
     print(sdpa_causal_fa2_result["status"] + _compile_suffix(sdpa_causal_fa2_result["compile_ms"]))
 
-    triton_profile = None
-    if device.type == "cuda" and semi_ar_triton_result["status"] == "OK":
-        _, triton_profile = flare_semi_autoregressive_trition(
+    triton_shared_profile = None
+    if device.type == "cuda" and semi_ar_triton_shared_result["status"] == "OK":
+        _, _, triton_shared_profile = flare_semi_autoregressive_trition(
             Q_flare,
             K_flare,
             V_flare,
@@ -305,14 +392,30 @@ def run_semi_autoregressive_main(
             scale=scale,
             profile=True,
         )
+    triton_separate_profile = None
+    if device.type == "cuda" and semi_ar_triton_separate_result["status"] == "OK":
+        _, _, triton_separate_profile = flare_semi_autoregressive_trition(
+            Q_flare,
+            K_flare,
+            V_flare,
+            block_size=block_size,
+            chunk_size=chunk_size,
+            scale=scale,
+            profile=True,
+            Q_dec=Q_dec_flare,
+            K_dec=K_dec_flare,
+        )
 
     print("\n" + "=" * 136)
     print(f"{'Implementation':<42} {'Time (ms)':<12} {'Memory (GB)':<15} {'Abs Err (mean/max)':<22} {'Rel Err (mean/max)':<22} {'Status'}")
     print("-" * 136)
     rows = [
-        (flare_ref_result, None),
-        (flare_block_stats_result, "semi_ar_block_stats"),
-        (semi_ar_triton_result, "semi_ar_triton"),
+        (flare_ref_shared_result, None),
+        (flare_ref_separate_result, None),
+        (flare_block_stats_shared_result, "semi_ar_block_stats_shared"),
+        (flare_block_stats_separate_result, "semi_ar_block_stats_separate"),
+        (semi_ar_triton_shared_result, "semi_ar_triton_shared"),
+        (semi_ar_triton_separate_result, "semi_ar_triton_separate"),
         (sdpa_causal_result, None),
         (sdpa_causal_fa2_result, None),
     ]
@@ -326,16 +429,8 @@ def run_semi_autoregressive_main(
             f"{row['status']}"
         )
 
-    if triton_profile is not None:
-        forward = triton_profile.get("forward", {})
-        kernel_names = sorted(forward.keys())
-        print("\n" + "=" * 96)
-        print(f"{'SemiAutoRegressiveFLARE Forward Kernel':<44} {'Time (ms)':<20}")
-        print("-" * 96)
-        for kernel_name in kernel_names:
-            kernel_ms = forward.get(kernel_name)
-            kernel_ms_str = f"{kernel_ms:.3f}" if kernel_ms is not None else "N/A"
-            print(f"{kernel_name:<44} {kernel_ms_str:<20}")
+    _print_profile_table("SemiAutoRegressiveFLARE Forward Kernel (shared decode)", triton_shared_profile)
+    _print_profile_table("SemiAutoRegressiveFLARE Forward Kernel (separate decode)", triton_separate_profile)
 
     return
 

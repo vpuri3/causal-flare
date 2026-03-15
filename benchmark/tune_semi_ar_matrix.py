@@ -194,11 +194,11 @@ def bench_case(
             block_size=case.block_size,
             chunk_size=case.chunk_size,
             scale=scale,
-        )
+        )[0]
         fn()
         torch.cuda.synchronize()
         total_ms = triton.testing.do_bench(fn, warmup=2, rep=3)
-        _, profile = flare_semi_autoregressive_trition(
+        _, _, profile = flare_semi_autoregressive_trition(
             q,
             k,
             v,
