@@ -9,10 +9,14 @@ import math
 import torch
 
 from causal_flare.semi_autoregressive.training import (
+    _ensure_triton_allocator,
     _get_semi_ar_forward_config,
+    _semi_ar_use_output_host_descriptors,
+    semi_ar_lse_output_desc_kernel,
     semi_ar_lse_output_separate_kernel,
     semi_ar_lse_output_shared_kernel,
 )
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,7 +79,68 @@ def main() -> int:
         return (BH, config["NUM_GLOBAL_CHUNKS"], config["NUM_D_VALUE_BLOCKS"])
 
     def launch() -> None:
-        if args.separate_decoder:
+        use_desc = (
+            _semi_ar_use_output_host_descriptors()
+            and args.M % int(config["BLOCK_M_OUTPUT"]) == 0
+            and args.D % int(config["BLOCK_K"]) == 0
+            and args.D % int(config["BLOCK_D"]) == 0
+        )
+        if use_desc:
+            _ensure_triton_allocator()
+            q_view = (q_dec if args.separate_decoder else K).permute(0, 2, 1, 3)
+            k_view = k_dec if args.separate_decoder else Q
+            o_view = output.permute(0, 2, 1, 3)
+            q_desc = TensorDescriptor(
+                q_view,
+                shape=list(q_view.shape),
+                strides=list(q_view.stride()),
+                block_shape=[1, 1, config["BLOCK_T"], config["BLOCK_K"]],
+            )
+            k_desc = TensorDescriptor(
+                k_view,
+                shape=list(k_view.shape),
+                strides=list(k_view.stride()),
+                block_shape=[1, config["BLOCK_M_OUTPUT"], config["BLOCK_K"]],
+            )
+            z_desc = TensorDescriptor(
+                z_block,
+                shape=list(z_block.shape),
+                strides=list(z_block.stride()),
+                block_shape=[1, 1, config["BLOCK_M_OUTPUT"], config["BLOCK_D"]],
+            )
+            o_desc = TensorDescriptor(
+                o_view,
+                shape=list(o_view.shape),
+                strides=list(o_view.stride()),
+                block_shape=[1, 1, config["BLOCK_T"], config["BLOCK_D"]],
+            )
+            semi_ar_lse_output_desc_kernel[grid](
+                q_desc,
+                k_desc,
+                z_desc,
+                lse_dec,
+                o_desc,
+                *lse_dec.stride(),
+                BH,
+                args.M,
+                args.N,
+                args.D,
+                args.D,
+                scale,
+                config["CHUNKS_PER_BLOCK"],
+                CHUNK_SIZE=config["CHUNK_SIZE"],
+                BLOCK_D=config["BLOCK_D"],
+                BLOCK_K=config["BLOCK_K"],
+                BLOCK_T=config["BLOCK_T"],
+                BLOCK_M_OUTPUT=config["BLOCK_M_OUTPUT"],
+                INPUT_PRECISION=config["input_precision"],
+                USE_BF16_OUTPUT=dtype == torch.bfloat16,
+                USE_FP16_OUTPUT=dtype == torch.float16,
+                H=args.H,
+                num_warps=config["lse_output_num_warps"],
+                num_stages=config["lse_output_num_stages"],
+            )
+        elif args.separate_decoder:
             semi_ar_lse_output_separate_kernel[grid](
                 q_dec,
                 k_dec,
