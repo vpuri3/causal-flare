@@ -27,6 +27,7 @@ def _get_semi_ar_forward_bucket_defaults(
 ) -> dict[str, object]:
     max_d = max(D_score, D_value)
     mixed_d = D_score != D_value
+    block_m_output = min(64, max(16, triton.next_power_of_2(M)))
 
     if chunk_size <= 16:
         block_t = chunk_size
@@ -42,6 +43,7 @@ def _get_semi_ar_forward_bucket_defaults(
     if block_size <= 32:
         return {
             "block_t": block_t,
+            "block_m_output": block_m_output,
             "prepare_launch": (2, 2),
             "lse_output_launch": (2, 2),
         }
@@ -50,34 +52,40 @@ def _get_semi_ar_forward_bucket_defaults(
         if block_size >= 256 and M <= 128 and not mixed_d and chunk_size >= 32:
             if chunk_size >= 128:
                 return {
-                    "block_t": 128,
+                    "block_t": 64,
+                    "block_m_output": 32,
                     "prepare_launch": (4, 3),
-                    "lse_output_launch": (4, 1) if weight_sharing_enc_dec else (4, 2),
+                    "lse_output_launch": (4, 1),
                 }
             return {
                 "block_t": 32,
+                "block_m_output": 32,
                 "prepare_launch": (4, 3),
                 "lse_output_launch": (2, 2),
             }
         if M > 256:
             return {
                 "block_t": min(64, chunk_size),
+                "block_m_output": block_m_output,
                 "prepare_launch": (8, 2),
                 "lse_output_launch": (4, 3),
             }
         if block_size <= 64:
             return {
                 "block_t": block_t,
+                "block_m_output": block_m_output,
                 "prepare_launch": (4, 1),
                 "lse_output_launch": (4, 1),
             }
         if block_size > 256:
             return {
                 "block_t": min(64, chunk_size),
+                "block_m_output": block_m_output,
                 "prepare_launch": (8, 2),
                 "lse_output_launch": (4, 1),
             }
         return {
+            "block_m_output": block_m_output,
             "prepare_launch": (4, 3),
             "lse_output_launch": (4, 2),
             "block_t": block_t,
@@ -86,6 +94,7 @@ def _get_semi_ar_forward_bucket_defaults(
     if M > 256:
         return {
             "block_t": block_t,
+            "block_m_output": block_m_output,
             "prepare_launch": (8, 2),
             "lse_output_launch": (4, 3),
         }
@@ -93,6 +102,7 @@ def _get_semi_ar_forward_bucket_defaults(
     if mixed_d:
         return {
             "block_t": block_t,
+            "block_m_output": block_m_output,
             "prepare_launch": (8, 2) if D_score > D_value else (4, 1),
             "lse_output_launch": (2, 2) if D_score > D_value else (4, 2),
         }
@@ -100,6 +110,7 @@ def _get_semi_ar_forward_bucket_defaults(
     if M >= 256:
         return {
             "block_t": block_t,
+            "block_m_output": block_m_output,
             "prepare_launch": (8, 2),
             "lse_output_launch": (4, 4),
         }
@@ -107,12 +118,14 @@ def _get_semi_ar_forward_bucket_defaults(
     if block_size > 128:
         return {
             "block_t": block_t,
+            "block_m_output": block_m_output,
             "prepare_launch": (4, 1),
             "lse_output_launch": (4, 4),
         }
 
     return {
         "block_t": block_t,
+        "block_m_output": block_m_output,
         "prepare_launch": (4, 2),
         "lse_output_launch": (4, 1),
     }
@@ -132,6 +145,21 @@ def _get_semi_ar_forward_config(
     block_m = min(64, max(16, triton.next_power_of_2(M)))
     block_d = min(64, max(16, triton.next_power_of_2(D_value)))
     block_k = min(64, max(16, triton.next_power_of_2(D_score)))
+    block_m_env = os.environ.get("FLARE_SEMI_AR_BLOCK_M", "").strip()
+    if block_m_env:
+        block_m = int(block_m_env)
+    block_d_env = os.environ.get("FLARE_SEMI_AR_BLOCK_D", "").strip()
+    if block_d_env:
+        block_d = int(block_d_env)
+    block_k_env = os.environ.get("FLARE_SEMI_AR_BLOCK_K", "").strip()
+    if block_k_env:
+        block_k = int(block_k_env)
+    if block_m <= 0 or block_m % 16 != 0:
+        raise ValueError(f"SemiAutoRegressiveFLARE requires BLOCK_M to be a positive multiple of 16. Got {block_m}.")
+    if block_d <= 0 or block_d % 16 != 0:
+        raise ValueError(f"SemiAutoRegressiveFLARE requires BLOCK_D to be a positive multiple of 16. Got {block_d}.")
+    if block_k <= 0 or block_k % 16 != 0:
+        raise ValueError(f"SemiAutoRegressiveFLARE requires BLOCK_K to be a positive multiple of 16. Got {block_k}.")
     block_t_prepare = min(32, chunk_size)
     bucket_defaults = _get_semi_ar_forward_bucket_defaults(
         M=M,
@@ -146,6 +174,15 @@ def _get_semi_ar_forward_config(
         block_t = int(block_t_env)
     else:
         block_t = int(bucket_defaults["block_t"])
+    block_m_output_env = os.environ.get("FLARE_SEMI_AR_BLOCK_M_OUTPUT", "").strip()
+    if block_m_output_env:
+        block_m_output = int(block_m_output_env)
+    else:
+        block_m_output = int(bucket_defaults["block_m_output"])
+    if block_m_output <= 0 or block_m_output % 16 != 0:
+        raise ValueError(
+            f"SemiAutoRegressiveFLARE requires BLOCK_M_OUTPUT to be a positive multiple of 16. Got {block_m_output}."
+        )
     if block_t <= 0 or block_t > chunk_size or chunk_size % block_t != 0:
         raise ValueError(
             "SemiAutoRegressiveFLARE requires BLOCK_T to be a positive divisor of chunk_size. "
@@ -195,6 +232,7 @@ def _get_semi_ar_forward_config(
         "BLOCK_SIZE": block_size,
         "CHUNK_SIZE": chunk_size,
         "BLOCK_M": block_m,
+        "BLOCK_M_OUTPUT": block_m_output,
         "BLOCK_D": block_d,
         "BLOCK_K": block_k,
         "BLOCK_T": block_t,
@@ -211,6 +249,163 @@ def _get_semi_ar_forward_config(
         "lse_output_num_warps": lse_output_warps,
         "lse_output_num_stages": lse_output_stages,
     }
+
+
+@triton.jit
+def _semi_ar_score_dot_full_panel(lhs, rhs, INPUT_PRECISION: tl.constexpr):
+    return tl.dot(lhs, tl.trans(rhs), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+
+
+@triton.jit
+def _semi_ar_make_2d_desc(
+    base,
+    rows,
+    cols,
+    stride_row,
+    stride_col,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    return tl.make_block_ptr(
+        base=base,
+        shape=(rows, cols),
+        strides=(stride_row, stride_col),
+        offsets=(0, 0),
+        block_shape=(BLOCK_ROWS, BLOCK_COLS),
+        order=(1, 0),
+    )
+
+
+@triton.jit
+def _semi_ar_load_q_full_panel(
+    q_base,
+    m_offsets,
+    mask_m,
+    stride_q_m,
+    stride_q_d,
+    D_SCORE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    d_offsets = tl.arange(0, BLOCK_K)
+    return tl.load(
+        q_base + m_offsets[:, None] * stride_q_m + d_offsets[None, :] * stride_q_d,
+        mask=mask_m[:, None] & (d_offsets[None, :] < D_SCORE),
+        other=0.0,
+    )
+
+
+@triton.jit
+def _semi_ar_prepare_score_dot_streamed(
+    q_base,
+    k_desc,
+    k_row_offset,
+    m_offsets,
+    mask_m,
+    stride_q_m,
+    stride_q_d,
+    D_SCORE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_T_PREPARE: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    scores = tl.zeros((BLOCK_T_PREPARE, BLOCK_M), dtype=tl.float32)
+    for k0 in tl.range(0, D_SCORE, BLOCK_K):
+        d_k = k0 + tl.arange(0, BLOCK_K)
+        mask_k = d_k < D_SCORE
+        q_tile = tl.load(
+            q_base + m_offsets[:, None] * stride_q_m + d_k[None, :] * stride_q_d,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+        k_tile = tl.load(tl.advance(k_desc, (k_row_offset, k0)), boundary_check=(0, 1), padding_option="zero")
+        scores += _semi_ar_score_dot_full_panel(k_tile, q_tile, INPUT_PRECISION=INPUT_PRECISION)
+    return scores
+
+
+@triton.jit
+def _semi_ar_output_score_dot_streamed(
+    q_desc,
+    k_desc,
+    q_row_offset,
+    m_row_offset,
+    D_SCORE: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    scores = tl.zeros((BLOCK_T, BLOCK_M), dtype=tl.float32)
+    for k0 in tl.range(0, D_SCORE, BLOCK_K):
+        q_tile = tl.load(tl.advance(q_desc, (q_row_offset, k0)), boundary_check=(0, 1), padding_option="zero")
+        k_tile = tl.load(tl.advance(k_desc, (m_row_offset, k0)), boundary_check=(0, 1), padding_option="zero")
+        scores += _semi_ar_score_dot_full_panel(q_tile, k_tile, INPUT_PRECISION=INPUT_PRECISION)
+    return scores
+
+
+@triton.jit
+def _semi_ar_lse_output_inner(
+    q_desc,
+    k_desc,
+    z_desc,
+    q_row_offset,
+    z_col_offset,
+    token_mask,
+    mask_d,
+    M,
+    score_scale,
+    D_SCORE: tl.constexpr,
+    BLOCK_M_OUTPUT: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    if D_SCORE <= BLOCK_K:
+        q_tile = tl.load(tl.advance(q_desc, (q_row_offset, 0)), boundary_check=(0, 1), padding_option="zero")
+    lse_max = tl.full((BLOCK_T,), -float("inf"), tl.float32)
+    lse_sum = tl.zeros((BLOCK_T,), tl.float32)
+    y_num = tl.zeros((BLOCK_T, BLOCK_D), tl.float32)
+
+    for m0 in tl.range(0, M, BLOCK_M_OUTPUT):
+        m_offsets = m0 + tl.arange(0, BLOCK_M_OUTPUT)
+        mask_m = m_offsets < M
+        if D_SCORE <= BLOCK_K:
+            k_bank = tl.load(tl.advance(k_desc, (m0, 0)), boundary_check=(0, 1), padding_option="zero")
+            scores_dec = _semi_ar_score_dot_full_panel(q_tile, k_bank, INPUT_PRECISION=INPUT_PRECISION)
+        else:
+            scores_dec = _semi_ar_output_score_dot_streamed(
+                q_desc,
+                k_desc,
+                q_row_offset,
+                m0,
+                D_SCORE=D_SCORE,
+                BLOCK_T=BLOCK_T,
+                BLOCK_M=BLOCK_M_OUTPUT,
+                BLOCK_K=BLOCK_K,
+                INPUT_PRECISION=INPUT_PRECISION,
+            )
+        z_md = tl.load(tl.advance(z_desc, (m0, z_col_offset)), boundary_check=(0, 1), padding_option="zero")
+
+        scores_dec = scores_dec * score_scale
+        scores_dec = tl.where(token_mask[:, None] & mask_m[None, :], scores_dec, -float("inf"))
+
+        block_max = tl.max(scores_dec, axis=1)
+        new_max = tl.maximum(lse_max, block_max)
+        new_max_safe = tl.where(new_max == -float("inf"), 0.0, new_max)
+        rescale_prev = tl.where(lse_max == -float("inf"), 0.0, tl.math.exp2(lse_max - new_max_safe))
+        both_inf = new_max == -float("inf")
+        rescale_prev = tl.where(both_inf & (lse_max == -float("inf")), 1.0, rescale_prev)
+        exp_scores = tl.math.exp2(scores_dec - new_max_safe[:, None])
+        exp_scores = tl.where(token_mask[:, None] & mask_m[None, :], exp_scores, 0.0)
+
+        y_num = y_num * rescale_prev[:, None] + tl.dot(
+            exp_scores.to(z_md.dtype), z_md, out_dtype=tl.float32, input_precision=INPUT_PRECISION
+        )
+        lse_sum = lse_sum * rescale_prev + tl.sum(exp_scores, axis=1)
+        lse_max = new_max
+
+    return y_num, lse_sum, lse_max
 
 
 @triton.jit
@@ -291,47 +486,62 @@ def semi_ar_block_prepare_kernel(
     block_den = tl.zeros((BLOCK_M,), tl.float32)
     block_num = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
-    for local_chunk in range(CHUNKS_PER_BLOCK):
+    if D_SCORE <= BLOCK_K:
+        q_full = _semi_ar_load_q_full_panel(
+            q_base,
+            m_offsets,
+            mask_m,
+            stride_q_m,
+            stride_q_d,
+            D_SCORE=D_SCORE,
+            BLOCK_K=BLOCK_K,
+        )
+
+    for local_chunk in tl.range(0, CHUNKS_PER_BLOCK):
         chunk_start = block_start + local_chunk * CHUNK_SIZE
         k_chunk_base = k_block_base + local_chunk * CHUNK_SIZE * stride_k_n
         v_chunk_base = v_block_base + local_chunk * CHUNK_SIZE * stride_v_n
-        t0 = 0
-        while t0 < CHUNK_SIZE:
+        k_desc = _semi_ar_make_2d_desc(
+            k_chunk_base,
+            CHUNK_SIZE,
+            D_SCORE,
+            stride_k_n,
+            stride_k_d,
+            BLOCK_T_PREPARE,
+            BLOCK_K,
+        )
+        v_desc = _semi_ar_make_2d_desc(
+            v_chunk_base,
+            CHUNK_SIZE,
+            D_VALUE,
+            stride_v_n,
+            stride_v_d,
+            BLOCK_T_PREPARE,
+            BLOCK_D,
+        )
+        for t0 in tl.range(0, CHUNK_SIZE, BLOCK_T_PREPARE):
             token_offsets = t0 + tl.arange(0, BLOCK_T_PREPARE)
             token_idx = chunk_start + token_offsets
             token_mask = token_idx < N
-            k_tile_base = tl.make_block_ptr(
-                base=k_chunk_base,
-                shape=(CHUNK_SIZE, D_SCORE),
-                strides=(stride_k_n, stride_k_d),
-                offsets=(t0, 0),
-                block_shape=(BLOCK_T_PREPARE, BLOCK_K),
-                order=(1, 0),
-            )
-            v_tile_ptr = tl.make_block_ptr(
-                base=v_chunk_base,
-                shape=(CHUNK_SIZE, D_VALUE),
-                strides=(stride_v_n, stride_v_d),
-                offsets=(t0, pid_d * BLOCK_D),
-                block_shape=(BLOCK_T_PREPARE, BLOCK_D),
-                order=(1, 0),
-            )
 
-            scores = tl.zeros((BLOCK_T_PREPARE, BLOCK_M), dtype=tl.float32)
-            for k0 in tl.static_range(0, D_SCORE, BLOCK_K):
-                d_k = k0 + tl.arange(0, BLOCK_K)
-                mask_k = d_k < D_SCORE
-                q_tile = tl.load(
-                    q_base + m_offsets[:, None] * stride_q_m + d_k[None, :] * stride_q_d,
-                    mask=mask_m[:, None] & mask_k[None, :],
-                    other=0.0,
+            if D_SCORE <= BLOCK_K:
+                k_tile = tl.load(tl.advance(k_desc, (t0, 0)), boundary_check=(0, 1), padding_option="zero")
+                scores = _semi_ar_score_dot_full_panel(k_tile, q_full, INPUT_PRECISION=INPUT_PRECISION)
+            else:
+                scores = _semi_ar_prepare_score_dot_streamed(
+                    q_base,
+                    k_desc,
+                    t0,
+                    m_offsets,
+                    mask_m,
+                    stride_q_m,
+                    stride_q_d,
+                    D_SCORE=D_SCORE,
+                    BLOCK_K=BLOCK_K,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_T_PREPARE=BLOCK_T_PREPARE,
+                    INPUT_PRECISION=INPUT_PRECISION,
                 )
-                k_tile = tl.load(
-                    tl.advance(k_tile_base, (0, k0)),
-                    boundary_check=(0, 1),
-                    padding_option="zero",
-                )
-                scores += tl.dot(k_tile, tl.trans(q_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             scores = scores * score_scale
             scores = tl.where(token_mask[:, None] & mask_m[None, :], scores, -float("inf"))
 
@@ -340,7 +550,7 @@ def semi_ar_block_prepare_kernel(
             exp_scores = tl.where(token_mask[:, None] & mask_m[None, :], exp_scores, 0.0)
             tile_den = tl.sum(exp_scores, axis=0)
 
-            v_tile = tl.load(v_tile_ptr, boundary_check=(0, 1), padding_option="zero")
+            v_tile = tl.load(tl.advance(v_desc, (t0, pid_d * BLOCK_D)), boundary_check=(0, 1), padding_option="zero")
             tile_num = tl.dot(tl.trans(exp_scores.to(v_tile.dtype)), v_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
             max_new = tl.maximum(block_max, tile_max)
@@ -353,7 +563,6 @@ def semi_ar_block_prepare_kernel(
             block_den = block_den * scale_prev + tile_den * scale_tile
             block_num = block_num * scale_prev[:, None] + tile_num * scale_tile[:, None]
             block_max = max_new
-            t0 += BLOCK_T_PREPARE
 
     bmax_ptr = BlockMax_ptr + pid_bh * stride_bmax_bh + block_idx * stride_bmax_blk
     bden_ptr = BlockDen_ptr + pid_bh * stride_bden_bh + block_idx * stride_bden_blk
@@ -603,6 +812,7 @@ def semi_ar_lse_output_shared_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    BLOCK_M_OUTPUT: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
     H: tl.constexpr,
 ):
@@ -624,67 +834,38 @@ def semi_ar_lse_output_shared_kernel(
     score_scale = scale * RCP_LN2
     q_base = K_ptr + pid_b * stride_k_b + pid_h * stride_k_h
     k_base = Q_ptr + pid_h * stride_q_h
+    q_desc = _semi_ar_make_2d_desc(q_base, N, D_SCORE, stride_k_n, stride_k_d, BLOCK_T, BLOCK_K)
+    k_desc = _semi_ar_make_2d_desc(k_base, M, D_SCORE, stride_q_m, stride_q_d, BLOCK_M_OUTPUT, BLOCK_K)
+    z_desc = _semi_ar_make_2d_desc(
+        ZBlock_ptr + pid_bh * stride_z_bh + block_idx * stride_z_blk,
+        M,
+        D_VALUE,
+        stride_z_m,
+        stride_z_d,
+        BLOCK_M_OUTPUT,
+        BLOCK_D,
+    )
 
-    t0 = 0
-    while t0 < CHUNK_SIZE:
+    for t0 in tl.range(0, CHUNK_SIZE, BLOCK_T):
         token_idx = q_chunk_start + t0 + tl.arange(0, BLOCK_T)
         token_mask = token_idx < N
-        q_tile_ptr = tl.make_block_ptr(
-            base=q_base,
-            shape=(N, D_SCORE),
-            strides=(stride_k_n, stride_k_d),
-            offsets=(q_chunk_start + t0, 0),
-            block_shape=(BLOCK_T, D_SCORE),
-            order=(1, 0),
+        y_num, lse_sum, lse_max = _semi_ar_lse_output_inner(
+            q_desc,
+            k_desc,
+            z_desc,
+            q_chunk_start + t0,
+            pid_d * BLOCK_D,
+            token_mask,
+            mask_d,
+            M,
+            score_scale,
+            D_SCORE=D_SCORE,
+            BLOCK_M_OUTPUT=BLOCK_M_OUTPUT,
+            BLOCK_D=BLOCK_D,
+            BLOCK_K=BLOCK_K,
+            BLOCK_T=BLOCK_T,
+            INPUT_PRECISION=INPUT_PRECISION,
         )
-        q_tile = tl.load(q_tile_ptr, boundary_check=(0, 1), padding_option="zero")
-        lse_max = tl.full((BLOCK_T,), -float("inf"), tl.float32)
-        lse_sum = tl.zeros((BLOCK_T,), tl.float32)
-        y_num = tl.zeros((BLOCK_T, BLOCK_D), tl.float32)
-
-        m0 = 0
-        while m0 < M:
-            m_offsets = m0 + tl.arange(0, BLOCK_M)
-            mask_m = m_offsets < M
-            mask_md = mask_m[:, None] & mask_d[None, :]
-            k_tile_ptr = tl.make_block_ptr(
-                base=k_base,
-                shape=(M, D_SCORE),
-                strides=(stride_q_m, stride_q_d),
-                offsets=(m0, 0),
-                block_shape=(BLOCK_M, D_SCORE),
-                order=(1, 0),
-            )
-            z_tile_ptr = tl.make_block_ptr(
-                base=ZBlock_ptr + pid_bh * stride_z_bh + block_idx * stride_z_blk,
-                shape=(M, D_VALUE),
-                strides=(stride_z_m, stride_z_d),
-                offsets=(m0, pid_d * BLOCK_D),
-                block_shape=(BLOCK_M, BLOCK_D),
-                order=(1, 0),
-            )
-            k_bank = tl.load(k_tile_ptr, boundary_check=(0, 1), padding_option="zero")
-            z_md = tl.load(z_tile_ptr, boundary_check=(0, 1), padding_option="zero")
-
-            scores_dec = tl.dot(q_tile, tl.trans(k_bank), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            scores_dec = scores_dec * score_scale
-            scores_dec = tl.where(token_mask[:, None] & mask_m[None, :], scores_dec, -float("inf"))
-
-            block_max = tl.max(scores_dec, axis=1)
-            new_max = tl.maximum(lse_max, block_max)
-            new_max_safe = tl.where(new_max == -float("inf"), 0.0, new_max)
-            rescale_prev = tl.where(lse_max == -float("inf"), 0.0, tl.math.exp2(lse_max - new_max_safe))
-            both_inf = new_max == -float("inf")
-            rescale_prev = tl.where(both_inf & (lse_max == -float("inf")), 1.0, rescale_prev)
-            exp_scores = tl.math.exp2(scores_dec - new_max_safe[:, None])
-            exp_scores = tl.where(token_mask[:, None] & mask_m[None, :], exp_scores, 0.0)
-
-            y_num = y_num * rescale_prev[:, None] + tl.dot(
-                exp_scores.to(z_md.dtype), z_md, out_dtype=tl.float32, input_precision=INPUT_PRECISION
-            )
-            lse_sum = lse_sum * rescale_prev + tl.sum(exp_scores, axis=1)
-            lse_max = new_max
-            m0 += BLOCK_M
 
         inv_den = 1.0 / tl.where(lse_sum > 0, lse_sum, 1.0)
         y_tile = y_num * inv_den[:, None]
@@ -698,7 +879,6 @@ def semi_ar_lse_output_shared_kernel(
             + d_offsets[None, :] * stride_o_d
         )
         tl.store(o_ptr, y_tile, mask=token_mask[:, None] & mask_d[None, :])
-        t0 += BLOCK_T
 
 
 @triton.jit
@@ -737,6 +917,7 @@ def semi_ar_lse_output_separate_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    BLOCK_M_OUTPUT: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
     H: tl.constexpr,
 ):
@@ -758,67 +939,38 @@ def semi_ar_lse_output_separate_kernel(
     score_scale = scale * RCP_LN2
     q_base = QDec_ptr + pid_b * stride_qdb + pid_h * stride_qdh
     k_base = KDec_ptr + pid_h * stride_kdh
+    q_desc = _semi_ar_make_2d_desc(q_base, N, D_SCORE, stride_qdn, stride_qdd, BLOCK_T, BLOCK_K)
+    k_desc = _semi_ar_make_2d_desc(k_base, M, D_SCORE, stride_kdm, stride_kdd, BLOCK_M_OUTPUT, BLOCK_K)
+    z_desc = _semi_ar_make_2d_desc(
+        ZBlock_ptr + pid_bh * stride_z_bh + block_idx * stride_z_blk,
+        M,
+        D_VALUE,
+        stride_z_m,
+        stride_z_d,
+        BLOCK_M_OUTPUT,
+        BLOCK_D,
+    )
 
-    t0 = 0
-    while t0 < CHUNK_SIZE:
+    for t0 in tl.range(0, CHUNK_SIZE, BLOCK_T):
         token_idx = q_chunk_start + t0 + tl.arange(0, BLOCK_T)
         token_mask = token_idx < N
-        q_tile_ptr = tl.make_block_ptr(
-            base=q_base,
-            shape=(N, D_SCORE),
-            strides=(stride_qdn, stride_qdd),
-            offsets=(q_chunk_start + t0, 0),
-            block_shape=(BLOCK_T, D_SCORE),
-            order=(1, 0),
+        y_num, lse_sum, lse_max = _semi_ar_lse_output_inner(
+            q_desc,
+            k_desc,
+            z_desc,
+            q_chunk_start + t0,
+            pid_d * BLOCK_D,
+            token_mask,
+            mask_d,
+            M,
+            score_scale,
+            D_SCORE=D_SCORE,
+            BLOCK_M_OUTPUT=BLOCK_M_OUTPUT,
+            BLOCK_D=BLOCK_D,
+            BLOCK_K=BLOCK_K,
+            BLOCK_T=BLOCK_T,
+            INPUT_PRECISION=INPUT_PRECISION,
         )
-        q_tile = tl.load(q_tile_ptr, boundary_check=(0, 1), padding_option="zero")
-        lse_max = tl.full((BLOCK_T,), -float("inf"), tl.float32)
-        lse_sum = tl.zeros((BLOCK_T,), tl.float32)
-        y_num = tl.zeros((BLOCK_T, BLOCK_D), tl.float32)
-
-        m0 = 0
-        while m0 < M:
-            m_offsets = m0 + tl.arange(0, BLOCK_M)
-            mask_m = m_offsets < M
-            mask_md = mask_m[:, None] & mask_d[None, :]
-            k_tile_ptr = tl.make_block_ptr(
-                base=k_base,
-                shape=(M, D_SCORE),
-                strides=(stride_kdm, stride_kdd),
-                offsets=(m0, 0),
-                block_shape=(BLOCK_M, D_SCORE),
-                order=(1, 0),
-            )
-            z_tile_ptr = tl.make_block_ptr(
-                base=ZBlock_ptr + pid_bh * stride_z_bh + block_idx * stride_z_blk,
-                shape=(M, D_VALUE),
-                strides=(stride_z_m, stride_z_d),
-                offsets=(m0, pid_d * BLOCK_D),
-                block_shape=(BLOCK_M, BLOCK_D),
-                order=(1, 0),
-            )
-            k_bank = tl.load(k_tile_ptr, boundary_check=(0, 1), padding_option="zero")
-            z_md = tl.load(z_tile_ptr, boundary_check=(0, 1), padding_option="zero")
-
-            scores_dec = tl.dot(q_tile, tl.trans(k_bank), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            scores_dec = scores_dec * score_scale
-            scores_dec = tl.where(token_mask[:, None] & mask_m[None, :], scores_dec, -float("inf"))
-
-            block_max = tl.max(scores_dec, axis=1)
-            new_max = tl.maximum(lse_max, block_max)
-            new_max_safe = tl.where(new_max == -float("inf"), 0.0, new_max)
-            rescale_prev = tl.where(lse_max == -float("inf"), 0.0, tl.math.exp2(lse_max - new_max_safe))
-            both_inf = new_max == -float("inf")
-            rescale_prev = tl.where(both_inf & (lse_max == -float("inf")), 1.0, rescale_prev)
-            exp_scores = tl.math.exp2(scores_dec - new_max_safe[:, None])
-            exp_scores = tl.where(token_mask[:, None] & mask_m[None, :], exp_scores, 0.0)
-
-            y_num = y_num * rescale_prev[:, None] + tl.dot(
-                exp_scores.to(z_md.dtype), z_md, out_dtype=tl.float32, input_precision=INPUT_PRECISION
-            )
-            lse_sum = lse_sum * rescale_prev + tl.sum(exp_scores, axis=1)
-            lse_max = new_max
-            m0 += BLOCK_M
 
         inv_den = 1.0 / tl.where(lse_sum > 0, lse_sum, 1.0)
         y_tile = y_num * inv_den[:, None]
@@ -832,7 +984,6 @@ def semi_ar_lse_output_separate_kernel(
             + d_offsets[None, :] * stride_o_d
         )
         tl.store(o_ptr, y_tile, mask=token_mask[:, None] & mask_d[None, :])
-        t0 += BLOCK_T
 
 
 def _run_semi_ar_lse_output_phase(
@@ -891,6 +1042,7 @@ def _run_semi_ar_lse_output_phase(
                 config["CHUNKS_PER_BLOCK"],
                 CHUNK_SIZE=config["CHUNK_SIZE"],
                 BLOCK_M=config["BLOCK_M"],
+                BLOCK_M_OUTPUT=config["BLOCK_M_OUTPUT"],
                 BLOCK_D=config["BLOCK_D"],
                 BLOCK_K=config["BLOCK_K"],
                 BLOCK_T=config["BLOCK_T"],
@@ -921,6 +1073,7 @@ def _run_semi_ar_lse_output_phase(
                 config["CHUNKS_PER_BLOCK"],
                 CHUNK_SIZE=config["CHUNK_SIZE"],
                 BLOCK_M=config["BLOCK_M"],
+                BLOCK_M_OUTPUT=config["BLOCK_M_OUTPUT"],
                 BLOCK_D=config["BLOCK_D"],
                 BLOCK_K=config["BLOCK_K"],
                 BLOCK_T=config["BLOCK_T"],
