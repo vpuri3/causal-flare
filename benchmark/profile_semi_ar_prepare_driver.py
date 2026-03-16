@@ -8,7 +8,14 @@ import math
 
 import torch
 
-from causal_flare.semi_autoregressive.training import _get_semi_ar_forward_config, semi_ar_block_prepare_kernel
+from causal_flare.semi_autoregressive.training import (
+    _ensure_triton_allocator,
+    _get_semi_ar_forward_config,
+    _semi_ar_use_prepare_host_descriptors,
+    semi_ar_block_prepare_desc_kernel,
+    semi_ar_block_prepare_kernel,
+)
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,42 +72,99 @@ def main() -> int:
     def grid(meta):
         return (BH, config["NUM_BLOCKS"], config["NUM_M_TILES"] * config["NUM_D_VALUE_BLOCKS"])
 
-    launcher = semi_ar_block_prepare_kernel[grid]
-
     def launch() -> None:
-        launcher(
-            K,
-            Q,
-            V,
-            block_max,
-            block_den,
-            block_num,
-            *K.stride(),
-            *Q.stride(),
-            *V.stride(),
-            *block_max.stride(),
-            *block_den.stride(),
-            *block_num.stride(),
-            BH,
-            args.M,
-            args.N,
-            args.D,
-            args.D,
-            scale,
-            config["BLOCK_SIZE"],
-            CHUNK_SIZE=config["CHUNK_SIZE"],
-            CHUNKS_PER_BLOCK=config["CHUNKS_PER_BLOCK"],
-            BLOCK_M=config["BLOCK_M"],
-            BLOCK_D=config["BLOCK_D"],
-            BLOCK_K=config["BLOCK_K"],
-            BLOCK_T_PREPARE=config["BLOCK_T_PREPARE"],
-            INPUT_PRECISION=config["input_precision"],
-            USE_BF16_NUM=dtype == torch.bfloat16,
-            USE_FP16_NUM=dtype == torch.float16,
-            H=args.H,
-            num_warps=config["block_prepare_num_warps"],
-            num_stages=config["block_prepare_num_stages"],
+        use_desc = (
+            _semi_ar_use_prepare_host_descriptors()
+            and args.M % int(config["BLOCK_M"]) == 0
+            and args.D % int(config["BLOCK_K"]) == 0
+            and args.D % int(config["BLOCK_D"]) == 0
         )
+        if use_desc:
+            _ensure_triton_allocator()
+            k_view = K.permute(0, 2, 1, 3)
+            v_view = V.permute(0, 2, 1, 3)
+            q_desc = TensorDescriptor(
+                Q,
+                shape=list(Q.shape),
+                strides=list(Q.stride()),
+                block_shape=[1, config["BLOCK_M"], config["BLOCK_K"]],
+            )
+            k_desc = TensorDescriptor(
+                k_view,
+                shape=list(k_view.shape),
+                strides=list(k_view.stride()),
+                block_shape=[1, 1, config["BLOCK_T_PREPARE"], config["BLOCK_K"]],
+            )
+            v_desc = TensorDescriptor(
+                v_view,
+                shape=list(v_view.shape),
+                strides=list(v_view.stride()),
+                block_shape=[1, 1, config["BLOCK_T_PREPARE"], config["BLOCK_D"]],
+            )
+            semi_ar_block_prepare_desc_kernel[grid](
+                k_desc,
+                q_desc,
+                v_desc,
+                block_max,
+                block_den,
+                block_num,
+                *block_max.stride(),
+                *block_den.stride(),
+                *block_num.stride(),
+                BH,
+                args.M,
+                args.N,
+                args.D,
+                args.D,
+                scale,
+                config["BLOCK_SIZE"],
+                CHUNK_SIZE=config["CHUNK_SIZE"],
+                CHUNKS_PER_BLOCK=config["CHUNKS_PER_BLOCK"],
+                BLOCK_M=config["BLOCK_M"],
+                BLOCK_D=config["BLOCK_D"],
+                BLOCK_K=config["BLOCK_K"],
+                BLOCK_T_PREPARE=config["BLOCK_T_PREPARE"],
+                INPUT_PRECISION=config["input_precision"],
+                USE_BF16_NUM=dtype == torch.bfloat16,
+                USE_FP16_NUM=dtype == torch.float16,
+                H=args.H,
+                num_warps=config["block_prepare_num_warps"],
+                num_stages=config["block_prepare_num_stages"],
+            )
+        else:
+            semi_ar_block_prepare_kernel[grid](
+                K,
+                Q,
+                V,
+                block_max,
+                block_den,
+                block_num,
+                *K.stride(),
+                *Q.stride(),
+                *V.stride(),
+                *block_max.stride(),
+                *block_den.stride(),
+                *block_num.stride(),
+                BH,
+                args.M,
+                args.N,
+                args.D,
+                args.D,
+                scale,
+                config["BLOCK_SIZE"],
+                CHUNK_SIZE=config["CHUNK_SIZE"],
+                CHUNKS_PER_BLOCK=config["CHUNKS_PER_BLOCK"],
+                BLOCK_M=config["BLOCK_M"],
+                BLOCK_D=config["BLOCK_D"],
+                BLOCK_K=config["BLOCK_K"],
+                BLOCK_T_PREPARE=config["BLOCK_T_PREPARE"],
+                INPUT_PRECISION=config["input_precision"],
+                USE_BF16_NUM=dtype == torch.bfloat16,
+                USE_FP16_NUM=dtype == torch.float16,
+                H=args.H,
+                num_warps=config["block_prepare_num_warps"],
+                num_stages=config["block_prepare_num_stages"],
+            )
 
     total_launches = args.warmup_launches + args.profile_launches
     for _ in range(total_launches):

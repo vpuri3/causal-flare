@@ -25,13 +25,21 @@ def _semi_ar_supports_host_descriptor() -> bool:
         return False
 
 
-def _semi_ar_use_output_host_descriptors() -> bool:
-    flag = os.environ.get("FLARE_SEMI_AR_OUTPUT_HOST_DESC", "").strip().lower()
+def _semi_ar_use_host_descriptors(env_var: str) -> bool:
+    flag = os.environ.get(env_var, "").strip().lower()
     if flag in {"0", "false", "no", "off"}:
         return False
     if flag in {"1", "true", "yes", "on"}:
         return _semi_ar_supports_host_descriptor()
     return _semi_ar_supports_host_descriptor()
+
+
+def _semi_ar_use_prepare_host_descriptors() -> bool:
+    return _semi_ar_use_host_descriptors("FLARE_SEMI_AR_PREPARE_HOST_DESC")
+
+
+def _semi_ar_use_output_host_descriptors() -> bool:
+    return _semi_ar_use_host_descriptors("FLARE_SEMI_AR_OUTPUT_HOST_DESC")
 
 
 def _ensure_triton_allocator() -> None:
@@ -292,7 +300,6 @@ def _get_semi_ar_forward_config(
 def _semi_ar_score_dot_full_panel(lhs, rhs, INPUT_PRECISION: tl.constexpr):
     return tl.dot(lhs, tl.trans(rhs), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
-
 @triton.jit
 def _semi_ar_make_2d_desc(
     base,
@@ -356,6 +363,28 @@ def _semi_ar_prepare_score_dot_streamed(
             other=0.0,
         )
         k_tile = tl.load(tl.advance(k_desc, (k_row_offset, k0)), boundary_check=(0, 1), padding_option="zero")
+        scores += _semi_ar_score_dot_full_panel(k_tile, q_tile, INPUT_PRECISION=INPUT_PRECISION)
+    return scores
+
+
+@triton.jit
+def _semi_ar_prepare_score_dot_streamed_desc(
+    q_desc,
+    k_desc,
+    pid_b,
+    pid_h,
+    k_row_offset,
+    m_row_offset,
+    D_SCORE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_T_PREPARE: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    scores = tl.zeros((BLOCK_T_PREPARE, BLOCK_M), dtype=tl.float32)
+    for k0 in tl.range(0, D_SCORE, BLOCK_K):
+        q_tile = q_desc.load([pid_h, m_row_offset, k0]).reshape([BLOCK_M, BLOCK_K])
+        k_tile = k_desc.load([pid_b, pid_h, k_row_offset, k0]).reshape([BLOCK_T_PREPARE, BLOCK_K])
         scores += _semi_ar_score_dot_full_panel(k_tile, q_tile, INPUT_PRECISION=INPUT_PRECISION)
     return scores
 
@@ -662,6 +691,136 @@ def semi_ar_block_prepare_kernel(
             scale_tile = tl.where(both_inf & (tile_max == -float("inf")), 1.0, scale_tile)
             block_den = block_den * scale_prev + tile_den * scale_tile
             block_num = block_num * scale_prev[:, None] + tile_num * scale_tile[:, None]
+            block_max = max_new
+
+    bmax_ptr = BlockMax_ptr + pid_bh * stride_bmax_bh + block_idx * stride_bmax_blk
+    bden_ptr = BlockDen_ptr + pid_bh * stride_bden_bh + block_idx * stride_bden_blk
+    bnum_ptr = BlockNum_ptr + pid_bh * stride_bnum_bh + block_idx * stride_bnum_blk
+    tl.store(bmax_ptr + m_offsets * stride_bmax_m, block_max, mask=store_shared & mask_m)
+    tl.store(bden_ptr + m_offsets * stride_bden_m, block_den, mask=store_shared & mask_m)
+    tl.store(
+        bnum_ptr + m_offsets[:, None] * stride_bnum_m + d_offsets[None, :] * stride_bnum_d,
+        block_num.to(num_dtype),
+        mask=mask_md,
+    )
+
+
+@triton.jit
+def semi_ar_block_prepare_desc_kernel(
+    KDesc,
+    QDesc,
+    VDesc,
+    BlockMax_ptr,
+    BlockDen_ptr,
+    BlockNum_ptr,
+    stride_bmax_bh,
+    stride_bmax_blk,
+    stride_bmax_m,
+    stride_bden_bh,
+    stride_bden_blk,
+    stride_bden_m,
+    stride_bnum_bh,
+    stride_bnum_blk,
+    stride_bnum_m,
+    stride_bnum_d,
+    BH,
+    M,
+    N,
+    D_SCORE: tl.constexpr,
+    D_VALUE: tl.constexpr,
+    scale,
+    BLOCK_SIZE,
+    CHUNK_SIZE: tl.constexpr,
+    CHUNKS_PER_BLOCK,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_T_PREPARE: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+    USE_BF16_NUM: tl.constexpr,
+    USE_FP16_NUM: tl.constexpr,
+    H: tl.constexpr,
+):
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    num_dtype: tl.constexpr = tl.bfloat16 if USE_BF16_NUM else (tl.float16 if USE_FP16_NUM else tl.float32)
+    pid_bh = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    pid_md = tl.program_id(2)
+    if pid_bh >= BH:
+        return
+
+    num_d_tiles = tl.cdiv(D_VALUE, BLOCK_D)
+    pid_m = pid_md // num_d_tiles
+    pid_d = pid_md - pid_m * num_d_tiles
+
+    pid_b = pid_bh // H
+    pid_h = pid_bh - pid_b * H
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_m = m_offsets < M
+    mask_d = d_offsets < D_VALUE
+    mask_md = mask_m[:, None] & mask_d[None, :]
+    store_shared = pid_d == 0
+
+    block_start = block_idx * BLOCK_SIZE
+    score_scale = scale * RCP_LN2
+    block_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
+    block_den = tl.zeros((BLOCK_M,), tl.float32)
+    block_num = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+
+    if D_SCORE <= BLOCK_K:
+        q_full = QDesc.load([pid_h, pid_m * BLOCK_M, 0]).reshape([BLOCK_M, BLOCK_K])
+
+    for local_chunk in tl.range(0, CHUNKS_PER_BLOCK):
+        chunk_start = block_start + local_chunk * CHUNK_SIZE
+        for t0 in tl.range(0, CHUNK_SIZE, BLOCK_T_PREPARE):
+            token_offsets = t0 + tl.arange(0, BLOCK_T_PREPARE)
+            token_idx = chunk_start + token_offsets
+            token_mask = token_idx < N
+
+            if D_SCORE <= BLOCK_K:
+                k_tile = KDesc.load([pid_b, pid_h, chunk_start + t0, 0]).reshape([BLOCK_T_PREPARE, BLOCK_K])
+                scores = _semi_ar_score_dot_full_panel(k_tile, q_full, INPUT_PRECISION=INPUT_PRECISION)
+            else:
+                scores = _semi_ar_prepare_score_dot_streamed_desc(
+                    QDesc,
+                    KDesc,
+                    pid_b,
+                    pid_h,
+                    chunk_start + t0,
+                    pid_m * BLOCK_M,
+                    D_SCORE=D_SCORE,
+                    BLOCK_K=BLOCK_K,
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_T_PREPARE=BLOCK_T_PREPARE,
+                    INPUT_PRECISION=INPUT_PRECISION,
+                )
+            scores = scores * score_scale
+            scores = tl.where(token_mask[:, None] & mask_m[None, :], scores, -float("inf"))
+
+            tile_max = tl.max(scores, axis=0)
+            exp_scores = tl.math.exp2(scores - tile_max[None, :])
+            exp_scores = tl.where(token_mask[:, None] & mask_m[None, :], exp_scores, 0.0)
+            tile_den = tl.sum(exp_scores, axis=0)
+
+            v_tile = VDesc.load([pid_b, pid_h, chunk_start + t0, pid_d * BLOCK_D]).reshape([BLOCK_T_PREPARE, BLOCK_D])
+
+            max_new = tl.maximum(block_max, tile_max)
+            max_new_safe = tl.where(max_new == -float("inf"), 0.0, max_new)
+            scale_prev = tl.where(block_max == -float("inf"), 0.0, tl.math.exp2(block_max - max_new_safe))
+            scale_tile = tl.where(tile_max == -float("inf"), 0.0, tl.math.exp2(tile_max - max_new_safe))
+            both_inf = max_new == -float("inf")
+            scale_prev = tl.where(both_inf & (block_max == -float("inf")), 1.0, scale_prev)
+            scale_tile = tl.where(both_inf & (tile_max == -float("inf")), 1.0, scale_tile)
+            block_den = block_den * scale_prev + tile_den * scale_tile
+            tile_num = tl.dot(
+                tl.trans((exp_scores * scale_tile[None, :]).to(v_tile.dtype)),
+                v_tile,
+                out_dtype=tl.float32,
+                input_precision=INPUT_PRECISION,
+            )
+            block_num = block_num * scale_prev[:, None] + tile_num
             block_max = max_new
 
     bmax_ptr = BlockMax_ptr + pid_bh * stride_bmax_bh + block_idx * stride_bmax_blk
@@ -1360,39 +1519,100 @@ def _run_semi_ar_block_prepare_phase(
     def grid(meta):
         return (BH, config["NUM_BLOCKS"], config["NUM_M_TILES"] * config["NUM_D_VALUE_BLOCKS"])
 
-    def launch():
-        semi_ar_block_prepare_kernel[grid](
-            K,
+    use_desc = (
+        _semi_ar_use_prepare_host_descriptors()
+        and M % int(config["BLOCK_M"]) == 0
+        and D_score % int(config["BLOCK_K"]) == 0
+        and D_value % int(config["BLOCK_D"]) == 0
+    )
+
+    if use_desc:
+        _ensure_triton_allocator()
+        k_view = K.permute(0, 2, 1, 3)
+        v_view = V.permute(0, 2, 1, 3)
+        q_desc = TensorDescriptor(
             Q,
-            V,
-            block_max,
-            block_den,
-            block_num,
-            *K.stride(),
-            *Q.stride(),
-            *V.stride(),
-            *block_max.stride(),
-            *block_den.stride(),
-            *block_num.stride(),
-            BH,
-            M,
-            N,
-            D_score,
-            D_value,
-            scale,
-            config["BLOCK_SIZE"],
-            CHUNK_SIZE=config["CHUNK_SIZE"],
-            CHUNKS_PER_BLOCK=config["CHUNKS_PER_BLOCK"],
-            BLOCK_M=config["BLOCK_M"],
-            BLOCK_D=config["BLOCK_D"],
-            BLOCK_K=config["BLOCK_K"],
-            BLOCK_T_PREPARE=config["BLOCK_T_PREPARE"],
-            INPUT_PRECISION=config["input_precision"],
-            **_num_storage_kernel_flags(num_storage_dtype),
-            H=H,
-            num_warps=config["block_prepare_num_warps"],
-            num_stages=config["block_prepare_num_stages"],
+            shape=list(Q.shape),
+            strides=list(Q.stride()),
+            block_shape=[1, int(config["BLOCK_M"]), int(config["BLOCK_K"])],
         )
+        k_desc = TensorDescriptor(
+            k_view,
+            shape=list(k_view.shape),
+            strides=list(k_view.stride()),
+            block_shape=[1, 1, int(config["BLOCK_T_PREPARE"]), int(config["BLOCK_K"])],
+        )
+        v_desc = TensorDescriptor(
+            v_view,
+            shape=list(v_view.shape),
+            strides=list(v_view.stride()),
+            block_shape=[1, 1, int(config["BLOCK_T_PREPARE"]), int(config["BLOCK_D"])],
+        )
+
+        def launch():
+            semi_ar_block_prepare_desc_kernel[grid](
+                k_desc,
+                q_desc,
+                v_desc,
+                block_max,
+                block_den,
+                block_num,
+                *block_max.stride(),
+                *block_den.stride(),
+                *block_num.stride(),
+                BH,
+                M,
+                N,
+                D_score,
+                D_value,
+                scale,
+                config["BLOCK_SIZE"],
+                CHUNK_SIZE=config["CHUNK_SIZE"],
+                CHUNKS_PER_BLOCK=config["CHUNKS_PER_BLOCK"],
+                BLOCK_M=config["BLOCK_M"],
+                BLOCK_D=config["BLOCK_D"],
+                BLOCK_K=config["BLOCK_K"],
+                BLOCK_T_PREPARE=config["BLOCK_T_PREPARE"],
+                INPUT_PRECISION=config["input_precision"],
+                **_num_storage_kernel_flags(num_storage_dtype),
+                H=H,
+                num_warps=config["block_prepare_num_warps"],
+                num_stages=config["block_prepare_num_stages"],
+            )
+    else:
+        def launch():
+            semi_ar_block_prepare_kernel[grid](
+                K,
+                Q,
+                V,
+                block_max,
+                block_den,
+                block_num,
+                *K.stride(),
+                *Q.stride(),
+                *V.stride(),
+                *block_max.stride(),
+                *block_den.stride(),
+                *block_num.stride(),
+                BH,
+                M,
+                N,
+                D_score,
+                D_value,
+                scale,
+                config["BLOCK_SIZE"],
+                CHUNK_SIZE=config["CHUNK_SIZE"],
+                CHUNKS_PER_BLOCK=config["CHUNKS_PER_BLOCK"],
+                BLOCK_M=config["BLOCK_M"],
+                BLOCK_D=config["BLOCK_D"],
+                BLOCK_K=config["BLOCK_K"],
+                BLOCK_T_PREPARE=config["BLOCK_T_PREPARE"],
+                INPUT_PRECISION=config["input_precision"],
+                **_num_storage_kernel_flags(num_storage_dtype),
+                H=H,
+                num_warps=config["block_prepare_num_warps"],
+                num_stages=config["block_prepare_num_stages"],
+            )
 
     _profiled_call(device, kernel_timings, "semi_ar_block_prepare", launch)
     return block_max, block_den, block_num
