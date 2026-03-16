@@ -61,6 +61,7 @@ def _block_causal_forward_pytorch(
     scale=None,
     Q_dec=None,
     K_dec=None,
+    return_aux: bool = False,
 ):
     """Reference semi-autoregressive / block-causal forward pass.
 
@@ -78,7 +79,7 @@ def _block_causal_forward_pytorch(
 
     Returns:
     - `Y`: `[B, N, H, D_value]`
-    - `aux` containing:
+    - If `return_aux=True`, also returns:
       - `LSE_dec`: `[B, H, N]`
       - `LSE_enc`: `[B, H, num_blocks, M]`
     """
@@ -274,6 +275,8 @@ def _block_causal_forward_pytorch(
 
     # Collapse the block/chunk view back to the public [B, N, H, D_value] layout.
     Y = Yc.reshape(B, H, N, D_value).permute(0, 2, 1, 3).to(out_dtype)  # [B, N, H, D_value]
+    if not return_aux:
+        return Y
     return Y, {"LSE_dec": LSE_dec, "LSE_enc": LSE_enc}
 
 
@@ -354,7 +357,7 @@ def benchmark_block_causal_torch(
     device = K.device
 
     def run_impl():
-        return _block_causal_forward_pytorch(Q, K, V, block_size=block_size, chunk_size=chunk_size, scale=scale)[0]
+        return _block_causal_forward_pytorch(Q, K, V, block_size=block_size, chunk_size=chunk_size, scale=scale)
 
     y_impl, impl_ms = _benchmark_callable(run_impl, warmup=warmup, iters=iters, device=device)
     results = {

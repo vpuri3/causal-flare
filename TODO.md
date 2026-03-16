@@ -1,5 +1,16 @@
 # TODO
 
+- [ ] Extremely high priority: port the successful `tl.exp(...) -> tl.math.exp2(... / ln(2))` conversion pattern from `causal_flare/semi_autoregressive/training.py` into `causal_flare/autoregressive/training.py`.
+  - hardcode `LN2 = 0.6931471824645996` and `RCP_LN2 = 1.4426950408889634` inside the relevant Triton kernels.
+  - merge `1 / ln(2)` into attention-score scaling where possible, then use `exp2` consistently for softmax weights and running-max rescaling.
+  - be careful about unit consistency: any saved max/LSE values that remain public or are consumed by other kernels may need conversion back to natural-log units at storage/load boundaries.
+  - this should be one of the first tasks picked up next session.
+
+- [ ] High priority: update the Triton version and migrate relevant kernels to use Triton descriptors and warp-specialize commands.
+  - audit which current kernels can benefit from descriptor-based loads/stores and warp specialization before changing version pins blindly.
+  - add explicit support for Triton warp specialization in the relevant kernels once the version/toolchain constraints are in place.
+  - document any new Triton/CUDA compatibility constraints and required environment updates in the repo setup docs when this lands.
+
 - [ ] Before publishing the repo, move all nonessential code out of `causal_flare/` and into `benchmark/`, `testing/`, or other non-package support directories so the package only contains essential runtime/user-facing implementation code.
 
 - [ ] Add a Triton reference implementation of block-causal SDPA by modifying the FlashAttention 2 Triton path so we have a non-FlexAttention GPU baseline for strict block upper-triangular masking.
@@ -30,6 +41,16 @@
   - a prototype path using `triton.language.associative_scan` for the forward computation where it fits naturally, plus a direct comparison against the current implementation for correctness, numerical stability, and performance.
   - attention to whether this can simplify launch structure, reduce manual scan logic, or improve maintainability, rather than assuming it is automatically faster.
   - a follow-up backward-pass investigation: determine whether the same associative-scan formulation can be applied in `bwd`, and if not, document the exact dependency or reduction pattern that blocks it.
+
+- [ ] High priority: remove `chunk_size` / chunking from `causal_flare/semi_autoregressive/training.py` forward now that it no longer changes forward semantics, with:
+  - verification baseline: today the Triton forward validates `chunk_size`, derives `NUM_GLOBAL_CHUNKS` / `CHUNKS_PER_BLOCK`, and uses it to partition launches/inner loops, but it only saves and consumes block-level summaries (`block_*`, `prefix_*`, `lse_enc`, `z_block`) and does not expose any chunk-level state.
+  - treat this as a forward-only semantic cleanup first: keep the same block-causal math and outputs while replacing chunk-based scheduling with direct block/token tiling inside the prepare and output phases.
+  - collapse config generation so forward launch choices depend on `block_size`, `M`, `D_score`, and `D_value`, not on a public `chunk_size` argument or `BLOCK_T`/`BLOCK_T_PREPARE` divisibility against `chunk_size`.
+  - rewrite the prepare kernels to iterate directly over `BLOCK_SIZE` token rows per block instead of nested `for local_chunk in CHUNKS_PER_BLOCK` plus `for t0 in CHUNK_SIZE`, and remove `CHUNK_SIZE`, `CHUNKS_PER_BLOCK`, and `NUM_GLOBAL_CHUNKS` from the forward config/plumbing.
+  - rewrite the LSE/output kernels so program ids map from `(bh, block_idx, token-tile, value-tile)` or an equivalent direct block-local token tiling, rather than `global_q_chunk`; keep `z_block` indexing block-based.
+  - tighten validation and API semantics: make `block_size` the only structural forward parameter, update error messages/docs accordingly, and decide whether `chunk_size` remains temporarily accepted only for backward/reference compatibility during the transition.
+  - update the PyTorch reference and any call sites/tests that currently require chunk alignment so the semantic contract is explicitly block-causal rather than block-and-chunk causal.
+  - after the forward cleanup lands, do a follow-up pass on backward/context saving to remove stale `ctx.chunk_size` plumbing and any remaining reference-only dependence on chunked reshapes.
 
 - [ ] Try a new multi-kernel `RecurrentFLARE` implementation by writing new `fwd_impl` / `bwd_impl` methods and wiring them into `RecurrentFLARE` behind env-var selection, with:
   - steps 1/2: precompute `LSE_ENC` and `LSE_DEC`. `LSE_ENC` may also be usable as a score-saving buffer. Computing `LSE_ENC` will likely require a token loop.
