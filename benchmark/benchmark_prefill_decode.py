@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
 Fast benchmark for FLARE cached-inference methods:
-- prefill: `flare_prefill_triton`
-- decode: `flare_decode_triton`
+- prefill: `flare_autoregressive_prefill_triton`
+- decode: `flare_autoregressive_decode_triton`
 
 Benchmarks are saved incrementally to raw JSONL so long runs are resumable.
 Summary CSV/JSON are written separately and can be re-plotted without rerunning.
@@ -23,7 +23,7 @@ import pandas as pd
 import torch
 import triton.testing
 
-from causal_flare import flare_decode_triton, flare_prefill_triton
+from causal_flare import flare_autoregressive_decode_triton, flare_autoregressive_prefill_triton
 
 
 DEFAULT_SEQ_LENGTHS = [2048, 4096, 8192, 16384, 32768, 65536, 131072]
@@ -225,7 +225,7 @@ def _build_prefill_fn(
     v = torch.randn(b, n, h, d_value, device=device, dtype=dtype)
 
     def run() -> None:
-        flare_prefill_triton(Q=q, K=k, V=v, scale=scale, input_precision=input_precision)
+        flare_autoregressive_prefill_triton(Q=q, K=k, V=v, scale=scale, input_precision=input_precision)
 
     return run
 
@@ -250,7 +250,7 @@ def _build_decode_fn(
     k_steps = torch.randn(decode_steps, b, h, d_score, device=device, dtype=dtype)
     v_steps = torch.randn(decode_steps, b, h, d_value, device=device, dtype=dtype)
 
-    _, base_state = flare_prefill_triton(
+    _, base_state = flare_autoregressive_prefill_triton(
         Q=q,
         K=k_prompt,
         V=v_prompt,
@@ -265,7 +265,7 @@ def _build_decode_fn(
             state[key].copy_(base_state[key])
         st = state
         for step_idx in range(decode_steps):
-            _, st = flare_decode_triton(
+            _, st = flare_autoregressive_decode_triton(
                 Q=q,
                 K=k_steps[step_idx],
                 V=v_steps[step_idx],

@@ -3,10 +3,10 @@ import torch
 
 from causal_flare import flare_recurrent_triton
 from causal_flare.autoregressive.inference import (
+    flare_autoregressive_decode_triton,
+    flare_autoregressive_prefill_triton,
     flare_decode_pytorch,
-    flare_decode_triton,
     flare_prefill_pytorch,
-    flare_prefill_triton,
 )
 from causal_flare.autoregressive.reference import flare_causal_reference
 
@@ -41,7 +41,7 @@ def test_cached_prefill_decode_regression_suite() -> None:
 
     # Prefill parity: PyTorch vs Triton
     y_py, s_py = flare_prefill_pytorch(q, k, v, scale=scale, attention_mask=mask)
-    y_tr, s_tr = flare_prefill_triton(q, k, v, scale=scale, attention_mask=mask)
+    y_tr, s_tr = flare_autoregressive_prefill_triton(q, k, v, scale=scale, attention_mask=mask)
     torch.testing.assert_close(y_tr, y_py, atol=atol, rtol=rtol)
 
     # Decode parity: PyTorch vs Triton
@@ -49,7 +49,7 @@ def test_cached_prefill_decode_regression_suite() -> None:
     v_next = torch.randn(B, T_NEXT, H, D, device=device, dtype=dtype)
     mask_next = (torch.rand(B, T_NEXT, device=device) > mask_prob).to(torch.int32)
     y_dec_py, _ = flare_decode_pytorch(q, k_next, v_next, s_py, scale=scale, attention_mask=mask_next)
-    y_dec_tr, _ = flare_decode_triton(q, k_next, v_next, s_tr, scale=scale, attention_mask=mask_next)
+    y_dec_tr, _ = flare_autoregressive_decode_triton(q, k_next, v_next, s_tr, scale=scale, attention_mask=mask_next)
     torch.testing.assert_close(y_dec_tr, y_dec_py, atol=atol, rtol=rtol)
 
     # Continuation consistency
@@ -66,7 +66,7 @@ def test_cached_prefill_decode_regression_suite() -> None:
     k_nomask = torch.randn(B, T, H, D, device=device, dtype=dtype)
     v_nomask = torch.randn(B, T, H, D, device=device, dtype=dtype)
     yn_py, sn_py = flare_prefill_pytorch(q, k_nomask, v_nomask, scale=scale, attention_mask=None)
-    yn_tr, sn_tr = flare_prefill_triton(q, k_nomask, v_nomask, scale=scale, attention_mask=None)
+    yn_tr, sn_tr = flare_autoregressive_prefill_triton(q, k_nomask, v_nomask, scale=scale, attention_mask=None)
     torch.testing.assert_close(yn_tr, yn_py, atol=atol, rtol=rtol)
 
     yn_ref = flare_causal_reference(q, k_nomask, v_nomask, scale=scale)
@@ -78,7 +78,7 @@ def test_cached_prefill_decode_regression_suite() -> None:
     k_next_nomask = torch.randn(B, T_NEXT, H, D, device=device, dtype=dtype)
     v_next_nomask = torch.randn(B, T_NEXT, H, D, device=device, dtype=dtype)
     ydn_py, _ = flare_decode_pytorch(q, k_next_nomask, v_next_nomask, sn_py, scale=scale, attention_mask=None)
-    ydn_tr, _ = flare_decode_triton(q, k_next_nomask, v_next_nomask, sn_tr, scale=scale, attention_mask=None)
+    ydn_tr, _ = flare_autoregressive_decode_triton(q, k_next_nomask, v_next_nomask, sn_tr, scale=scale, attention_mask=None)
     torch.testing.assert_close(ydn_tr, ydn_py, atol=atol, rtol=rtol)
 
     yn_full_ref = flare_causal_reference(

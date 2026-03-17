@@ -28,7 +28,11 @@ def build_child_code(mode: str, anchor: dict[str, int], dtype: str, input_precis
         import time
         import torch
 
-        from causal_flare import flare_autoregressive_triton, flare_decode_triton, flare_prefill_triton
+        from causal_flare import (
+            flare_autoregressive_decode_triton,
+            flare_autoregressive_prefill_triton,
+            flare_autoregressive_triton,
+        )
 
         torch.manual_seed(0)
         device = torch.device("cuda")
@@ -64,10 +68,17 @@ def build_child_code(mode: str, anchor: dict[str, int], dtype: str, input_precis
     elif mode == "inference_decode":
         body = textwrap.dedent(
             """
-            _, state = flare_prefill_triton(Q, K, V, scale=scale, input_precision=input_precision)
+            _, state = flare_autoregressive_prefill_triton(Q, K, V, scale=scale, input_precision=input_precision)
             K_step = torch.randn((B, 1, H, Dk), device=device, dtype=dtype)
             V_step = torch.randn((B, 1, H, Dv), device=device, dtype=dtype)
-            Y, _ = flare_decode_triton(Q, K_step, V_step, state=state, scale=scale, input_precision=input_precision)
+            Y, _ = flare_autoregressive_decode_triton(
+                Q,
+                K_step,
+                V_step,
+                state=state,
+                scale=scale,
+                input_precision=input_precision,
+            )
             """
         )
     else:

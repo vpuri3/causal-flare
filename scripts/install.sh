@@ -1,6 +1,35 @@
 #!/bin/bash
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/install.sh [--clear]
+
+Options:
+  --clear   Recreate .venv from scratch before installing dependencies.
+  -h, --help  Show this help message.
+EOF
+}
+
+CLEAN_VENV=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --clear)
+      CLEAN_VENV=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
 # Auto-detect a sensible parallel build level.
 detect_cpu_count() {
   if command -v nproc >/dev/null 2>&1; then
@@ -36,8 +65,15 @@ export MAKEFLAGS="-j${BUILD_JOBS}"
 
 echo "Detected ${CPU_COUNT} CPUs; using ${BUILD_JOBS} parallel build jobs."
 
-# Recreate the venv from scratch to avoid stale packages.
-uv venv .venv --clear
+# Recreate the venv from scratch only when explicitly requested.
+if [ "${CLEAN_VENV}" -eq 1 ]; then
+  echo "Creating a fresh .venv because --clear was requested."
+  uv venv .venv --clear
+else
+  echo "Reusing existing .venv if present. Pass --clear to recreate it."
+  uv venv .venv
+fi
+
 source .venv/bin/activate
 
 # Ensure the lock reflects current pyproject constraints, then sync deps.

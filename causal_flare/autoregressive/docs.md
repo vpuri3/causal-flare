@@ -24,8 +24,8 @@ Public tensor layout:
 Public wrappers:
 
 - `flare_autoregressive_triton`
-- `flare_decode_triton`
-- `flare_prefill_triton`
+- `flare_autoregressive_decode_triton`
+- `flare_autoregressive_prefill_triton`
 
 ## Production vs Experimental
 

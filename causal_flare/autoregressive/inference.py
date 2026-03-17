@@ -489,7 +489,7 @@ def flare_recurrent_step_kernel(
     tl.store(y_base + d_offsets * stride_yd, y, mask=mask_d)
 
 
-def flare_decode_triton(
+def flare_autoregressive_decode_triton(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -503,7 +503,7 @@ def flare_decode_triton(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[tuple[torch.Tensor, dict[str, torch.Tensor]], dict[str, object]]:
     if not Q.is_cuda:
         raise RuntimeError(
-            "flare_decode requires CUDA tensors. "
+            "flare_autoregressive_decode requires CUDA tensors. "
         )
 
     K_input = K
@@ -611,7 +611,7 @@ def flare_decode_triton(
             num_stages=int(decode_cfg["num_stages"]),
         )
 
-    _profiled_call(K.device, forward_timings, "flare_decode_step", launch_decode)
+    _profiled_call(K.device, forward_timings, "flare_autoregressive_decode_step", launch_decode)
 
     next_state = {"m": m_state, "d": d_state, "u": u_state}
     y_out = _profiled_call(K.device, forward_timings, "decode_output_cast", lambda: y[:, None, :, :].to(V.dtype))
@@ -621,7 +621,7 @@ def flare_decode_triton(
     return y_out, next_state
 
 
-def flare_prefill_triton(
+def flare_autoregressive_prefill_triton(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -634,7 +634,7 @@ def flare_prefill_triton(
     profile: bool = False,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | tuple[tuple[torch.Tensor, dict[str, torch.Tensor]], dict[str, object]]:
     if not Q.is_cuda:
-        raise RuntimeError("flare_prefill requires CUDA tensors.")
+        raise RuntimeError("flare_autoregressive_prefill requires CUDA tensors.")
 
     K, V = _canonicalize_kv_for_prefill(K, V)
     B, T, H, D_score = K.shape
@@ -680,7 +680,7 @@ def flare_prefill_triton(
                 else:
                     q_dec_t = Q_dec[:, t, :, :] if separate_Q_dec else None
                     k_dec_t = K_dec if separate_K_dec else None
-                y_t, st = flare_decode_triton(
+                y_t, st = flare_autoregressive_decode_triton(
                     Q=Q,
                     K=K[:, t, :, :],
                     V=V[:, t, :, :],
@@ -833,7 +833,7 @@ def flare_prefill(
     K_dec: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if impl == "triton":
-        return flare_prefill_triton(
+        return flare_autoregressive_prefill_triton(
             Q=Q,
             K=K,
             V=V,
@@ -871,7 +871,7 @@ def flare_decode(
     K_dec: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if impl == "triton":
-        return flare_decode_triton(
+        return flare_autoregressive_decode_triton(
             Q=Q,
             K=K,
             V=V,

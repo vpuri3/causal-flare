@@ -6,16 +6,14 @@ import torch
 
 from causal_flare import flare_autoregressive_triton, flare_recurrent_triton
 from causal_flare.autoregressive.inference import (
+    flare_autoregressive_decode_triton,
+    flare_autoregressive_prefill_triton,
     flare_decode_pytorch,
-    flare_decode_triton,
     flare_prefill_pytorch,
-    flare_prefill_triton,
 )
-from causal_flare.autoregressive.reference import (
-    flare_causal_chunked,
-    flare_recurrent_dense_backward_pytorch,
-    flare_recurrent_pytorch,
-)
+from causal_flare.autoregressive.dense import flare_recurrent_dense_backward_pytorch
+from causal_flare.autoregressive.recurrent import flare_recurrent_pytorch
+from causal_flare.autoregressive.reference import flare_causal_chunked
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -467,7 +465,7 @@ def test_inference_prefill_decode_variants_match_pytorch(q_dec_mode: str, k_dec_
         raise ValueError(f"Unknown k_dec_mode={k_dec_mode}")
 
     y_pre_py, s_py = flare_prefill_pytorch(Q=q, K=k, V=v, Q_dec=q_dec, K_dec=k_dec, scale=scale)
-    y_pre_tr, s_tr = flare_prefill_triton(Q=q, K=k, V=v, Q_dec=q_dec, K_dec=k_dec, scale=scale)
+    y_pre_tr, s_tr = flare_autoregressive_prefill_triton(Q=q, K=k, V=v, Q_dec=q_dec, K_dec=k_dec, scale=scale)
     torch.testing.assert_close(y_pre_tr, y_pre_py, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(s_tr["m"], s_py["m"], rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(s_tr["d"], s_py["d"], rtol=1e-4, atol=1e-5)
@@ -486,7 +484,7 @@ def test_inference_prefill_decode_variants_match_pytorch(q_dec_mode: str, k_dec_
     y_dec_py, _ = flare_decode_pytorch(
         Q=q, K=k_next, V=v_next, state=s_py, Q_dec=q_dec_next, K_dec=k_dec, scale=scale
     )
-    y_dec_tr, _ = flare_decode_triton(
+    y_dec_tr, _ = flare_autoregressive_decode_triton(
         Q=q, K=k_next, V=v_next, state=s_tr, Q_dec=q_dec_next, K_dec=k_dec, scale=scale
     )
     torch.testing.assert_close(y_dec_tr, y_dec_py, rtol=1e-4, atol=1e-5)

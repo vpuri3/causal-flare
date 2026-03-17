@@ -1,6 +1,10 @@
 """Experimental dense autoregressive FLARE variants."""
 
 from causal_flare._common import *
+from causal_flare._reference_utils import (
+    resolve_flare_causal_decode_inputs as _resolve_flare_causal_decode_inputs,
+    validate_flare_qkv_layouts as _validate_flare_qkv_layouts,
+)
 
 # NOTE:
 # - This file does not implement sequence-length (N-axis) chunking.
@@ -8,6 +12,149 @@ from causal_flare._common import *
 #   chunked algorithms.
 # - Keep this module self-contained: do not import kernels from training.py.
 # - This path is experimental and is not exported from the default package API.
+
+
+def _flare_recurrent_dense_lse_forward_state(Q, K, V, scale=None, Q_dec=None, K_dec=None):
+    B, T, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q, K, V, name="Recurrent FLARE")
+    scale = _resolve_attn_scale(scale, D_score)
+    Q_dec, K_dec, separate_Q_dec, separate_K_dec, weight_sharing_enc_dec = _resolve_flare_causal_decode_inputs(
+        Q, K, Q_dec, K_dec
+    )
+
+    Q_f = Q.float().unsqueeze(0).expand(B, -1, -1, -1)  # [B,H,M,D]
+    K_f = K.float().permute(0, 2, 1, 3).contiguous()    # [B,H,T,D]
+    V_f = V.float().permute(0, 2, 1, 3).contiguous()    # [B,H,T,D]
+    Q_dec_f = Q_dec.float().permute(0, 2, 1, 3).contiguous() if separate_Q_dec else K_f
+    K_dec_f = K_dec.float().unsqueeze(0).expand(B, -1, -1, -1) if separate_K_dec else Q_f
+
+    S_enc = torch.einsum("bhmd,bhtd->bhtm", Q_f, K_f) * scale  # [B,H,T,M]
+    LSE_enc = torch.logcumsumexp(S_enc, dim=2)                  # [B,H,T,M]
+
+    if weight_sharing_enc_dec:
+        S_dec = S_enc
+    else:
+        S_dec = torch.einsum("bhtd,bhmd->bhtm", Q_dec_f, K_dec_f) * scale
+    LSE_dec = torch.logsumexp(S_dec, dim=-1)                    # [B,H,T]
+    alpha = torch.exp(S_dec - LSE_dec.unsqueeze(-1))            # [B,H,T,M]
+
+    m_state = torch.full((B, H, M), -float("inf"), device=Q.device, dtype=torch.float32)
+    d_state = torch.zeros((B, H, M), device=Q.device, dtype=torch.float32)
+    u_state = torch.zeros((B, H, M, D_value), device=Q.device, dtype=torch.float32)
+    Z = torch.empty((B, H, T, M, D_value), device=Q.device, dtype=torch.float32)
+    for t in range(T):
+        s_t = S_enc[:, :, t, :]
+        m_new = torch.maximum(m_state, s_t)
+        gamma = torch.exp(m_state - m_new)
+        eta = torch.exp(s_t - m_new)
+        d_state = d_state * gamma + eta
+        u_state = u_state * gamma[..., None] + eta[..., None] * V_f[:, :, t, None, :]
+        Z[:, :, t, :, :] = u_state / d_state[..., None]
+        m_state = m_new
+
+    Y = torch.einsum("bhtm,bhtmd->bhtd", alpha, Z)
+    return {
+        "Q_f": Q_f,
+        "K_f": K_f,
+        "V_f": V_f,
+        "Q_dec_f": Q_dec_f,
+        "K_dec_f": K_dec_f,
+        "S_enc": S_enc,
+        "LSE_enc": LSE_enc,
+        "LSE_dec": LSE_dec,
+        "alpha": alpha,
+        "Z": Z,
+        "Y": Y,
+        "scale": scale,
+        "separate_Q_dec": separate_Q_dec,
+        "separate_K_dec": separate_K_dec,
+        "weight_sharing_enc_dec": weight_sharing_enc_dec,
+    }
+
+
+def _flare_recurrent_dense_decode_backward(alpha, Z, dY):
+    dZ = alpha[..., None] * dY[:, :, :, None, :]
+    score_proj = torch.sum(dY[:, :, :, None, :] * Z, dim=-1)
+    centered = score_proj - torch.sum(alpha * score_proj, dim=-1, keepdim=True)
+    dS_dec = alpha * centered
+    return dZ, dS_dec
+
+
+def _flare_recurrent_dense_encode_backward(S_enc, LSE_enc, V_f, dZ):
+    B, H, T, M = S_enc.shape
+    D = V_f.size(-1)
+    dS_enc = torch.zeros_like(S_enc)
+    dV_f = torch.zeros((B, H, T, D), device=S_enc.device, dtype=torch.float32)
+    for t in range(T):
+        s_pref = S_enc[:, :, : t + 1, :]
+        lse_t = LSE_enc[:, :, t : t + 1, :]
+        p_t = torch.exp(s_pref - lse_t)
+        dz_t = dZ[:, :, t, :, :]
+        c_t = torch.einsum("bhud,bhmd->bhum", V_f[:, :, : t + 1, :], dz_t)
+        r_t = torch.sum(p_t * c_t, dim=2, keepdim=True)
+        dS_enc[:, :, : t + 1, :] += p_t * (c_t - r_t)
+        dV_f[:, :, : t + 1, :] += torch.einsum("bhum,bhmd->bhud", p_t, dz_t)
+    return dS_enc, dV_f
+
+
+def flare_recurrent_dense_backward_pytorch(Q, K, V, dY, scale=None, Q_dec=None, K_dec=None):
+    state = _flare_recurrent_dense_lse_forward_state(Q, K, V, scale=scale, Q_dec=Q_dec, K_dec=K_dec)
+    Q_f = state["Q_f"]
+    K_f = state["K_f"]
+    V_f = state["V_f"]
+    Q_dec_f = state["Q_dec_f"]
+    K_dec_f = state["K_dec_f"]
+    S_enc = state["S_enc"]
+    LSE_enc = state["LSE_enc"]
+    alpha = state["alpha"]
+    Z = state["Z"]
+    Y = state["Y"]
+    scale = state["scale"]
+    separate_Q_dec = state["separate_Q_dec"]
+    separate_K_dec = state["separate_K_dec"]
+    weight_sharing_enc_dec = state["weight_sharing_enc_dec"]
+
+    if dY.dim() != 4 or dY.size(0) != K.size(0) or dY.size(1) != K.size(2) or dY.size(2) != K.size(1) or dY.size(3) != V.size(3):
+        raise ValueError(
+            "Expected dY [B, H, T, D] matching recurrent output layout. "
+            f"Got dY.shape={tuple(dY.shape)} for K.shape={tuple(K.shape)} and V.shape={tuple(V.shape)}"
+        )
+    dY_f = dY.float()
+
+    dZ, dS_dec = _flare_recurrent_dense_decode_backward(alpha, Z, dY_f)
+    dS_enc, dV_f = _flare_recurrent_dense_encode_backward(S_enc, LSE_enc, V_f, dZ)
+
+    if weight_sharing_enc_dec:
+        for t in range(S_enc.size(2)):
+            dS_enc[:, :, t, :] += dS_dec[:, :, t, :]
+
+    dQ = scale * torch.einsum("bhtm,bhtd->hmd", dS_enc, K_f)
+    dK_f = scale * torch.einsum("bhtm,bhmd->bhtd", dS_enc, Q_f)
+
+    dQ_dec = None
+    dK_dec = None
+    if not weight_sharing_enc_dec:
+        if separate_Q_dec:
+            dQ_dec_f = scale * torch.einsum("bhtm,bhmd->bhtd", dS_dec, K_dec_f)
+            dQ_dec = dQ_dec_f.permute(0, 2, 1, 3).contiguous()
+        else:
+            dK_f += scale * torch.einsum("bhtm,bhmd->bhtd", dS_dec, K_dec_f)
+
+        if separate_K_dec:
+            dK_dec_f = scale * torch.einsum("bhtm,bhtd->bhmd", dS_dec, Q_dec_f)
+            dK_dec = dK_dec_f.sum(dim=0).contiguous()
+        else:
+            dQ += scale * torch.einsum("bhtm,bhtd->bhmd", dS_dec, Q_dec_f).sum(dim=0)
+
+    dK = dK_f.permute(0, 2, 1, 3).contiguous()
+    dV = dV_f.permute(0, 2, 1, 3).contiguous()
+    return (
+        Y.to(Q.dtype),
+        dQ.to(Q.dtype),
+        dK.to(K.dtype),
+        dV.to(V.dtype),
+        None if dQ_dec is None else dQ_dec.to(Q.dtype),
+        None if dK_dec is None else dK_dec.to(Q.dtype),
+    )
 
 
 def flare_causal_pytorch_dense1(Q, K, V, scale=None, eps=None, profile: bool = False):

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Import Smoke Check"
+  short_description: "Verify targeted causal_flare imports without running pytest."
+  default_prompt: "Use $import-smoke to run the reusable import smoke checker for the moved causal_flare symbols and report exactly which imports resolved."

@@ -1,1 +1,1 @@
-# Branch-specific autoregressive FLARE tests.
+# Branch-specific autoregressive FLARE tests for the autoregressive decode/prefill APIs.

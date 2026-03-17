@@ -1,7 +1,10 @@
 """Experimental recurrent autoregressive FLARE variants."""
 
 from causal_flare._common import *
-from causal_flare._reference_utils import resolve_flare_causal_decode_inputs as _resolve_recurrent_decode_inputs
+from causal_flare._reference_utils import (
+    resolve_flare_causal_decode_inputs as _resolve_recurrent_decode_inputs,
+    validate_flare_qkv_layouts as _validate_flare_qkv_layouts,
+)
 
 # NOTE:
 # - This file does not implement sequence-length (N-axis) chunking.
@@ -9,6 +12,49 @@ from causal_flare._reference_utils import resolve_flare_causal_decode_inputs as 
 #   chunked algorithms.
 # - Keep this module self-contained: do not import kernels from training.py.
 # - This path is experimental and is not exported from the default package API.
+
+
+def flare_recurrent_pytorch(Q, K, V, scale=None, Q_dec=None, K_dec=None):
+    B, T, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q, K, V, name="Recurrent FLARE")
+    scale = _resolve_attn_scale(scale, D_score)
+    Q_dec, K_dec, separate_Q_dec, separate_K_dec, weight_sharing_enc_dec = _resolve_recurrent_decode_inputs(
+        Q, K, Q_dec, K_dec
+    )
+    device = Q.device
+    out_dtype = Q.dtype
+
+    Q_f = Q.float().unsqueeze(0).expand(B, -1, -1, -1)  # [B,H,M,D]
+    K_f = K.float().permute(0, 2, 1, 3).contiguous()    # [B,H,T,D]
+    V_f = V.float().permute(0, 2, 1, 3).contiguous()    # [B,H,T,D]
+    Q_dec_f = Q_dec.float().permute(0, 2, 1, 3).contiguous() if separate_Q_dec else K_f
+    K_dec_f = K_dec.float().unsqueeze(0).expand(B, -1, -1, -1) if separate_K_dec else Q_f
+
+    U = torch.zeros((B, H, M, D_value), device=device, dtype=torch.float32)
+    d = torch.zeros((B, H, M), device=device, dtype=torch.float32)
+    m = torch.full((B, H, M), -float("inf"), device=device, dtype=torch.float32)
+    Y = torch.empty((B, H, T, D_value), device=device, dtype=out_dtype)
+
+    for t in range(T):
+        k_t = K_f[:, :, t, :]
+        v_t = V_f[:, :, t, :]
+        s_t = torch.einsum("bhmd,bhd->bhm", Q_f, k_t) * scale
+        m_new = torch.maximum(m, s_t)
+        gamma = torch.exp(m - m_new)
+        eta = torch.exp(s_t - m_new)
+        d = d * gamma + eta
+        U = U * gamma[..., None] + eta[..., None] * v_t[:, :, None, :]
+        Z = U / d[..., None]
+        if weight_sharing_enc_dec:
+            a_t = s_t
+        else:
+            q_t_dec = Q_dec_f[:, :, t, :]
+            a_t = torch.einsum("bhd,bhmd->bhm", q_t_dec, K_dec_f) * scale
+        alpha = torch.softmax(a_t, dim=-1)
+        y_t = torch.einsum("bhm,bhmd->bhd", alpha, Z)
+        Y[:, :, t, :] = y_t.to(out_dtype)
+        m = m_new
+
+    return Y
 
 
 def _get_recurrent_block_d_k(D: int, block_d=None) -> tuple[int, int]:

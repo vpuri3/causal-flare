@@ -2,7 +2,12 @@
 
 ## Session Startup
 - At the start of every session, read `TODO.md` and align ongoing work with current priorities.
+- At the start of every session, inspect local skills under `skills/*/SKILL.md`, note which ones apply to the request, and read the matching skill instructions before substantial work.
 - Before starting opportunistic refactors or side quests, check whether the request aligns with current `TODO.md` priorities.
+
+## Local Skills
+- `chunked-flare-profile`: use when profiling or retuning chunked FLARE launch heuristics after kernel or launch-config changes.
+- `import-smoke`: use when the task is to verify that targeted `causal_flare` imports resolve cleanly without running the test suite.
 
 ## Workflow Expectations
 - This is an experimental repo. Do not write extra code purely to preserve backward compatibility unless the user explicitly asks for it.

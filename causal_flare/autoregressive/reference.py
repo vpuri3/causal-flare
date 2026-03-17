@@ -4,204 +4,10 @@ from causal_flare._reference_utils import (
     validate_flare_qkv_layouts as _validate_flare_qkv_layouts,
 )
 
-def flare_recurrent_pytorch(Q, K, V, scale=None, Q_dec=None, K_dec=None):
-    B, T, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q, K, V, name="Recurrent FLARE")
-    scale = _resolve_attn_scale(scale, D_score)
-    Q_dec, K_dec, separate_Q_dec, separate_K_dec, weight_sharing_enc_dec = _resolve_flare_causal_decode_inputs(
-        Q, K, Q_dec, K_dec
-    )
-    device = Q.device
-    out_dtype = Q.dtype
-
-    Q_f = Q.float().unsqueeze(0).expand(B, -1, -1, -1)  # [B,H,M,D]
-    K_f = K.float().permute(0, 2, 1, 3).contiguous()    # [B,H,T,D]
-    V_f = V.float().permute(0, 2, 1, 3).contiguous()    # [B,H,T,D]
-    Q_dec_f = Q_dec.float().permute(0, 2, 1, 3).contiguous() if separate_Q_dec else K_f
-    K_dec_f = K_dec.float().unsqueeze(0).expand(B, -1, -1, -1) if separate_K_dec else Q_f
-
-    U = torch.zeros((B, H, M, D_value), device=device, dtype=torch.float32)
-    d = torch.zeros((B, H, M), device=device, dtype=torch.float32)
-    m = torch.full((B, H, M), -float("inf"), device=device, dtype=torch.float32)
-    Y = torch.empty((B, H, T, D_value), device=device, dtype=out_dtype)
-
-    for t in range(T):
-        k_t = K_f[:, :, t, :]
-        v_t = V_f[:, :, t, :]
-        s_t = torch.einsum("bhmd,bhd->bhm", Q_f, k_t) * scale
-        m_new = torch.maximum(m, s_t)
-        gamma = torch.exp(m - m_new)
-        eta = torch.exp(s_t - m_new)
-        d = d * gamma + eta
-        U = U * gamma[..., None] + eta[..., None] * v_t[:, :, None, :]
-        Z = U / d[..., None]
-        if weight_sharing_enc_dec:
-            a_t = s_t
-        else:
-            q_t_dec = Q_dec_f[:, :, t, :]
-            a_t = torch.einsum("bhd,bhmd->bhm", q_t_dec, K_dec_f) * scale
-        alpha = torch.softmax(a_t, dim=-1)
-        y_t = torch.einsum("bhm,bhmd->bhd", alpha, Z)
-        Y[:, :, t, :] = y_t.to(out_dtype)
-        m = m_new
-
-    return Y
-
-
-def _flare_recurrent_dense_lse_forward_state(Q, K, V, scale=None, Q_dec=None, K_dec=None):
-    B, T, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q, K, V, name="Recurrent FLARE")
-    scale = _resolve_attn_scale(scale, D_score)
-    Q_dec, K_dec, separate_Q_dec, separate_K_dec, weight_sharing_enc_dec = _resolve_flare_causal_decode_inputs(
-        Q, K, Q_dec, K_dec
-    )
-
-    Q_f = Q.float().unsqueeze(0).expand(B, -1, -1, -1)  # [B,H,M,D]
-    K_f = K.float().permute(0, 2, 1, 3).contiguous()    # [B,H,T,D]
-    V_f = V.float().permute(0, 2, 1, 3).contiguous()    # [B,H,T,D]
-    Q_dec_f = Q_dec.float().permute(0, 2, 1, 3).contiguous() if separate_Q_dec else K_f
-    K_dec_f = K_dec.float().unsqueeze(0).expand(B, -1, -1, -1) if separate_K_dec else Q_f
-
-    S_enc = torch.einsum("bhmd,bhtd->bhtm", Q_f, K_f) * scale  # [B,H,T,M]
-    LSE_enc = torch.logcumsumexp(S_enc, dim=2)                  # [B,H,T,M]
-
-    if weight_sharing_enc_dec:
-        S_dec = S_enc
-    else:
-        S_dec = torch.einsum("bhtd,bhmd->bhtm", Q_dec_f, K_dec_f) * scale
-    LSE_dec = torch.logsumexp(S_dec, dim=-1)                    # [B,H,T]
-    alpha = torch.exp(S_dec - LSE_dec.unsqueeze(-1))            # [B,H,T,M]
-
-    m_state = torch.full((B, H, M), -float("inf"), device=Q.device, dtype=torch.float32)
-    d_state = torch.zeros((B, H, M), device=Q.device, dtype=torch.float32)
-    u_state = torch.zeros((B, H, M, D_value), device=Q.device, dtype=torch.float32)
-    Z = torch.empty((B, H, T, M, D_value), device=Q.device, dtype=torch.float32)
-    for t in range(T):
-        s_t = S_enc[:, :, t, :]
-        m_new = torch.maximum(m_state, s_t)
-        gamma = torch.exp(m_state - m_new)
-        eta = torch.exp(s_t - m_new)
-        d_state = d_state * gamma + eta
-        u_state = u_state * gamma[..., None] + eta[..., None] * V_f[:, :, t, None, :]
-        Z[:, :, t, :, :] = u_state / d_state[..., None]
-        m_state = m_new
-
-    Y = torch.einsum("bhtm,bhtmd->bhtd", alpha, Z)
-    return {
-        "Q_f": Q_f,
-        "K_f": K_f,
-        "V_f": V_f,
-        "Q_dec_f": Q_dec_f,
-        "K_dec_f": K_dec_f,
-        "S_enc": S_enc,
-        "LSE_enc": LSE_enc,
-        "LSE_dec": LSE_dec,
-        "alpha": alpha,
-        "Z": Z,
-        "Y": Y,
-        "scale": scale,
-        "separate_Q_dec": separate_Q_dec,
-        "separate_K_dec": separate_K_dec,
-        "weight_sharing_enc_dec": weight_sharing_enc_dec,
-    }
-
-
-def _flare_recurrent_dense_decode_backward(alpha, Z, dY):
-    # y_t = sum_m alpha_tm * z_tm
-    dZ = alpha[..., None] * dY[:, :, :, None, :]  # [B, H, T, M, D]
-    score_proj = torch.sum(dY[:, :, :, None, :] * Z, dim=-1)  # [B, H, T, M]
-    centered = score_proj - torch.sum(alpha * score_proj, dim=-1, keepdim=True)  # [B, H, T, M]
-    dS_dec = alpha * centered  # [B, H, T, M]
-    return dZ, dS_dec
-
-
-def _flare_recurrent_dense_encode_backward(S_enc, LSE_enc, V_f, dZ):
-    B, H, T, M = S_enc.shape  # scalars
-    D = V_f.size(-1)  # scalar
-    dS_enc = torch.zeros_like(S_enc)  # [B, H, T, M]
-    dV_f = torch.zeros((B, H, T, D), device=S_enc.device, dtype=torch.float32)  # [B, H, T, D]
-    for t in range(T):
-        s_pref = S_enc[:, :, : t + 1, :]  # [B, H, t+1, M]
-        lse_t = LSE_enc[:, :, t : t + 1, :]  # [B, H, 1, M]
-        p_t = torch.exp(s_pref - lse_t)  # [B, H, t+1, M]
-        dz_t = dZ[:, :, t, :, :]  # [B, H, M, D]
-        c_t = torch.einsum("bhud,bhmd->bhum", V_f[:, :, : t + 1, :], dz_t)  # [B, H, t+1, M]
-        r_t = torch.sum(p_t * c_t, dim=2, keepdim=True)  # [B, H, 1, M]
-        dS_enc[:, :, : t + 1, :] += p_t * (c_t - r_t)  # [B, H, t+1, M]
-        dV_f[:, :, : t + 1, :] += torch.einsum("bhum,bhmd->bhud", p_t, dz_t)  # [B, H, t+1, D]
-    return dS_enc, dV_f
-
-
-def flare_recurrent_dense_backward_pytorch(Q, K, V, dY, scale=None, Q_dec=None, K_dec=None):
-    """
-    Dense backward decomposition using LSE_enc/LSE_dec:
-      1) decode-softmax branch (dS_dec, dZ)
-      2) encoder recurrent-softmax branch (dS_enc, dV)
-      3) score projections to dQ/dK (+ optional dQ_dec/dK_dec)
-    """
-    state = _flare_recurrent_dense_lse_forward_state(Q, K, V, scale=scale, Q_dec=Q_dec, K_dec=K_dec)
-    Q_f = state["Q_f"]  # [B, H, M, D]
-    K_f = state["K_f"]  # [B, H, T, D]
-    V_f = state["V_f"]  # [B, H, T, D]
-    Q_dec_f = state["Q_dec_f"]  # [B, H, T, D]
-    K_dec_f = state["K_dec_f"]  # [B, H, M, D]
-    S_enc = state["S_enc"]  # [B, H, T, M]
-    LSE_enc = state["LSE_enc"]  # [B, H, T, M]
-    alpha = state["alpha"]  # [B, H, T, M]
-    Z = state["Z"]  # [B, H, T, M, D]
-    Y = state["Y"]  # [B, H, T, D]
-    scale = state["scale"]  # scalar
-    separate_Q_dec = state["separate_Q_dec"]  # bool
-    separate_K_dec = state["separate_K_dec"]  # bool
-    weight_sharing_enc_dec = state["weight_sharing_enc_dec"]  # bool
-
-    if dY.dim() != 4 or dY.size(0) != K.size(0) or dY.size(1) != K.size(2) or dY.size(2) != K.size(1) or dY.size(3) != V.size(3):
-        raise ValueError(
-            "Expected dY [B, H, T, D] matching recurrent output layout. "
-            f"Got dY.shape={tuple(dY.shape)} for K.shape={tuple(K.shape)} and V.shape={tuple(V.shape)}"
-        )
-    dY_f = dY.float()  # [B, H, T, D]
-
-    dZ, dS_dec = _flare_recurrent_dense_decode_backward(alpha, Z, dY_f)  # [B,H,T,M,D], [B,H,T,M]
-    dS_enc, dV_f = _flare_recurrent_dense_encode_backward(S_enc, LSE_enc, V_f, dZ)  # [B,H,T,M], [B,H,T,D]
-
-    if weight_sharing_enc_dec:
-        for t in range(S_enc.size(2)):
-            dS_enc[:, :, t, :] += dS_dec[:, :, t, :]
-
-    dQ = scale * torch.einsum("bhtm,bhtd->hmd", dS_enc, K_f)  # [H, M, D]
-    dK_f = scale * torch.einsum("bhtm,bhmd->bhtd", dS_enc, Q_f)  # [B, H, T, D]
-
-    dQ_dec = None
-    dK_dec = None
-    if not weight_sharing_enc_dec:
-        if separate_Q_dec:
-            dQ_dec_f = scale * torch.einsum("bhtm,bhmd->bhtd", dS_dec, K_dec_f)  # [B, H, T, D]
-            dQ_dec = dQ_dec_f.permute(0, 2, 1, 3).contiguous()  # [B, T, H, D]
-        else:
-            # Q_dec aliases K_enc: accumulate directly into dK.
-            dK_f += scale * torch.einsum("bhtm,bhmd->bhtd", dS_dec, K_dec_f)  # [B, H, T, D]
-
-        if separate_K_dec:
-            dK_dec_f = scale * torch.einsum("bhtm,bhtd->bhmd", dS_dec, Q_dec_f)  # [B, H, M, D]
-            dK_dec = dK_dec_f.sum(dim=0).contiguous()  # [H, M, D]
-        else:
-            # K_dec aliases Q_enc: accumulate directly into dQ.
-            dQ += scale * torch.einsum("bhtm,bhtd->bhmd", dS_dec, Q_dec_f).sum(dim=0)  # [H, M, D]
-
-    dK = dK_f.permute(0, 2, 1, 3).contiguous()  # [B, T, H, D]
-    dV = dV_f.permute(0, 2, 1, 3).contiguous()  # [B, T, H, D]
-    return (
-        Y.to(Q.dtype),
-        dQ.to(Q.dtype),
-        dK.to(K.dtype),
-        dV.to(V.dtype),
-        None if dQ_dec is None else dQ_dec.to(Q.dtype),
-        None if dK_dec is None else dK_dec.to(Q.dtype),
-    )
-
 #======================================================================#
 #======================================================================#
 #======================================================================#
-# Prefix, Streaming, and Cached Implementations
+# Reference implementations
 #======================================================================#
 #======================================================================#
 #======================================================================#
@@ -310,22 +116,130 @@ def flare_causal_perciever_ar(Q, K, V, scale=None):
     """Backward-compatible alias for common misspelling."""
     return flare_causal_perceiver_ar(Q, K, V, scale=scale)
 
-#------------------------------------------------------------------------------#
-# PyTorch Implementation of FLARE
-#------------------------------------------------------------------------------#
+#======================================================================#
+#======================================================================#
+#======================================================================#
+# PyTorch Implementations
+#======================================================================#
+#======================================================================#
+#======================================================================#
 
-def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, chunk_size=None, Q_dec=None, K_dec=None):
+def _canonicalize_reference_flare_state(
+    state: dict[str, torch.Tensor] | None,
+    batch_size: int,
+    num_heads: int,
+    num_latents: int,
+    value_head_dim: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    if state is None:
+        m = torch.full((batch_size, num_heads, num_latents), -float("inf"), device=device, dtype=torch.float32)
+        d = torch.zeros((batch_size, num_heads, num_latents), device=device, dtype=torch.float32)
+        u = torch.zeros((batch_size, num_heads, num_latents, value_head_dim), device=device, dtype=torch.float32)
+        return {"m": m, "d": d, "u": u}
+
+    if not isinstance(state, dict):
+        raise ValueError(f"FLARE recurrent state must be a dict with keys {'m', 'd', 'u'}. Got {type(state)}")
+    if not all(k in state for k in ("m", "d", "u")):
+        raise ValueError(f"Invalid FLARE recurrent state keys: {list(state.keys())}")
+
+    m = state["m"].to(device=device, dtype=torch.float32)
+    d = state["d"].to(device=device, dtype=torch.float32)
+    u = state["u"].to(device=device, dtype=torch.float32)
+    expected_scalar_shape = (batch_size, num_heads, num_latents)
+    expected_u_shape = (batch_size, num_heads, num_latents, value_head_dim)
+    if tuple(m.shape) != expected_scalar_shape or tuple(d.shape) != expected_scalar_shape or tuple(u.shape) != expected_u_shape:
+        raise ValueError(
+            "Invalid FLARE recurrent state shapes. "
+            f"Expected m/d={expected_scalar_shape}, u={expected_u_shape}; "
+            f"got m={tuple(m.shape)}, d={tuple(d.shape)}, u={tuple(u.shape)}"
+        )
+    return {"m": m, "d": d, "u": u}
+
+
+def _merge_reference_flare_stats(
+    m_a: torch.Tensor,
+    d_a: torch.Tensor,
+    u_a: torch.Tensor,
+    m_b: torch.Tensor,
+    d_b: torch.Tensor,
+    u_b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m_new = torch.maximum(m_a, m_b)
+    is_a_inf = torch.isinf(m_a) & (m_a < 0)
+    is_b_inf = torch.isinf(m_b) & (m_b < 0)
+    is_new_inf = torch.isinf(m_new) & (m_new < 0)
+    m_safe = torch.where(is_new_inf, torch.zeros_like(m_new), m_new)
+
+    scale_a = torch.where(
+        is_a_inf & is_new_inf,
+        torch.ones_like(m_new),
+        torch.where(is_a_inf, torch.zeros_like(m_new), torch.exp(m_a - m_safe)),
+    )
+    scale_b = torch.where(
+        is_b_inf & is_new_inf,
+        torch.ones_like(m_new),
+        torch.where(is_b_inf, torch.zeros_like(m_new), torch.exp(m_b - m_safe)),
+    )
+
+    d_new = d_a * scale_a + d_b * scale_b
+    u_new = u_a * scale_a[..., None] + u_b * scale_b[..., None]
+    return m_new, d_new, u_new
+
+
+def _resolve_reference_chunk_size(N: int, M: int, D_score: int, chunk_size) -> int:
+    if chunk_size is None:
+        env_chunk = os.environ.get("FLARE_PYTORCH_CHUNK_SIZE", "")
+        chunk_size = int(env_chunk) if env_chunk else None
+    if chunk_size is not None:
+        return int(chunk_size)
+    if D_score <= 32 and M <= 64 and N >= 1024:
+        return 64
+    if D_score <= 64 and M <= 128 and N >= 1024:
+        return 128
+    return max(64, min(2048, max(1, N // 2)))
+
+
+def flare_autoregressive_pytorch(
+    Q,
+    K,
+    V,
+    scale=None,
+    eps=None,
+    profile: bool = False,
+    chunk_size=None,
+    Q_dec=None,
+    K_dec=None,
+    state: dict[str, torch.Tensor] | None = None,
+    attention_mask: torch.Tensor | None = None,
+    return_state: bool = False,
+):
     B, N, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q, K, V, name="Chunked FLARE")
     scale = _resolve_attn_scale(scale, D_score)
     Q_dec, K_dec, separate_Q_dec, separate_K_dec, weight_sharing_enc_dec = _resolve_flare_causal_decode_inputs(
         Q, K, Q_dec, K_dec
     )
+    use_fast_unmasked = attention_mask is None and state is None
+    if attention_mask is not None and attention_mask.shape != (B, N):
+        raise ValueError(f"attention_mask must be [B, N]. Got {tuple(attention_mask.shape)}")
 
     device = Q.device
-    out_dtype = Q.dtype
+    out_dtype = V.dtype
     compute_dtype = torch.float32
     if os.environ.get("FLARE_PYTORCH_MATCH_REFERENCE", "") == "1":
         compute_dtype = Q.dtype
+
+    if N == 0:
+        next_state = _canonicalize_reference_flare_state(
+            state=state,
+            batch_size=B,
+            num_heads=H,
+            num_latents=M,
+            value_head_dim=D_value,
+            device=device,
+        )
+        Y = torch.empty((B, 0, H, D_value), device=device, dtype=out_dtype)
+        return (Y, next_state) if return_state else Y
 
     Q_f = Q.to(compute_dtype)
     K_f = K.to(compute_dtype)
@@ -334,44 +248,47 @@ def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, c
     K_dec_f = None
     if not weight_sharing_enc_dec:
         Q_dec_f = Q_dec.to(compute_dtype).permute(0, 2, 1, 3).contiguous() if separate_Q_dec else K_f.permute(0, 2, 1, 3)
-        K_dec_f = K_dec.to(compute_dtype).unsqueeze(0).expand(B, -1, -1, -1) if separate_K_dec else Q_f.unsqueeze(0).expand(B, -1, -1, -1)
+        K_dec_f = (
+            K_dec.to(compute_dtype).unsqueeze(0).expand(B, -1, -1, -1).contiguous()
+            if separate_K_dec else
+            Q_f.unsqueeze(0).expand(B, -1, -1, -1)
+        )
 
-    ###
-    # CHUNKING & PADDING
-    ###
-
-    if chunk_size is None:
-        env_chunk = os.environ.get("FLARE_PYTORCH_CHUNK_SIZE", "")
-        chunk_size = int(env_chunk) if env_chunk else None
-    C = int(chunk_size) if chunk_size is not None else max(64, min(2048, N // 2))
-    # Non-stable branch only.
-    CHUNK_SIZE = C
-    NC = NUM_CHUNKS = math.ceil(N / CHUNK_SIZE)
-
-    PADDED_LEN = NUM_CHUNKS * CHUNK_SIZE
+    C = _resolve_reference_chunk_size(N, M, D_score, chunk_size)
+    NC = math.ceil(N / C)
+    PADDED_LEN = NC * C
     PAD = PADDED_LEN - N
 
+    valid_tokens = None
+    if attention_mask is not None:
+        valid_tokens = attention_mask.to(device=device, dtype=torch.bool)
     if PAD > 0:
         K_f = torch.cat([K_f, torch.zeros((B, PAD, H, D_score), device=device, dtype=compute_dtype)], dim=1)
         V_f = torch.cat([V_f, torch.zeros((B, PAD, H, D_value), device=device, dtype=compute_dtype)], dim=1)
-
-    ###
-    # CHUNKING
-    ###
+        if valid_tokens is None:
+            valid_tokens = torch.ones((B, N), device=device, dtype=torch.bool)
+        valid_tokens = torch.cat([valid_tokens, torch.zeros((B, PAD), device=device, dtype=torch.bool)], dim=1)
+        if not weight_sharing_enc_dec and separate_Q_dec:
+            Q_dec_f = torch.cat([Q_dec_f, torch.zeros((B, H, PAD, D_score), device=device, dtype=compute_dtype)], dim=2)
+    elif valid_tokens is not None:
+        valid_tokens = valid_tokens.contiguous()
+    if not weight_sharing_enc_dec and not separate_Q_dec:
+        Q_dec_f = K_f.permute(0, 2, 1, 3).contiguous()
 
     Kc = K_f.reshape(B, NC, C, H, D_score).permute(0, 3, 1, 2, 4).contiguous()
     Vc = V_f.reshape(B, NC, C, H, D_value).permute(0, 3, 1, 2, 4).contiguous()
+    valid_chunk = None
+    if valid_tokens is not None:
+        valid_chunk = valid_tokens.reshape(B, NC, C).unsqueeze(1).unsqueeze(-1)
 
-    #---------------------------------------------------------------#
-    # Phase 0: Compute scores
-    # NEEDS: Q, Kc, Vc
-    # RETURNS: score_chunk
-    #---------------------------------------------------------------#
-
-    score_chunk = scale * torch.einsum("bhncd,hmd->bhncm", Kc, Q_f)  # [B, H, NC, C, M]
-
-    if PAD > 0:
-        score_chunk.view(B, H, PADDED_LEN, M)[:, :, -PAD:, :] = -torch.inf
+    st = _canonicalize_reference_flare_state(
+        state=state,
+        batch_size=B,
+        num_heads=H,
+        num_latents=M,
+        value_head_dim=D_value,
+        device=device,
+    )
 
     phase1_start = phase1_end = None
     phase2_start = phase2_end = None
@@ -391,13 +308,28 @@ def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, c
     # RETURNS: score_chunk_max, score_chunk_den, score_chunk_num
     #---------------------------------------------------------------#
 
-    score_chunk_max = score_chunk.max(dim=3).values                               # [B, H, NC, M]
-    score_chunk_exp = torch.exp(score_chunk - score_chunk_max.unsqueeze(3))       # [B, H, NC, C, M]
-    score_chunk_den = score_chunk_exp.sum(dim=3)                                  # [B, H, NC, M]
+    scale_f = float(scale)
+    score_chunk = scale_f * torch.einsum("bhncd,hmd->bhncm", Kc, Q_f)
+    if valid_chunk is not None:
+        score_chunk = torch.where(valid_chunk, score_chunk, torch.full_like(score_chunk, -float("inf")))
+    elif PAD > 0:
+        score_chunk.view(B, H, PADDED_LEN, M)[:, :, -PAD:, :] = -torch.inf
+
+    score_chunk_max = score_chunk.max(dim=3).values
+    score_chunk_max_safe = torch.where(
+        torch.isinf(score_chunk_max) & (score_chunk_max < 0),
+        torch.zeros_like(score_chunk_max),
+        score_chunk_max,
+    )
+    score_chunk_exp = torch.exp(score_chunk - score_chunk_max_safe.unsqueeze(3))
+    if valid_chunk is not None:
+        score_chunk_exp = score_chunk_exp * valid_chunk.to(score_chunk_exp.dtype)
+    score_chunk_den = score_chunk_exp.sum(dim=3)
     BHNC = B * H * NC
-    exp_b = score_chunk_exp.reshape(BHNC, C, M)
-    V_b = Vc.reshape(BHNC, C, D_value)
-    score_chunk_num = torch.bmm(exp_b.transpose(1, 2), V_b).reshape(B, H, NC, M, D_value)
+    score_chunk_num = torch.bmm(
+        score_chunk_exp.reshape(BHNC, C, M).transpose(1, 2),
+        Vc.reshape(BHNC, C, D_value),
+    ).reshape(B, H, NC, M, D_value)
 
     if profile and torch.cuda.is_available():
         phase1_end.record()
@@ -409,40 +341,41 @@ def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, c
     # RETURNS: score_prev_max, score_prev_den, score_prev_num
     #---------------------------------------------------------------#
 
-    # Score suffix (prev) statistics needed for phase 3
-    score_prev_max = torch.empty(B, H, NC, M, device=device, dtype=compute_dtype)
-    score_prev_den = torch.zeros(B, H, NC, M, device=device, dtype=compute_dtype)
-    score_prev_num = torch.zeros(B, H, NC, M, D_value, device=device, dtype=compute_dtype)
-
-    # temporary variables for prefix statistics
-    max_curr = torch.full((B, H, M), -float("inf"), device=device, dtype=compute_dtype)
-    den_curr = torch.zeros((B, H, M), device=device, dtype=compute_dtype)
-    num_curr = torch.zeros((B, H, M, D_value), device=device, dtype=compute_dtype)
+    score_prev_max = torch.empty(B, H, NC, M, device=device, dtype=torch.float32)
+    score_prev_den = torch.empty(B, H, NC, M, device=device, dtype=torch.float32)
+    score_prev_num = torch.empty(B, H, NC, M, D_value, device=device, dtype=torch.float32)
+    max_curr = st["m"]
+    den_curr = st["d"]
+    num_curr = st["u"]
 
     for chunk_idx in range(NC):
         score_prev_max[:, :, chunk_idx, :] = max_curr
         score_prev_den[:, :, chunk_idx, :] = den_curr
         score_prev_num[:, :, chunk_idx, :, :] = num_curr
-
         sc_max = score_chunk_max[:, :, chunk_idx, :]
         sc_den = score_chunk_den[:, :, chunk_idx, :]
-        sc_num = score_chunk_num[:, :, chunk_idx, :]
-
-        ###
-        ### online softmax update
-        ###
-
-        # get new max (including current chunk)
-        max_new = torch.maximum(max_curr, sc_max)
-
-        # get rescale factors
-        rescale_factor_prev = torch.exp(max_curr - max_new) # rescale factor for previous chunks
-        rescale_factor_curr = torch.exp(sc_max - max_new)   # rescale factor for current chunk
-
-        # update denominator, numerator, max
-        den_curr = den_curr * rescale_factor_prev + sc_den * rescale_factor_curr
-        num_curr = num_curr * rescale_factor_prev.unsqueeze(-1) + sc_num * rescale_factor_curr.unsqueeze(-1)
-        max_curr = max_new
+        sc_num = score_chunk_num[:, :, chunk_idx, :, :]
+        if use_fast_unmasked:
+            max_new = torch.maximum(max_curr, sc_max)
+            rescale_prev = torch.exp(max_curr - max_new)
+            rescale_curr = torch.exp(sc_max - max_new)
+            den_curr = den_curr * rescale_prev + sc_den * rescale_curr
+            num_curr = num_curr * rescale_prev.unsqueeze(-1) + sc_num * rescale_curr.unsqueeze(-1)
+            max_curr = max_new
+        else:
+            max_curr, den_curr, num_curr = _merge_reference_flare_stats(
+                max_curr,
+                den_curr,
+                num_curr,
+                sc_max,
+                sc_den,
+                sc_num,
+            )
+    next_state = {
+        "m": max_curr.contiguous(),
+        "d": den_curr.contiguous(),
+        "u": num_curr.contiguous(),
+    }
 
     if profile and torch.cuda.is_available():
         phase2_end.record()
@@ -453,45 +386,65 @@ def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, c
     # NEEDS: score_chunk, score_prev_*, Vc
     # RETURNS: Yc
     #---------------------------------------------------------------#
-    S = score_chunk  # [B, H, NC, C, M]
-    Yc = torch.empty((B, H, NC, C, D_value), device=device, dtype=compute_dtype)
+    Yc = torch.empty((B, H, NC, C, D_value), device=device, dtype=torch.float32)
     for chunk_idx in range(NC):
         max_curr = score_prev_max[:, :, chunk_idx, :]
         den_curr = score_prev_den[:, :, chunk_idx, :]
         num_curr = score_prev_num[:, :, chunk_idx, :, :]
         for t in range(C):
             token_idx = chunk_idx * C + t
-            s_t = S[:, :, chunk_idx, t, :]
+            s_t = score_chunk[:, :, chunk_idx, t, :]
             v_t = Vc[:, :, chunk_idx, t, :]
-
-            max_new = torch.maximum(max_curr, s_t)
-            rescale_prev = torch.exp(max_curr - max_new)
-            rescale_curr = torch.exp(s_t - max_new)
-            den_curr = den_curr * rescale_prev + rescale_curr
-            num_curr = num_curr * rescale_prev.unsqueeze(-1) + rescale_curr.unsqueeze(-1) * v_t[:, :, None, :]
-            z_t = num_curr / den_curr.unsqueeze(-1)
+            if use_fast_unmasked:
+                max_new = torch.maximum(max_curr, s_t)
+                rescale_prev = torch.exp(max_curr - max_new)
+                rescale_curr = torch.exp(s_t - max_new)
+                den_curr = den_curr * rescale_prev + rescale_curr
+                num_curr = num_curr * rescale_prev.unsqueeze(-1) + rescale_curr.unsqueeze(-1) * v_t[:, :, None, :]
+            else:
+                max_new = torch.maximum(max_curr, s_t)
+                is_m_inf = torch.isinf(max_curr) & (max_curr < 0)
+                is_m_new_inf = torch.isinf(max_new) & (max_new < 0)
+                max_new_safe = torch.where(is_m_new_inf, torch.zeros_like(max_new), max_new)
+                gamma = torch.where(
+                    is_m_inf & is_m_new_inf,
+                    torch.ones_like(max_new),
+                    torch.where(is_m_inf, torch.zeros_like(max_new), torch.exp(max_curr - max_new_safe)),
+                )
+                eta = torch.where(is_m_new_inf, torch.zeros_like(s_t), torch.exp(s_t - max_new_safe))
+                den_curr = den_curr * gamma + eta
+                num_curr = num_curr * gamma.unsqueeze(-1) + eta.unsqueeze(-1) * v_t[:, :, None, :]
+            max_curr = max_new
 
             if token_idx >= N:
                 Yc[:, :, chunk_idx, t, :] = 0.0
-                max_curr = max_new
                 continue
 
             if weight_sharing_enc_dec:
                 a_t = s_t
             else:
                 q_t_dec = Q_dec_f[:, :, token_idx, :]
-                a_t = torch.einsum("bhd,bhmd->bhm", q_t_dec, K_dec_f) * scale
-
-            alpha = torch.softmax(a_t, dim=-1)
-            Yc[:, :, chunk_idx, t, :] = torch.einsum("bhm,bhmd->bhd", alpha, z_t)
-            max_curr = max_new
+                a_t = torch.einsum("bhd,bhmd->bhm", q_t_dec, K_dec_f) * scale_f
+            if use_fast_unmasked:
+                z_t = num_curr / den_curr.unsqueeze(-1)
+                alpha_t = torch.softmax(a_t, dim=-1)
+            else:
+                d_safe = torch.where(den_curr > 0, den_curr, torch.ones_like(den_curr))
+                z_t = num_curr / d_safe.unsqueeze(-1)
+                if valid_chunk is not None:
+                    valid_t = valid_chunk[:, :, chunk_idx, t, :]
+                    a_t = torch.where(valid_t, a_t, torch.zeros_like(a_t))
+                    alpha_t = torch.softmax(a_t, dim=-1) * valid_t.to(a_t.dtype)
+                else:
+                    alpha_t = torch.softmax(a_t, dim=-1)
+            Yc[:, :, chunk_idx, t, :] = torch.einsum("bhm,bhmd->bhd", alpha_t, z_t)
 
     #---------------------------------------------------------------#
     # Return output
     #---------------------------------------------------------------#
 
-    Y = Yc.reshape(B, H, PADDED_LEN, D_value)[:, :, :N, :].permute(0, 2, 1, 3).to(out_dtype)
-    _check_finite("flare_causal_chunked.Y", Y)
+    Y_out = Yc.reshape(B, H, PADDED_LEN, D_value)[:, :, :N, :].permute(0, 2, 1, 3).to(out_dtype)
+    _check_finite("flare_autoregressive_pytorch.Y", Y_out)
     if profile and torch.cuda.is_available():
         phase3_end.record()
         torch.cuda.synchronize()
@@ -500,4 +453,21 @@ def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, c
         _BWD_PROFILE_TIMINGS[mode]["phase1_chunk_stats"] = phase1_start.elapsed_time(phase1_end)
         _BWD_PROFILE_TIMINGS[mode]["phase2_prefix"] = phase2_start.elapsed_time(phase2_end)
         _BWD_PROFILE_TIMINGS[mode]["phase3_output"] = phase3_start.elapsed_time(phase3_end)
-    return Y
+    return (Y_out, next_state) if return_state else Y_out
+
+
+def flare_causal_chunked(Q, K, V, scale=None, eps=None, profile: bool = False, chunk_size=None, Q_dec=None, K_dec=None):
+    return flare_autoregressive_pytorch(
+        Q,
+        K,
+        V,
+        scale=scale,
+        eps=eps,
+        profile=profile,
+        chunk_size=chunk_size,
+        Q_dec=Q_dec,
+        K_dec=K_dec,
+        state=None,
+        attention_mask=None,
+        return_state=False,
+    )

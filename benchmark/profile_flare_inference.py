@@ -30,7 +30,7 @@ except ImportError:
         temp_env,
     )
 
-from causal_flare import flare_decode_triton, flare_prefill_triton
+from causal_flare import flare_autoregressive_decode_triton, flare_autoregressive_prefill_triton
 from causal_flare.autoregressive.inference import _get_decode_step_config, flare_recurrent_step_kernel
 
 
@@ -130,7 +130,7 @@ def average_prefill_profile_timings(
     input_precision: str | None,
 ) -> dict[str, float]:
     def run_once(profile: bool) -> dict[str, object] | None:
-        result = flare_prefill_triton(q, k, v, input_precision=input_precision, profile=profile)
+        result = flare_autoregressive_prefill_triton(q, k, v, input_precision=input_precision, profile=profile)
         if profile:
             (_, _), profile_data = result
             return profile_data
@@ -165,7 +165,7 @@ def average_decode_profile_timings(
         state = clone_state(base_state)
         totals: dict[str, float] = defaultdict(float)
         for step_idx in range(decode_steps):
-            result = flare_decode_triton(
+            result = flare_autoregressive_decode_triton(
                 q,
                 k_steps[step_idx],
                 v_steps[step_idx],
@@ -203,7 +203,11 @@ def bench_prefill_end_to_end_ms(
     *,
     input_precision: str | None,
 ) -> float:
-    return float(triton.testing.do_bench(lambda: flare_prefill_triton(q, k, v, input_precision=input_precision)))
+    return float(
+        triton.testing.do_bench(
+            lambda: flare_autoregressive_prefill_triton(q, k, v, input_precision=input_precision)
+        )
+    )
 
 
 def bench_decode_end_to_end_ms(
@@ -217,7 +221,7 @@ def bench_decode_end_to_end_ms(
     def op():
         state = clone_state(base_state)
         for step_idx in range(k_steps.shape[0]):
-            _, state = flare_decode_triton(
+            _, state = flare_autoregressive_decode_triton(
                 q,
                 k_steps[step_idx],
                 v_steps[step_idx],
@@ -298,7 +302,7 @@ def bench_case(
             v_prompt = torch.randn(case.batch_size, case.seq_len, case.num_heads, case.head_dim, device=device, dtype=dtype)
             k_steps = torch.randn(decode_steps, case.batch_size, case.num_heads, case.head_dim, device=device, dtype=dtype)
             v_steps = torch.randn(decode_steps, case.batch_size, case.num_heads, case.head_dim, device=device, dtype=dtype)
-            _, base_state = flare_prefill_triton(q, k_prompt, v_prompt, input_precision=input_precision)
+            _, base_state = flare_autoregressive_prefill_triton(q, k_prompt, v_prompt, input_precision=input_precision)
             compiled_decode = compile_decode_kernel(
                 q,
                 k_steps[0],
