@@ -51,6 +51,260 @@ def _validate_block_causal_config(*, N: int, block_size, chunk_size, name: str):
     return block_size, chunk_size, num_blocks, num_chunks, chunks_per_block
 
 
+def _build_block_causal_forward_state(
+    Q,
+    K,
+    V,
+    *,
+    block_size,
+    chunk_size,
+    scale=None,
+    Q_dec=None,
+    K_dec=None,
+):
+    return _block_causal_forward_pytorch(
+        Q,
+        K,
+        V,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+        Q_dec=Q_dec,
+        K_dec=K_dec,
+        _return_state=True,
+    )
+
+
+def _block_causal_summary_backward_pytorch(
+    LSE_enc: torch.Tensor,
+    z_block: torch.Tensor,
+    dZ_block: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Map dZ on inclusive block summaries back to local block-summary gradients.
+
+    Forward phase 2 produces, for each block `g`:
+      A_g = exp(LSE_enc[g])
+      B_g = A_g * z_block[g]
+
+    where `A_g` is the inclusive encoder normalizer through block `g`, and `B_g` is the
+    corresponding inclusive value numerator. Decoder backward first gives us `dZ_block`,
+    i.e. gradients with respect to the normalized summaries `z_block[g] = B_g / A_g`.
+
+    This helper converts those gradients back into:
+    - `a_block[g]`: the *local* encoder normalizer contributed by block `g`
+    - `dA_block[g]`: gradient on each local block normalizer
+    - `dB_block[g]`: gradient on each local block numerator
+
+    The reverse cumulative sums appear because every local block summary contributes to
+    every later inclusive summary.
+    """
+
+    a_prefix = torch.exp(LSE_enc.float())
+    z_block_f = z_block.float()
+    dZ_block_f = dZ_block.float()
+    inv_a = torch.where(a_prefix > 0, a_prefix.reciprocal(), torch.zeros_like(a_prefix))
+
+    dB_prefix = dZ_block_f * inv_a.unsqueeze(-1)
+    dA_prefix = -(dZ_block_f * z_block_f).sum(dim=-1) * inv_a
+
+    dB_block = torch.flip(torch.cumsum(torch.flip(dB_prefix, dims=(2,)), dim=2), dims=(2,))
+    dA_block = torch.flip(torch.cumsum(torch.flip(dA_prefix, dims=(2,)), dim=2), dims=(2,))
+
+    a_prev = torch.zeros_like(a_prefix)
+    a_prev[:, :, 1:, :] = a_prefix[:, :, :-1, :]
+    a_block = (a_prefix - a_prev).clamp_min(0.0)
+    return a_block, dA_block, dB_block
+
+
+def _block_causal_backward_pytorch(
+    Q,
+    K,
+    V,
+    dY,
+    *,
+    block_size,
+    chunk_size,
+    scale=None,
+    Q_dec=None,
+    K_dec=None,
+    return_aux: bool = False,
+):
+    """Reference backward pass matching `_block_causal_forward_pytorch`.
+
+    The backward is structured in the same phases as the forward:
+    1. replay decoder softmaxes to produce `dZ_block` and decoder-side gradients
+    2. map `dZ_block` back to local encoder block-summary gradients
+    3. replay encoder block softmaxes to recover `dQ`, `dK`, and `dV`
+    """
+
+    state = _build_block_causal_forward_state(
+        Q,
+        K,
+        V,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+        Q_dec=Q_dec,
+        K_dec=K_dec,
+    )
+
+    B = state["B"]
+    N = state["N"]
+    H = state["H"]
+    M = state["M"]
+    D_value = state["D_value"]
+    block_size = state["block_size"]
+    chunk_size = state["chunk_size"]
+    num_blocks = state["num_blocks"]
+    chunks_per_block = state["chunks_per_block"]
+    scale = state["scale"]
+
+    q_bank = state["Q_f"]
+    k_tokens = state["K_tokens"]
+    v_tokens = state["V_tokens"]
+    q_dec_tokens = state["Q_dec_tokens"]
+    k_dec_bank = state["K_dec_bank"]
+    y_tokens = state["Y"].float().permute(0, 2, 1, 3).contiguous()
+    dy_tokens = dY.float().permute(0, 2, 1, 3).contiguous()
+    lse_dec = state["LSE_dec"].float()
+    lse_enc = state["LSE_enc"].float()
+    z_block = state["z_block"].float()
+
+    dQ_shared = torch.zeros_like(q_bank)
+    dK_shared_tokens = torch.zeros_like(k_tokens)
+    dQ_dec_tokens = torch.zeros_like(q_dec_tokens) if state["separate_Q_dec"] else None
+    dK_dec = torch.zeros_like(k_dec_bank) if state["separate_K_dec"] else None
+    dZ_block = torch.zeros((B, H, num_blocks, M, D_value), device=Q.device, dtype=torch.float32)
+
+    # For a softmax output `Y[t]`, `delta[t] = <dY[t], Y[t]>` is the standard contraction
+    # used to form `dS = P * (dP - delta)`. We precompute it once because phase 1 replays
+    # every decoder token against the latent bank.
+    delta = (y_tokens * dy_tokens).sum(dim=-1)
+
+    # -------------------------------------------------------------------------
+    # Phase 1: replay decoder softmaxes
+    # -------------------------------------------------------------------------
+    # The forward output phase computed:
+    #   alpha[t, m] = softmax_dec(dec_scores[t, m])
+    #   Y[t, d] = sum_m alpha[t, m] * z_block[block(t), m, d]
+    #
+    # Backward therefore has two jobs in this phase:
+    # 1. accumulate dZ_block from all tokens that consume the same block summary
+    # 2. propagate decoder-softmax gradients into the decode/shared Q/K parameters
+    #
+    # Crucially, this phase touches only decoder-side quantities plus the saved `z_block`;
+    # raw encoder tokens do not reappear until phase 3.
+    for block_idx in range(num_blocks):
+        z_block_blk = z_block[:, :, block_idx, :, :]
+        for local_q_chunk in range(chunks_per_block):
+            token_start = block_idx * block_size + local_q_chunk * chunk_size
+            token_end = token_start + chunk_size
+
+            q_chunk = q_dec_tokens[:, :, token_start:token_end, :]
+            dy_chunk = dy_tokens[:, :, token_start:token_end, :]
+            lse_dec_chunk = lse_dec[:, :, token_start:token_end]
+            delta_chunk = delta[:, :, token_start:token_end]
+
+            # Replay the decoder weights for this query chunk against the latent bank.
+            dec_scores_chunk = scale * torch.einsum("bhcd,hmd->bhcm", q_chunk, k_dec_bank)
+            alpha = torch.exp(dec_scores_chunk - lse_dec_chunk.unsqueeze(-1))
+
+            # Every token in this block consumes the same `z_block[block_idx]`, so their
+            # contributions all accumulate into the same dZ slice.
+            dZ_block[:, :, block_idx, :, :] += torch.einsum("bhcm,bhcd->bhmd", alpha, dy_chunk)
+
+            # Differentiate Y[t] = alpha[t] @ z_block[block(t)] through the decoder softmax.
+            dAlpha = torch.einsum("bhcd,bhmd->bhcm", dy_chunk, z_block_blk)
+            dS_dec = alpha * (dAlpha - delta_chunk.unsqueeze(-1))
+            grad_query = scale * torch.einsum("bhcm,hmd->bhcd", dS_dec, k_dec_bank)
+            grad_key = scale * torch.einsum("bhcm,bhcd->hmd", dS_dec, q_chunk)
+
+            # When decode weights are shared, decoder-query gradients land on encoder-token
+            # K and decoder-key gradients land on the shared latent bank Q. Otherwise they
+            # go to the explicit Q_dec / K_dec tensors.
+            if dQ_dec_tokens is None:
+                dK_shared_tokens[:, :, token_start:token_end, :] += grad_query
+            else:
+                dQ_dec_tokens[:, :, token_start:token_end, :] += grad_query
+
+            if dK_dec is None:
+                dQ_shared += grad_key
+            else:
+                dK_dec += grad_key
+
+    # -------------------------------------------------------------------------
+    # Phase 2: map inclusive `dZ_block` back to local block summary gradients
+    # -------------------------------------------------------------------------
+    # Forward phase 2 turned local block summaries into inclusive `z_block`. Before we can
+    # replay encoder tokens, we need gradients with respect to each *local* block's
+    # numerator/normalizer contribution.
+    a_block, dA_block, dB_block = _block_causal_summary_backward_pytorch(lse_enc, z_block, dZ_block)
+
+    dQ_enc = torch.zeros_like(q_bank)
+    dK_tokens = torch.zeros_like(k_tokens)
+    dV_tokens = torch.zeros_like(v_tokens)
+    block_lse = torch.log(a_block.clamp_min(1e-20))
+
+    # -------------------------------------------------------------------------
+    # Phase 3: replay encoder block softmaxes
+    # -------------------------------------------------------------------------
+    # This mirrors forward phase 1, but now each local encoder chunk replays its block-local
+    # softmax so we can push gradients from `(dA_block, dB_block)` back into:
+    # - encoder values V through the local numerator path
+    # - encoder keys K and shared latent bank Q through the local score path
+    for block_idx in range(num_blocks):
+        a_block_blk = a_block[:, :, block_idx, :]
+        dA_block_blk = dA_block[:, :, block_idx, :]
+        dB_block_blk = dB_block[:, :, block_idx, :, :]
+        lse_block = block_lse[:, :, block_idx, :]
+        for local_src_chunk in range(chunks_per_block):
+            token_start = block_idx * block_size + local_src_chunk * chunk_size
+            token_end = token_start + chunk_size
+
+            k_chunk = k_tokens[:, :, token_start:token_end, :]
+            v_chunk = v_tokens[:, :, token_start:token_end, :]
+
+            # `p_block` is the block-local encoder softmax probability in the local block
+            # frame. Multiplying by `a_block_blk` converts it back to the raw local weight
+            # on this block's numerator/normalizer contribution.
+            enc_scores_chunk = scale * torch.einsum("bhcd,hmd->bhcm", k_chunk, q_bank)
+            p_block = torch.exp(enc_scores_chunk - lse_block.unsqueeze(2))
+            raw_weights = p_block * a_block_blk.unsqueeze(2)
+
+            # The local numerator is a weighted sum of encoder values, so dV is just a
+            # contraction of those raw weights with the numerator gradient.
+            dV_tokens[:, :, token_start:token_end, :] = torch.einsum("bhcm,bhmd->bhcd", raw_weights, dB_block_blk)
+
+            # Differentiate the same local numerator w.r.t. the encoder scores, then push
+            # those score gradients back into encoder K and shared latent-bank Q.
+            v_proj = torch.einsum("bhcd,bhmd->bhcm", v_chunk, dB_block_blk)
+            dS_enc = raw_weights * (dA_block_blk.unsqueeze(2) + v_proj)
+
+            dK_tokens[:, :, token_start:token_end, :] = scale * torch.einsum("bhcm,hmd->bhcd", dS_enc, q_bank)
+            dQ_enc += scale * torch.einsum("bhcm,bhcd->hmd", dS_enc, k_chunk)
+
+    # Merge the encoder-side latent-bank gradient with any shared decoder contribution,
+    # then convert everything back to the public layouts/dtypes expected by callers.
+    dQ = (dQ_enc + dQ_shared).to(Q.dtype)
+    dK = (dK_tokens + dK_shared_tokens).permute(0, 2, 1, 3).contiguous().to(K.dtype)
+    dV = dV_tokens.permute(0, 2, 1, 3).contiguous().to(V.dtype)
+    dQ_dec = dQ_dec_tokens.permute(0, 2, 1, 3).contiguous().to(Q_dec.dtype) if dQ_dec_tokens is not None else None
+    dK_dec = dK_dec.to(K_dec.dtype) if dK_dec is not None else None
+
+    if not return_aux:
+        return dQ, dK, dV, dQ_dec, dK_dec
+    return (dQ, dK, dV, dQ_dec, dK_dec), {
+        "Y": state["Y"],
+        "LSE_dec": lse_dec,
+        "LSE_enc": lse_enc,
+        "z_block": z_block,
+        "dZ_block": dZ_block,
+        "a_block": a_block,
+        "dA_block": dA_block,
+        "dB_block": dB_block,
+    }
+
+
 def _block_causal_forward_pytorch(
     Q,
     K,
@@ -62,8 +316,15 @@ def _block_causal_forward_pytorch(
     Q_dec=None,
     K_dec=None,
     return_aux: bool = False,
+    _return_state: bool = False,
 ):
     """Reference semi-autoregressive / block-causal forward pass.
+
+    The implementation intentionally follows the same three-phase structure as
+    `SemiAutoRegressiveFLARE.forward` in the Triton path:
+    1. prepare: summarize each encoder block into local max/den/num statistics
+    2. scan_block_z: inclusive-scan those local summaries into one normalized `z_block` per block
+    3. output: compute decoder LSEs and outputs using only the per-block `z_block` summaries
 
     Shapes:
     - `Q`: `[H, M, D_score]`
@@ -84,30 +345,6 @@ def _block_causal_forward_pytorch(
       - `LSE_enc`: `[B, H, num_blocks, M]`
     """
 
-    # This is the readable reference version of the semi-autoregressive / block-causal
-    # algorithm. It is organized as a sequence of explicit phases that mirror the
-    # intended chunkwise training structure:
-    #
-    # Phase 0: validate shapes, canonicalize decode inputs, and reshape K/V into
-    #          block-aligned chunk views.
-    # Phase 1: iterate through source chunks inside each block and reduce them directly
-    #          into one per-block encoder summary.
-    # Phase 2: prefix-scan those block summaries so each block sees all strictly
-    #          previous blocks.
-    # Phase 3: finish the encoder and decoder normalizers. For the encoder this means
-    #          the full within-block cumulative log-sum-exp. For the decoder this means
-    #          one log-sum-exp over the latent axis for each query token chunk.
-    # Phase 4: assemble outputs by combining two sources:
-    #          1. the prefix contribution from all completed previous blocks
-    #          2. the within-block contribution from every source chunk in the current block
-    # The implementation is intentionally explicit rather than clever so the dataflow is easy
-    # to compare against the future Triton path.
-
-    # Phase 0: validate the block-causal layout and canonicalize decode-side inputs.
-    # Public layout:
-    #   Q: [H, M, D_score]
-    #   K: [B, N, H, D_score]
-    #   V: [B, N, H, D_value]
     B, N, H, M, D_score, D_value = _validate_flare_qkv_layouts(Q, K, V, name="Block-Causal FLARE")
     block_size, chunk_size, _, _, chunks_per_block = _validate_block_causal_config(
         N=N,
@@ -124,56 +361,65 @@ def _block_causal_forward_pytorch(
     stats_dtype = torch.float32
     out_dtype = V.dtype
     num_blocks = N // block_size
-    chunks_per_block = block_size // chunk_size
 
-    # Run score computation and value accumulation in FP32. This keeps the numerically
-    # sensitive softmax-weighted numerator path stable even when the caller provides BF16.
-    Q_f = Q.to(compute_dtype)  # [H, M, D_score]
-    K_f = K.to(compute_dtype)  # [B, N, H, D_score]
-    V_f = V.to(compute_dtype)  # [B, N, H, D_value]
+    # Canonicalize everything into the layouts the three phases operate on:
+    # - encoder tokens: [B, H, N, ...]
+    # - decoder queries: [B, H, N, D_score]
+    # - latent bank: [H, M, D_score]
+    # The reference keeps intermediates in FP32 so the local and scanned softmax state is
+    # easy to compare against the Triton path without BF16/FP16 accumulator noise.
+    Q_f = Q.to(compute_dtype)
+    K_f = K.to(compute_dtype)
+    V_f = V.to(compute_dtype)
+    K_tokens = K_f.permute(0, 2, 1, 3).contiguous()
+    V_tokens = V_f.permute(0, 2, 1, 3).contiguous()
+    q_dec_comp = Q_dec.to(compute_dtype) if separate_Q_dec else K_f
+    k_dec_comp = K_dec.to(compute_dtype) if separate_K_dec else Q_f
+    Q_dec_tokens = q_dec_comp.permute(0, 2, 1, 3).contiguous()
+    K_dec_bank = k_dec_comp
 
-    # The decode branch can either share weights with the encode branch or use separate
-    # Q_dec/K_dec projections. Canonicalize both cases into the same [B, H, ...] layout.
-    if weight_sharing_enc_dec:
-        Q_dec_f = None
-        K_dec_f = None
-    else:
-        q_dec_comp = Q_dec.to(compute_dtype) if separate_Q_dec else K_f
-        k_dec_comp = K_dec.to(compute_dtype) if separate_K_dec else Q_f
-        Q_dec_f = q_dec_comp.permute(0, 2, 1, 3).contiguous()  # [B, H, N, D_score]
-        K_dec_f = k_dec_comp.unsqueeze(0).expand(B, -1, -1, -1).contiguous()  # [B, H, M, D_score]
-
-    # Reinterpret K/V as [B, H, block, local_chunk, token_in_chunk, D]. This makes the
-    # later block-local and chunk-local scans explicit and avoids re-slicing flat [B, N, ...]
-    # tensors over and over inside the phase loops.
+    # The encoder prepare loop works in block/chunk coordinates because `chunk_size` is
+    # still part of the public block-causal reference contract today.
     Kc = K_f.reshape(B, num_blocks, chunks_per_block, chunk_size, H, D_score).permute(0, 4, 1, 2, 3, 5).contiguous()
-    Kc = Kc  # [B, H, num_blocks, chunks_per_block, chunk_size, D_score]
     Vc = V_f.reshape(B, num_blocks, chunks_per_block, chunk_size, H, D_value).permute(0, 4, 1, 2, 3, 5).contiguous()
-    Vc = Vc  # [B, H, num_blocks, chunks_per_block, chunk_size, D_value]
 
-    BHB = B * H
-    # Chunking is only the internal reduction schedule used to build one encoder summary
-    # per block. The reference stores only block-level summaries.
-    block_max = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
-    block_den = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
+    # -------------------------------------------------------------------------
+    # Phase 1: prepare
+    # -------------------------------------------------------------------------
+    # Compute one local encoder summary per block:
+    #   block_max[g, m]
+    #   block_den[g, m]
+    #   block_num[g, m, d]
+    #
+    # These summarize only tokens inside block `g`. No cross-block information is mixed
+    # here yet. This directly matches the role of the Triton prepare kernel.
+    bh = B * H
+    block_max = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)
+    block_den = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)
     block_num = torch.empty((B, H, num_blocks, M, D_value), device=Q.device, dtype=compute_dtype)
+
     for block_idx in range(num_blocks):
-        max_block = torch.full((B, H, M), -float("inf"), device=Q.device, dtype=stats_dtype)  # [B, H, M]
-        den_block = torch.zeros((B, H, M), device=Q.device, dtype=stats_dtype)  # [B, H, M]
-        num_block = torch.zeros((B, H, M, D_value), device=Q.device, dtype=compute_dtype)  # [B, H, M, D_value]
+        max_block = torch.full((B, H, M), -float("inf"), device=Q.device, dtype=stats_dtype)
+        den_block = torch.zeros((B, H, M), device=Q.device, dtype=stats_dtype)
+        num_block = torch.zeros((B, H, M, D_value), device=Q.device, dtype=compute_dtype)
 
         for local_chunk in range(chunks_per_block):
-            k_chunk = Kc[:, :, block_idx, local_chunk, :, :]  # [B, H, chunk_size, D_score]
-            v_chunk = Vc[:, :, block_idx, local_chunk, :, :]  # [B, H, chunk_size, D_value]
-            score_chunk = scale * torch.einsum("bhcd,hmd->bhcm", k_chunk, Q_f)  # [B, H, chunk_size, M]
-            chunk_max = score_chunk.max(dim=2).values.to(stats_dtype)  # [B, H, M]
-            chunk_exp = torch.exp(score_chunk - chunk_max.to(compute_dtype).unsqueeze(2))  # [B, H, chunk_size, M]
-            chunk_den = chunk_exp.to(stats_dtype).sum(dim=2)  # [B, H, M]
-            chunk_num = torch.bmm(
-                chunk_exp.reshape(BHB, chunk_size, M).transpose(1, 2),
-                v_chunk.reshape(BHB, chunk_size, D_value),
-            ).reshape(B, H, M, D_value)  # [B, H, M, D_value]
+            k_chunk = Kc[:, :, block_idx, local_chunk, :, :]
+            v_chunk = Vc[:, :, block_idx, local_chunk, :, :]
 
+            # Score each token in this encoder chunk against every latent in the shared bank.
+            # Shape: [B, H, chunk_size, M]
+            score_chunk = scale * torch.einsum("bhcd,hmd->bhcm", k_chunk, Q_f)
+            chunk_max = score_chunk.max(dim=2).values.to(stats_dtype)
+            chunk_exp = torch.exp(score_chunk - chunk_max.to(compute_dtype).unsqueeze(2))
+            chunk_den = chunk_exp.to(stats_dtype).sum(dim=2)
+            chunk_num = torch.bmm(
+                chunk_exp.reshape(bh, chunk_size, M).transpose(1, 2),
+                v_chunk.reshape(bh, chunk_size, D_value),
+            ).reshape(B, H, M, D_value)
+
+            # Merge the current chunk into the running block-local softmax state using the
+            # standard stable max/denominator rescaling formula.
             max_new = torch.maximum(max_block, chunk_max)
             rescale_prev = torch.exp(max_block - max_new)
             rescale_chunk = torch.exp(chunk_max - max_new)
@@ -188,25 +434,33 @@ def _block_causal_forward_pytorch(
         block_den[:, :, block_idx, :] = den_block
         block_num[:, :, block_idx, :, :] = num_block
 
-    # Phase 2: prefix-scan the per-block summaries. This is the first saved-summary level
-    # the eventual Triton path would likely write, since block summaries are sufficient to
-    # represent all completed earlier blocks.
-    prefix_max = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
-    prefix_den = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
-    prefix_num = torch.empty((B, H, num_blocks, M, D_value), device=Q.device, dtype=compute_dtype)
-    full_block_max = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
-    full_block_den = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)  # [B, H, num_blocks, M]
-    max_curr = torch.full((B, H, M), -float("inf"), device=Q.device, dtype=stats_dtype)  # [B, H, M]
-    den_curr = torch.zeros((B, H, M), device=Q.device, dtype=stats_dtype)  # [B, H, M]
-    num_curr = torch.zeros((B, H, M, D_value), device=Q.device, dtype=compute_dtype)  # [B, H, M, D_value]
+    # -------------------------------------------------------------------------
+    # Phase 2: scan_block_z
+    # -------------------------------------------------------------------------
+    # Inclusive-scan the local block summaries so block `g` sees all encoder tokens from
+    # blocks `<= g`. This produces the encoder-side outputs consumed by backward/output:
+    #   LSE_enc[g, m]
+    #   z_block[g, m, d]
+    prefix_max = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)
+    prefix_den = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)
+    full_block_max = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)
+    full_block_den = torch.empty((B, H, num_blocks, M), device=Q.device, dtype=stats_dtype)
+    full_block_num = torch.empty((B, H, num_blocks, M, D_value), device=Q.device, dtype=compute_dtype)
+
+    max_curr = torch.full((B, H, M), -float("inf"), device=Q.device, dtype=stats_dtype)
+    den_curr = torch.zeros((B, H, M), device=Q.device, dtype=stats_dtype)
+    num_curr = torch.zeros((B, H, M, D_value), device=Q.device, dtype=compute_dtype)
+
     for block_idx in range(num_blocks):
+        # Save the exclusive prefix before folding in the current block. These match the
+        # corresponding saved forward summaries in the Triton path.
         prefix_max[:, :, block_idx, :] = max_curr
         prefix_den[:, :, block_idx, :] = den_curr
-        prefix_num[:, :, block_idx, :, :] = num_curr
 
         bm = block_max[:, :, block_idx, :]
         bd = block_den[:, :, block_idx, :]
         bn = block_num[:, :, block_idx, :, :]
+
         max_new = torch.maximum(max_curr, bm)
         rescale_prev = torch.exp(max_curr - max_new)
         rescale_block = torch.exp(bm - max_new)
@@ -219,65 +473,67 @@ def _block_causal_forward_pytorch(
 
         full_block_max[:, :, block_idx, :] = max_curr
         full_block_den[:, :, block_idx, :] = den_curr
+        full_block_num[:, :, block_idx, :, :] = num_curr
 
-    # Phase 3a: compute all decode-side scores in block/chunk layout, then one logsumexp
-    # over the latent axis produces the decoder normalizer for every query token.
-    if weight_sharing_enc_dec:
-        dec_scores = scale * torch.einsum("bhgxcd,hmd->bhgxcm", Kc, Q_f)  # [B, H, num_blocks, chunks_per_block, chunk_size, M]
-    else:
-        Q_dec_chunks = Q_dec_f.reshape(B, H, num_blocks, chunks_per_block, chunk_size, D_score)
-        Kc_dec = K_dec_f.unsqueeze(2).unsqueeze(3).expand(-1, -1, num_blocks, chunks_per_block, -1, -1)
-        dec_scores = scale * (Kc_dec @ Q_dec_chunks.mT).transpose(-1, -2)
-    LSE_dec = torch.logsumexp(dec_scores.to(stats_dtype), dim=-1).reshape(B, H, N)  # [B, H, N]
+    LSE_enc = torch.log(full_block_den.clamp_min(1e-20)) + full_block_max
+    z_block = full_block_num * torch.exp(full_block_max - LSE_enc).to(compute_dtype).unsqueeze(-1)
 
-    # Phase 3b: The encoder-side normalization is stored as log(sum(exp(.))) so later phases do not
-    # need to carry separate max/denominator tensors unless they are explicitly inspecting
-    # intermediate summaries.
-    LSE_enc = torch.log(full_block_den) + full_block_max  # [B, H, num_blocks, M]
-
-    # Phase 4: assemble outputs. Each query chunk receives:
-    #   - a prefix contribution from all completed previous blocks, already summarized in
-    #     prefix_num / prefix_max / LSE_enc
-    #   - a current-block contribution formed by mixing decoder weights (alpha) with
-    #     encoder weights for each source chunk in the same block
+    # -------------------------------------------------------------------------
+    # Phase 3: output
+    # -------------------------------------------------------------------------
+    # Decoder-side work now depends only on:
+    # - per-token decode queries
+    # - the latent key bank
+    # - the per-block encoder summary `z_block`
     #
-    # The inner local_src_chunk loop is intentionally explicit: it makes it obvious that
-    # within-block interactions are retained in full, while earlier blocks only appear via
-    # their prefix summary.
-    Yc = torch.empty((B, H, num_blocks, chunks_per_block, chunk_size, D_value), device=Q.device, dtype=compute_dtype)
-    # Yc: [B, H, num_blocks, chunks_per_block, chunk_size, D_value]
-    for block_idx in range(num_blocks):
-        prefix_block_num = prefix_num[:, :, block_idx, :, :]  # [B, H, M, D_value]
-        lse_enc_block = LSE_enc[:, :, block_idx, :]  # [B, H, M]
-        prefix_scale = torch.exp(prefix_max[:, :, block_idx, :] - lse_enc_block).to(compute_dtype).unsqueeze(-1)  # [B, H, M, 1]
-        prefix_value = prefix_block_num * prefix_scale  # [B, H, M, D_value]
+    # This is the main debugging-friendly structural point: once phase 2 is done, output
+    # never replays raw encoder tokens.
+    q_dec_blocks = Q_dec_tokens.reshape(B, H, num_blocks, block_size, D_score)
+    dec_scores = scale * torch.einsum("bhgtd,hmd->bhgtm", q_dec_blocks, K_dec_bank)
+    lse_dec_blocks = torch.logsumexp(dec_scores.to(stats_dtype), dim=-1)
+    alpha = torch.exp(dec_scores - lse_dec_blocks.to(compute_dtype).unsqueeze(-1))
+    Y_blocks = torch.einsum("bhgtm,bhgmd->bhgtd", alpha, z_block)
+    Y = Y_blocks.reshape(B, H, N, D_value).permute(0, 2, 1, 3).to(out_dtype)
 
-        for local_q_chunk in range(chunks_per_block):
-            token_start = (block_idx * chunks_per_block + local_q_chunk) * chunk_size
+    if _return_state:
+        return {
+            "B": B,
+            "N": N,
+            "H": H,
+            "M": M,
+            "D_score": D_score,
+            "D_value": D_value,
+            "block_size": block_size,
+            "chunk_size": chunk_size,
+            "num_blocks": num_blocks,
+            "chunks_per_block": chunks_per_block,
+            "scale": scale,
+            "Q_f": Q_f,
+            "K_f": K_f,
+            "V_f": V_f,
+            "K_tokens": K_tokens,
+            "V_tokens": V_tokens,
+            "Q_dec_tokens": Q_dec_tokens,
+            "K_dec_bank": K_dec_bank,
+            "Kc": Kc,
+            "Vc": Vc,
+            "Y": Y,
+            "LSE_dec": lse_dec_blocks.reshape(B, H, N),
+            "LSE_enc": LSE_enc,
+            "z_block": z_block,
+            "prefix_max": prefix_max,
+            "prefix_den": prefix_den,
+            "block_max": block_max,
+            "block_den": block_den,
+            "block_num": block_num,
+            "separate_Q_dec": separate_Q_dec,
+            "separate_K_dec": separate_K_dec,
+            "weight_sharing_enc_dec": weight_sharing_enc_dec,
+        }
 
-            dec_scores_chunk = dec_scores[:, :, block_idx, local_q_chunk, :, :]  # [B, H, chunk_size, M]
-            lse_dec_chunk = LSE_dec[:, :, token_start : token_start + chunk_size]  # [B, H, chunk_size]
-            alpha = torch.exp(dec_scores_chunk - lse_dec_chunk.to(compute_dtype).unsqueeze(-1))  # [B, H, chunk_size, M]
-
-            y_chunk = torch.einsum("bhcm,bhmd->bhcd", alpha, prefix_value)  # [B, H, chunk_size, D_value]
-            for local_src_chunk in range(chunks_per_block):
-                enc_scores_chunk = scale * torch.einsum(
-                    "bhcd,hmd->bhcm", Kc[:, :, block_idx, local_src_chunk, :, :], Q_f
-                )  # [B, H, chunk_size, M]
-                enc_weights = torch.exp(
-                    enc_scores_chunk - lse_enc_block.to(compute_dtype).unsqueeze(2)
-                )  # [B, H, chunk_size, M]
-                beta = torch.einsum("bhcm,bhum->bhcu", alpha, enc_weights)  # [B, H, chunk_size, chunk_size]
-                y_chunk = y_chunk + torch.einsum(
-                    "bhcu,bhud->bhcd", beta, Vc[:, :, block_idx, local_src_chunk, :, :]
-                )  # [B, H, chunk_size, D_value]
-            Yc[:, :, block_idx, local_q_chunk, :, :] = y_chunk
-
-    # Collapse the block/chunk view back to the public [B, N, H, D_value] layout.
-    Y = Yc.reshape(B, H, N, D_value).permute(0, 2, 1, 3).to(out_dtype)  # [B, N, H, D_value]
     if not return_aux:
         return Y
-    return Y, {"LSE_dec": LSE_dec, "LSE_enc": LSE_enc}
+    return Y, {"LSE_dec": lse_dec_blocks.reshape(B, H, N), "LSE_enc": LSE_enc}
 
 
 def _benchmark_callable(fn, *, warmup: int, iters: int, device: torch.device):

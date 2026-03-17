@@ -9,6 +9,7 @@ from causal_flare.semi_autoregressive import (
     flare_semi_autoregressive_trition,
 )
 from causal_flare.semi_autoregressive.reference import (
+    _block_causal_backward_pytorch,
     _block_causal_forward_pytorch,
     semi_autoregressive_flare_reference,
 )
@@ -72,6 +73,106 @@ def test_block_causal_forward_matches_sdpa_reference(
     assert aux["LSE_dec"].shape == (B, H, seq_len)
     assert aux["LSE_enc"].shape == (B, H, (seq_len + block_size - 1) // block_size, M)
     torch.testing.assert_close(y_impl, y_ref, rtol=1e-4, atol=1e-5)
+
+
+def test_block_causal_reference_backward_matches_autograd():
+    torch.manual_seed(21)
+
+    B = 2
+    N = 48
+    H = 3
+    M = 5
+    D = 16
+    block_size = 16
+    chunk_size = 16
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), dtype=torch.float32)
+    k = torch.randn((B, N, H, D), dtype=torch.float32)
+    v = torch.randn((B, N, H, D), dtype=torch.float32)
+    dy = torch.randn((B, N, H, D), dtype=torch.float32)
+
+    dQ, dK, dV, dQ_dec, dK_dec = _block_causal_backward_pytorch(
+        q,
+        k,
+        v,
+        dy,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+    )
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    y_ref, _ = _block_causal_forward_pytorch(
+        q_ref,
+        k_ref,
+        v_ref,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+        return_aux=True,
+    )
+    grads_ref = torch.autograd.grad(y_ref, (q_ref, k_ref, v_ref), grad_outputs=dy)
+
+    assert dQ_dec is None
+    assert dK_dec is None
+    for grad, grad_ref in zip((dQ, dK, dV), grads_ref):
+        torch.testing.assert_close(grad, grad_ref, rtol=1e-4, atol=1e-5)
+
+
+def test_block_causal_reference_backward_matches_autograd_with_separate_decode_weights():
+    torch.manual_seed(22)
+
+    B = 2
+    N = 48
+    H = 3
+    M = 5
+    D = 16
+    block_size = 16
+    chunk_size = 16
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), dtype=torch.float32)
+    k = torch.randn((B, N, H, D), dtype=torch.float32)
+    v = torch.randn((B, N, H, D), dtype=torch.float32)
+    q_dec = torch.randn((B, N, H, D), dtype=torch.float32)
+    k_dec = torch.randn((H, M, D), dtype=torch.float32)
+    dy = torch.randn((B, N, H, D), dtype=torch.float32)
+
+    dQ, dK, dV, dQ_dec, dK_dec = _block_causal_backward_pytorch(
+        q,
+        k,
+        v,
+        dy,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+        Q_dec=q_dec,
+        K_dec=k_dec,
+    )
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    q_dec_ref = q_dec.detach().clone().requires_grad_(True)
+    k_dec_ref = k_dec.detach().clone().requires_grad_(True)
+    y_ref, _ = _block_causal_forward_pytorch(
+        q_ref,
+        k_ref,
+        v_ref,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+        Q_dec=q_dec_ref,
+        K_dec=k_dec_ref,
+        return_aux=True,
+    )
+    grads_ref = torch.autograd.grad(y_ref, (q_ref, k_ref, v_ref, q_dec_ref, k_dec_ref), grad_outputs=dy)
+
+    for grad, grad_ref in zip((dQ, dK, dV, dQ_dec, dK_dec), grads_ref):
+        torch.testing.assert_close(grad, grad_ref, rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton path")
@@ -426,6 +527,56 @@ def test_block_causal_training_wrapper_backward_matches_reference_on_cuda_with_s
 
     for grad, grad_ref in zip(grads, grads_ref):
         torch.testing.assert_close(grad, grad_ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(
+    os.environ.get("FLARE_RUN_BLOCK_CAUSAL_LARGE_BWD", "0") != "1" or not torch.cuda.is_available(),
+    reason="set FLARE_RUN_BLOCK_CAUSAL_LARGE_BWD=1 on CUDA to run the large backward validation",
+)
+def test_block_causal_training_wrapper_large_backward_matches_reference_on_cuda():
+    torch.manual_seed(11)
+
+    B = 4
+    H = 16
+    M = 64
+    N = 8192
+    D = 32
+    block_size = 256
+    chunk_size = 128
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn((B, N, H, D), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn((B, N, H, D), device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    y, _ = flare_semi_autoregressive_trition(
+        q,
+        k,
+        v,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+    )
+    dy = torch.randn_like(y)
+    grads = torch.autograd.grad(y, (q, k, v), grad_outputs=dy)
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    y_ref, _ = _block_causal_forward_pytorch(
+        q_ref,
+        k_ref,
+        v_ref,
+        block_size=block_size,
+        chunk_size=chunk_size,
+        scale=scale,
+        return_aux=True,
+    )
+    grads_ref = torch.autograd.grad(y_ref, (q_ref, k_ref, v_ref), grad_outputs=dy)
+
+    for grad, grad_ref in zip(grads, grads_ref):
+        torch.testing.assert_close(grad, grad_ref, rtol=3e-2, atol=3e-2)
+
 
 @pytest.mark.skipif(
     os.environ.get("FLARE_RUN_BLOCK_CAUSAL_PERF", "0") != "1" or not torch.cuda.is_available(),

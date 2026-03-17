@@ -236,24 +236,37 @@ def run_semi_autoregressive_main(
     def _run_flash_attn(q, k, v, *, is_causal: bool):
         return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=is_causal)
 
-    def _print_profile_table(title: str, profiles_by_precision: dict[str, dict] | None):
-        if not profiles_by_precision:
+    def _print_profile_table(title: str, profiles_by_variant: dict[str, dict[str, dict]] | None):
+        if not profiles_by_variant:
             return
+
+        decode_variants = ("shared dec", "separate dec")
         kernel_names = sorted(
             {
                 kernel_name
-                for profile_data in profiles_by_precision.values()
+                for variant_profiles in profiles_by_variant.values()
+                for profile_data in variant_profiles.values()
                 for kernel_name in profile_data.get("forward", {}).keys()
             }
         )
+        if not kernel_names:
+            return
+
         table_rows = kernel_names + ["total"]
-        print("\n" + "=" * 120)
-        print(f"{title:<52} {'tf32':>12} {'tf32x3':>12} {'ieee':>12}")
-        print("-" * 120)
+        columns = [(decode_variant, input_precision) for decode_variant in decode_variants for input_precision in triton_precision_modes]
+        value_col_width = 20
+        table_width = 52 + len(columns) * value_col_width + len(columns)
+
+        print("\n" + "=" * table_width)
+        print(
+            f"{title:<52}"
+            + "".join(f" {f'{decode_variant} {input_precision}':>{value_col_width}}" for decode_variant, input_precision in columns)
+        )
+        print("-" * table_width)
         for row_name in table_rows:
             values = []
-            for input_precision in triton_precision_modes:
-                profile_data = profiles_by_precision.get(input_precision)
+            for decode_variant, input_precision in columns:
+                profile_data = profiles_by_variant.get(decode_variant, {}).get(input_precision)
                 if profile_data is None:
                     values.append("N/A")
                     continue
@@ -262,7 +275,7 @@ def run_semi_autoregressive_main(
                 else:
                     value = profile_data.get("forward", {}).get(row_name)
                 values.append(f"{value:.3f}" if value is not None else "N/A")
-            print(f"{row_name:<52} {values[0]:>12} {values[1]:>12} {values[2]:>12}")
+            print(f"{row_name:<52}" + "".join(f" {value:>{value_col_width}}" for value in values))
 
     print(
         f"Testing Semi-Autoregressive FLARE Forward Pass "
@@ -428,8 +441,345 @@ def run_semi_autoregressive_main(
             f"{row['status']}"
         )
 
-    _print_profile_table("FLARE Semi AR Triton Forward Kernel (shared dec)", triton_profiles["shared dec"])
-    _print_profile_table("FLARE Semi AR Triton Forward Kernel (separate dec)", triton_profiles["separate dec"])
+    _print_profile_table(
+        "FLARE Semi AR Triton Forward Kernel",
+        {decode_variant: triton_profiles[decode_variant] for decode_variant in ("shared dec", "separate dec")},
+    )
+
+    # ====================================================================
+    # Semi-AR Backward Pass
+    # ====================================================================
+    print("\n" + "=" * 136)
+    print(
+        f"Testing Semi-Autoregressive FLARE Backward Pass "
+        f"(B={B}, H={H}, M={M}, N={N}, D={D}, block_size={block_size}, chunk_size={chunk_size}, dtype={dtype_obj})"
+    )
+    print("=" * 136)
+
+    def _unwrap_semi_ar(output):
+        if isinstance(output, (tuple, list)):
+            return output[0]
+        return output
+
+    def _run_semi_ar_backward(func, q, k, v, *, extra_leaves=None, **kwargs):
+        """Run forward + backward for semi-AR, zeroing grads first."""
+        for t in [q, k, v] + (extra_leaves or []):
+            if t.grad is not None:
+                t.grad = None
+        out = _unwrap_semi_ar(func(q, k, v, **kwargs))
+        out.sum().backward()
+
+    def _bench_semi_ar_backward(func, q, k, v, *, extra_leaves=None, **kwargs):
+        def _run():
+            with torch.enable_grad():
+                _run_semi_ar_backward(func, q, k, v, extra_leaves=extra_leaves, **kwargs)
+        ms = triton.testing.do_bench(_run)
+        _, mem = measure_memory(_run)
+        return ms, mem
+
+    def _semi_ar_grad_errors(name, grads, ref_grads):
+        """Compute max error across all gradient tensors."""
+        mean_abs_all, max_abs_all = 0.0, 0.0
+        mean_rel_all, max_rel_all = 0.0, 0.0
+        allclose_all = True
+        for gname, g, g_ref in grads:
+            if g is None and g_ref is None:
+                continue
+            if g is None or g_ref is None:
+                return {"allclose": False, "mean_abs": float("inf"), "max_abs": float("inf"),
+                        "mean_rel": float("inf"), "max_rel": float("inf")}
+            err = compute_errors(g, g_ref, f"{name}_{gname}")
+            mean_abs_all = max(mean_abs_all, err[f"{name}_{gname}_mean_abs_err"])
+            max_abs_all = max(max_abs_all, err[f"{name}_{gname}_max_abs_err"])
+            mean_rel_all = max(mean_rel_all, err[f"{name}_{gname}_mean_rel_err"])
+            max_rel_all = max(max_rel_all, err[f"{name}_{gname}_max_rel_err"])
+            allclose_all = allclose_all and err[f"{name}_{gname}_allclose"]
+        return {"allclose": allclose_all, "mean_abs": mean_abs_all, "max_abs": max_abs_all,
+                "mean_rel": mean_rel_all, "max_rel": max_rel_all}
+
+    bwd_results = {}
+    bwd_grad_errors = {}
+    bwd_profiles = {dv: {} for dv in ("shared dec", "separate dec")}
+
+    # --- Reference backward (shared decode) via autograd on _block_causal_forward_pytorch ---
+    Q_ref_sh = Q_flare.detach().requires_grad_(True)
+    K_ref_sh = K_flare.detach().requires_grad_(True)
+    V_ref_sh = V_flare.detach().requires_grad_(True)
+
+    try:
+        print("Measuring backward Reference (shared decode)...", end=" ", flush=True)
+        with torch.enable_grad():
+            _run_semi_ar_backward(
+                lambda q, k, v, **kw: _block_causal_forward_pytorch(q, k, v, block_size=block_size, chunk_size=chunk_size, scale=scale, **kw),
+                Q_ref_sh, K_ref_sh, V_ref_sh,
+            )
+        qg_ref_sh = Q_ref_sh.grad.detach()
+        kg_ref_sh = K_ref_sh.grad.detach()
+        vg_ref_sh = V_ref_sh.grad.detach()
+
+        bwd_results["Reference (shared dec)"] = _bench_semi_ar_backward(
+            lambda q, k, v, **kw: _block_causal_forward_pytorch(q, k, v, block_size=block_size, chunk_size=chunk_size, scale=scale, **kw),
+            Q_ref_sh, K_ref_sh, V_ref_sh,
+        )
+        print("Done")
+    except Exception as exc:
+        print(f"Failed: {exc}")
+        bwd_results["Reference (shared dec)"] = (float("nan"), 0.0)
+        qg_ref_sh, kg_ref_sh, vg_ref_sh = None, None, None
+
+    # --- Reference backward (separate decode) ---
+    Q_ref_sep = Q_flare.detach().requires_grad_(True)
+    K_ref_sep = K_flare.detach().requires_grad_(True)
+    V_ref_sep = V_flare.detach().requires_grad_(True)
+    Qd_ref_sep = Q_dec_flare.detach().requires_grad_(True)
+    Kd_ref_sep = K_dec_flare.detach().requires_grad_(True)
+
+    try:
+        print("Measuring backward Reference (separate decode)...", end=" ", flush=True)
+        with torch.enable_grad():
+            _run_semi_ar_backward(
+                lambda q, k, v, **kw: _block_causal_forward_pytorch(
+                    q, k, v, block_size=block_size, chunk_size=chunk_size, scale=scale,
+                    Q_dec=Qd_ref_sep, K_dec=Kd_ref_sep, **kw,
+                ),
+                Q_ref_sep, K_ref_sep, V_ref_sep, extra_leaves=[Qd_ref_sep, Kd_ref_sep],
+            )
+        qg_ref_sep = Q_ref_sep.grad.detach()
+        kg_ref_sep = K_ref_sep.grad.detach()
+        vg_ref_sep = V_ref_sep.grad.detach()
+        qdg_ref_sep = Qd_ref_sep.grad.detach() if Qd_ref_sep.grad is not None else None
+        kdg_ref_sep = Kd_ref_sep.grad.detach() if Kd_ref_sep.grad is not None else None
+
+        bwd_results["Reference (separate dec)"] = _bench_semi_ar_backward(
+            lambda q, k, v, **kw: _block_causal_forward_pytorch(
+                q, k, v, block_size=block_size, chunk_size=chunk_size, scale=scale,
+                Q_dec=Qd_ref_sep, K_dec=Kd_ref_sep, **kw,
+            ),
+            Q_ref_sep, K_ref_sep, V_ref_sep, extra_leaves=[Qd_ref_sep, Kd_ref_sep],
+        )
+        print("Done")
+    except Exception as exc:
+        print(f"Failed: {exc}")
+        bwd_results["Reference (separate dec)"] = (float("nan"), 0.0)
+        qg_ref_sep, kg_ref_sep, vg_ref_sep = None, None, None
+        qdg_ref_sep, kdg_ref_sep = None, None
+
+    # --- Triton backward (shared and separate decode) ---
+    for decode_variant, ref_grads, decode_kwargs in [
+        (
+            "shared dec",
+            (qg_ref_sh, kg_ref_sh, vg_ref_sh, None, None),
+            {},
+        ),
+        (
+            "separate dec",
+            (qg_ref_sep, kg_ref_sep, vg_ref_sep, qdg_ref_sep, kdg_ref_sep),
+            {"Q_dec": Q_dec_flare, "K_dec": K_dec_flare},
+        ),
+    ]:
+        qg_ref, kg_ref, vg_ref, qdg_ref, kdg_ref = ref_grads
+        has_separate = bool(decode_kwargs)
+
+        for input_precision in triton_precision_modes:
+            label = f"Triton ({decode_variant}, {input_precision})"
+            print(f"Measuring backward {label}...", end=" ", flush=True)
+
+            Q_bwd = Q_flare.detach().requires_grad_(True)
+            K_bwd = K_flare.detach().requires_grad_(True)
+            V_bwd = V_flare.detach().requires_grad_(True)
+            extra_leaves = []
+            kw = dict(
+                block_size=block_size, chunk_size=chunk_size, scale=scale,
+                input_precision=input_precision,
+            )
+            if has_separate:
+                Qd_bwd = Q_dec_flare.detach().requires_grad_(True)
+                Kd_bwd = K_dec_flare.detach().requires_grad_(True)
+                kw["Q_dec"] = Qd_bwd
+                kw["K_dec"] = Kd_bwd
+                extra_leaves = [Qd_bwd, Kd_bwd]
+
+            try:
+                with torch.enable_grad():
+                    _run_semi_ar_backward(
+                        flare_semi_autoregressive_trition,
+                        Q_bwd, K_bwd, V_bwd, extra_leaves=extra_leaves, **kw,
+                    )
+
+                grad_pairs = [
+                    ("dQ", Q_bwd.grad.detach() if Q_bwd.grad is not None else None, qg_ref),
+                    ("dK", K_bwd.grad.detach() if K_bwd.grad is not None else None, kg_ref),
+                    ("dV", V_bwd.grad.detach() if V_bwd.grad is not None else None, vg_ref),
+                ]
+                if has_separate:
+                    grad_pairs.append(("dQ_dec", Qd_bwd.grad.detach() if Qd_bwd.grad is not None else None, qdg_ref))
+                    grad_pairs.append(("dK_dec", Kd_bwd.grad.detach() if Kd_bwd.grad is not None else None, kdg_ref))
+
+                if qg_ref is not None:
+                    bwd_grad_errors[label] = _semi_ar_grad_errors(
+                        label.replace(" ", "_").replace("(", "").replace(")", "").replace(",", ""),
+                        [(n, g, r) for n, g, r in grad_pairs],
+                        ref_grads,
+                    )
+
+                # Benchmark timing
+                Q_bench = Q_flare.detach().requires_grad_(True)
+                K_bench = K_flare.detach().requires_grad_(True)
+                V_bench = V_flare.detach().requires_grad_(True)
+                bench_kw = dict(
+                    block_size=block_size, chunk_size=chunk_size, scale=scale,
+                    input_precision=input_precision,
+                )
+                bench_leaves = []
+                if has_separate:
+                    Qd_bench = Q_dec_flare.detach().requires_grad_(True)
+                    Kd_bench = K_dec_flare.detach().requires_grad_(True)
+                    bench_kw["Q_dec"] = Qd_bench
+                    bench_kw["K_dec"] = Kd_bench
+                    bench_leaves = [Qd_bench, Kd_bench]
+
+                bwd_results[label] = _bench_semi_ar_backward(
+                    flare_semi_autoregressive_trition,
+                    Q_bench, K_bench, V_bench, extra_leaves=bench_leaves, **bench_kw,
+                )
+
+                # Profile run
+                Q_prof = Q_flare.detach().requires_grad_(True)
+                K_prof = K_flare.detach().requires_grad_(True)
+                V_prof = V_flare.detach().requires_grad_(True)
+                prof_kw = dict(
+                    block_size=block_size, chunk_size=chunk_size, scale=scale,
+                    input_precision=input_precision, profile=True,
+                )
+                prof_leaves = []
+                if has_separate:
+                    Qd_prof = Q_dec_flare.detach().requires_grad_(True)
+                    Kd_prof = K_dec_flare.detach().requires_grad_(True)
+                    prof_kw["Q_dec"] = Qd_prof
+                    prof_kw["K_dec"] = Kd_prof
+                    prof_leaves = [Qd_prof, Kd_prof]
+
+                with torch.enable_grad():
+                    result = flare_semi_autoregressive_trition(Q_prof, K_prof, V_prof, **prof_kw)
+                    y_prof, aux_prof, profile_data = result
+                    y_prof.sum().backward()
+                    bwd_profiles[decode_variant][input_precision] = profile_data
+
+                print("Done")
+            except Exception as exc:
+                print(f"Failed: {exc}")
+                bwd_results[label] = (float("nan"), 0.0)
+
+    try:
+        print("Measuring backward Causal SDPA (flash_attn)...", end=" ", flush=True)
+        Q_sdpa_bwd = Q_sdpa.detach().requires_grad_(True)
+        K_sdpa_bwd = K_sdpa.detach().requires_grad_(True)
+        V_sdpa_bwd = V_sdpa.detach().requires_grad_(True)
+        bwd_results["Causal SDPA (flash_attn)"] = _bench_semi_ar_backward(
+            lambda q, k, v, **kw: _run_flash_attn(q, k, v, is_causal=True),
+            Q_sdpa_bwd,
+            K_sdpa_bwd,
+            V_sdpa_bwd,
+        )
+        print("Done")
+    except Exception as exc:
+        print(f"Failed: {exc}")
+        bwd_results["Causal SDPA (flash_attn)"] = (float("nan"), 0.0)
+
+    try:
+        print("Measuring backward Causal SDPA FA2...", end=" ", flush=True)
+        Q_sdpa_fa2_bwd = Q_sdpa.detach().requires_grad_(True)
+        K_sdpa_fa2_bwd = K_sdpa.detach().requires_grad_(True)
+        V_sdpa_fa2_bwd = V_sdpa.detach().requires_grad_(True)
+        bwd_results["Causal SDPA FA2"] = _bench_semi_ar_backward(
+            lambda q, k, v, **kw: _run_sdpa_fa2(q, k, v, is_causal=True),
+            Q_sdpa_fa2_bwd,
+            K_sdpa_fa2_bwd,
+            V_sdpa_fa2_bwd,
+        )
+        print("Done")
+    except Exception as exc:
+        print(f"Failed: {exc}")
+        bwd_results["Causal SDPA FA2"] = (float("nan"), 0.0)
+
+    # --- Print backward error table ---
+    print("\n" + "=" * 136)
+    print(f"{'Implementation':<45} {'Time (ms)':<12} {'Memory (GB)':<15} {'Abs Err (mean/max)':<24} {'Rel Err (mean/max)':<24} {'Status'}")
+    print("-" * 136)
+
+    all_bwd_names = [
+        "Reference (shared dec)",
+        "Reference (separate dec)",
+    ] + [
+        f"Triton ({dv}, {ip})"
+        for dv in ("shared dec", "separate dec")
+        for ip in triton_precision_modes
+    ] + [
+        "Causal SDPA (flash_attn)",
+        "Causal SDPA FA2",
+    ]
+
+    for name in all_bwd_names:
+        ms, mem = bwd_results.get(name, (float("nan"), 0.0))
+        ms_str = f"{ms:.3f}" if not math.isnan(ms) else "N/A"
+
+        if name in bwd_grad_errors:
+            err = bwd_grad_errors[name]
+            abs_err_str = f"{err['mean_abs']:.2e}/{err['max_abs']:.2e}"
+            rel_err_str = f"{err['mean_rel']:.2e}/{err['max_rel']:.2e}"
+            status = "OK" if err["allclose"] else "MISMATCH"
+        else:
+            abs_err_str = "N/A"
+            rel_err_str = "N/A"
+            status = "OK" if not math.isnan(ms) else "N/A"
+
+        print(f"{name:<45} {ms_str:<12} {mem:<15.2e} {abs_err_str:<24} {rel_err_str:<24} {status}")
+
+    # --- Print backward phase profile tables ---
+    def _print_bwd_profile_table(title: str, profiles_by_variant: dict[str, dict[str, dict]] | None):
+        if not profiles_by_variant:
+            return
+
+        decode_variants = ("shared dec", "separate dec")
+        kernel_names = sorted(
+            {
+                kernel_name
+                for variant_profiles in profiles_by_variant.values()
+                for profile_data in variant_profiles.values()
+                for kernel_name in profile_data.get("backward", {}).keys()
+            }
+        )
+        if not kernel_names:
+            return
+        table_rows = kernel_names + ["total"]
+        columns = [(decode_variant, input_precision) for decode_variant in decode_variants for input_precision in triton_precision_modes]
+        value_col_width = 20
+        table_width = 52 + len(columns) * value_col_width + len(columns)
+
+        print("\n" + "=" * table_width)
+        print(
+            f"{title:<52}"
+            + "".join(f" {f'{decode_variant} {input_precision}':>{value_col_width}}" for decode_variant, input_precision in columns)
+        )
+        print("-" * table_width)
+        for row_name in table_rows:
+            values = []
+            for decode_variant, input_precision in columns:
+                profile_data = profiles_by_variant.get(decode_variant, {}).get(input_precision)
+                if profile_data is None:
+                    values.append("N/A")
+                    continue
+                if row_name == "total":
+                    value = profile_data.get("backward_total_ms")
+                else:
+                    value = profile_data.get("backward", {}).get(row_name)
+                values.append(f"{value:.3f}" if value is not None else "N/A")
+            print(f"{row_name:<52}" + "".join(f" {value:>{value_col_width}}" for value in values))
+
+    _print_bwd_profile_table(
+        "FLARE Semi AR Triton Backward Kernel",
+        {decode_variant: bwd_profiles[decode_variant] for decode_variant in ("shared dec", "separate dec")},
+    )
 
     return
 
