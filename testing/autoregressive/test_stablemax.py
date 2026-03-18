@@ -17,8 +17,7 @@ def _sequential_stablemax_write_gated_reference(
     q_dec,
     k_dec,
     write_gate_fixed_value=None,
-    write_gate_scale=None,
-    write_gate_bias=None,
+    write_gate_tensor=None,
 ):
     B, N, H, D = k.shape
     _, M, _ = q.shape
@@ -33,31 +32,26 @@ def _sequential_stablemax_write_gated_reference(
     d_state = torch.zeros((B, H, M), dtype=torch.float32)
     z_state = torch.zeros((B, H, M, Dv), dtype=torch.float32)
 
+    if write_gate_tensor is not None:
+        gate_tensor_f = write_gate_tensor.float()
+    else:
+        gate_tensor_f = None
+
     if write_gate_fixed_value is not None:
         gate_fixed = float(write_gate_fixed_value)
     else:
         gate_fixed = None
 
-    def _broadcast_gate_param(param):
-        param_t = torch.as_tensor(param, dtype=torch.float32)
-        if param_t.ndim == 0:
-            return param_t.view(1, 1, 1)
-        if param_t.ndim == 1 and param_t.shape[0] == H:
-            return param_t.view(1, H, 1)
-        if param_t.ndim == 2 and param_t.shape == (H, M):
-            return param_t.view(1, H, M)
-        raise ValueError(f"Unsupported gate parameter shape: {tuple(param_t.shape)}")
-
     for t in range(N):
         score_t = float(scale) * torch.einsum("bhd,hmd->bhm", k_f[:, t], q_f)
         stable_t = _stablemax_score_transform(score_t, power=power)
         d_state = d_state + stable_t
-        if gate_fixed is not None:
+        if gate_tensor_f is not None:
+            gate_t = gate_tensor_f[:, t]
+        elif gate_fixed is not None:
             gate_t = torch.full_like(stable_t, gate_fixed)
         else:
-            scale_t = _broadcast_gate_param(0.0 if write_gate_scale is None else write_gate_scale)
-            bias_t = _broadcast_gate_param(6.0 if write_gate_bias is None else write_gate_bias)
-            gate_t = torch.sigmoid(score_t * scale_t + bias_t)
+            gate_t = torch.ones_like(stable_t)
         alpha_t = (stable_t / d_state.clamp_min(torch.finfo(torch.float32).eps)) * gate_t
         z_state = z_state + alpha_t.unsqueeze(-1) * (v_f[:, t, :, None, :] - z_state)
         decode_logits_t = float(scale) * torch.einsum("bhd,hmd->bhm", q_dec_f[:, t], k_dec_f)
@@ -66,20 +60,9 @@ def _sequential_stablemax_write_gated_reference(
 
     return y
 
-
-def _make_gate_case(case: str, H: int, M: int):
+def _make_gate_case(case: str):
     if case == "fixed_0.5":
         return {"write_gate_fixed_value": 0.5}
-    if case == "head":
-        return {
-            "write_gate_scale": torch.linspace(-0.15, 0.2, H, dtype=torch.float32),
-            "write_gate_bias": torch.linspace(0.5, 1.1, H, dtype=torch.float32),
-        }
-    if case == "head_latent":
-        return {
-            "write_gate_scale": torch.linspace(-0.2, 0.25, H * M, dtype=torch.float32).reshape(H, M),
-            "write_gate_bias": torch.linspace(0.3, 1.2, H * M, dtype=torch.float32).reshape(H, M),
-        }
     raise ValueError(f"Unknown gate case: {case}")
 
 
@@ -93,40 +76,31 @@ def _sequential_stablemax_write_gated_reference_autograd(
     q_dec,
     k_dec,
     write_gate_fixed_value=None,
-    write_gate_scale=None,
-    write_gate_bias=None,
+    write_gate_tensor=None,
 ):
     B, N, H, D = k.shape
     _, M, _ = q.shape
     Dv = v.size(-1)
 
+    if write_gate_tensor is not None:
+        gate_tensor_f = write_gate_tensor.float()
+    else:
+        gate_tensor_f = None
+
     y = []
     d_state = torch.zeros((B, H, M), device=k.device, dtype=torch.float32)
     z_state = torch.zeros((B, H, M, Dv), device=k.device, dtype=torch.float32)
-
-    def _broadcast_gate_param(param):
-        if torch.is_tensor(param):
-            param_t = param
-        else:
-            param_t = torch.as_tensor(param, device=k.device, dtype=torch.float32)
-        if param_t.ndim == 0:
-            return param_t.view(1, 1, 1)
-        if param_t.ndim == 1 and param_t.shape[0] == H:
-            return param_t.view(1, H, 1)
-        if param_t.ndim == 2 and param_t.shape == (H, M):
-            return param_t.view(1, H, M)
-        raise ValueError(f"Unsupported gate parameter shape: {tuple(param_t.shape)}")
 
     for t in range(N):
         score_t = float(scale) * torch.einsum("bhd,hmd->bhm", k[:, t].float(), q.float())
         stable_t = _stablemax_score_transform(score_t, power=power)
         d_state = d_state + stable_t
-        if write_gate_fixed_value is not None:
+        if gate_tensor_f is not None:
+            gate_t = gate_tensor_f[:, t].to(score_t.dtype)
+        elif write_gate_fixed_value is not None:
             gate_t = torch.full_like(stable_t, float(write_gate_fixed_value))
         else:
-            scale_t = _broadcast_gate_param(0.0 if write_gate_scale is None else write_gate_scale).to(score_t.dtype)
-            bias_t = _broadcast_gate_param(6.0 if write_gate_bias is None else write_gate_bias).to(score_t.dtype)
-            gate_t = torch.sigmoid(score_t * scale_t + bias_t)
+            gate_t = torch.ones_like(stable_t)
         alpha_t = (stable_t / d_state.clamp_min(torch.finfo(torch.float32).eps)) * gate_t
         z_state = z_state + alpha_t.unsqueeze(-1) * (v[:, t].float()[:, :, None, :] - z_state)
         decode_logits_t = float(scale) * torch.einsum("bhd,hmd->bhm", q_dec[:, t].float(), k_dec.float())
@@ -134,6 +108,78 @@ def _sequential_stablemax_write_gated_reference_autograd(
         y.append(torch.einsum("bhm,bhmd->bhd", decode_probs_t, z_state))
 
     return torch.stack(y, dim=1)
+
+
+def _finite_difference(loss_fn, tensor: torch.Tensor, index: tuple[int, ...], eps: float = 1e-6) -> torch.Tensor:
+    with torch.no_grad():
+        pos = tensor.detach().clone()
+        neg = tensor.detach().clone()
+        pos[index] += eps
+        neg[index] -= eps
+    return (loss_fn(pos) - loss_fn(neg)) / (2.0 * eps)
+
+
+def _make_fd_case(*, decode_mode: str = "separate", dtype: torch.dtype = torch.float64):
+    torch.manual_seed(11)
+    B = 1
+    N = 5
+    H = 2
+    M = 3
+    D = 2
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), dtype=dtype)
+    k = torch.randn((B, N, H, D), dtype=dtype)
+    v = torch.randn((B, N, H, D), dtype=dtype)
+    grad_out = torch.randn((B, N, H, D), dtype=dtype)
+    if decode_mode == "separate":
+        q_dec = torch.randn((B, N, H, D), dtype=dtype)
+        k_dec = torch.randn((H, M, D), dtype=dtype)
+    elif decode_mode == "shared":
+        q_dec = None
+        k_dec = None
+    else:
+        raise ValueError(f"Unsupported decode_mode={decode_mode!r}")
+
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "q_dec": q_dec,
+        "k_dec": k_dec,
+        "grad_out": grad_out,
+        "scale": scale,
+        "chunk_size": 2,
+        "power": 2.0,
+    }
+
+
+def _stablemax_gate_loss(
+    *,
+    q,
+    k,
+    v,
+    q_dec,
+    k_dec,
+    grad_out,
+    scale,
+    chunk_size,
+    power,
+    **gate_kwargs,
+):
+    y = flare_autoregressive_stablemax_pytorch(
+        q,
+        k,
+        v,
+        scale=scale,
+        chunk_size=chunk_size,
+        Q_dec=q_dec,
+        K_dec=k_dec,
+        write_gate=True,
+        power=power,
+        **gate_kwargs,
+    )
+    return (y * grad_out).sum()
 
 
 def test_stablemax_write_gate_identity_matches_baseline():
@@ -177,7 +223,7 @@ def test_stablemax_write_gate_identity_matches_baseline():
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("gate_case", ["fixed_0.5", "head", "head_latent"])
+@pytest.mark.parametrize("gate_case", ["fixed_0.5"])
 def test_stablemax_write_gate_matches_tiny_sequential_reference(gate_case: str):
     torch.manual_seed(1)
 
@@ -193,7 +239,7 @@ def test_stablemax_write_gate_matches_tiny_sequential_reference(gate_case: str):
     v = torch.randn((B, N, H, D), dtype=torch.float32)
     q_dec = torch.randn((B, N, H, D), dtype=torch.float32)
     k_dec = torch.randn((H, M, D), dtype=torch.float32)
-    gate_kwargs = _make_gate_case(gate_case, H, M)
+    gate_kwargs = _make_gate_case(gate_case)
 
     y_ref = _sequential_stablemax_write_gated_reference(
         q,
@@ -217,6 +263,50 @@ def test_stablemax_write_gate_matches_tiny_sequential_reference(gate_case: str):
             K_dec=k_dec,
             write_gate=True,
             **gate_kwargs,
+        )
+        torch.testing.assert_close(y, y_ref, rtol=1e-5, atol=1e-6)
+
+
+@torch.no_grad()
+def test_stablemax_write_gate_tensor_matches_tiny_sequential_reference():
+    torch.manual_seed(12)
+
+    B = 1
+    N = 8
+    H = 2
+    M = 4
+    D = 3
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), dtype=torch.float32)
+    k = torch.randn((B, N, H, D), dtype=torch.float32)
+    v = torch.randn((B, N, H, D), dtype=torch.float32)
+    q_dec = torch.randn((B, N, H, D), dtype=torch.float32)
+    k_dec = torch.randn((H, M, D), dtype=torch.float32)
+    write_gate_tensor = torch.sigmoid(torch.randn((B, N, H, M), dtype=torch.float32))
+
+    y_ref = _sequential_stablemax_write_gated_reference(
+        q,
+        k,
+        v,
+        scale=scale,
+        power=2.0,
+        q_dec=q_dec,
+        k_dec=k_dec,
+        write_gate_tensor=write_gate_tensor,
+    )
+
+    for chunk_size in (1, 2, 4, 8):
+        y = flare_autoregressive_stablemax_pytorch(
+            q,
+            k,
+            v,
+            scale=scale,
+            chunk_size=chunk_size,
+            Q_dec=q_dec,
+            K_dec=k_dec,
+            write_gate=True,
+            write_gate_tensor=write_gate_tensor,
         )
         torch.testing.assert_close(y, y_ref, rtol=1e-5, atol=1e-6)
 
@@ -249,7 +339,7 @@ def test_stablemax_write_gate_affine_composition_matches_direct_replay():
     torch.testing.assert_close(z_affine, z_direct, rtol=1e-6, atol=1e-6)
 
 
-@pytest.mark.parametrize("gate_case", ["fixed_0.5", "head"])
+@pytest.mark.parametrize("gate_case", ["fixed_0.5"])
 def test_stablemax_write_gate_backward_matches_sequential_autograd(gate_case: str):
     torch.manual_seed(3)
 
@@ -267,7 +357,7 @@ def test_stablemax_write_gate_backward_matches_sequential_autograd(gate_case: st
     k_dec_seed = torch.randn((H, M, D), dtype=torch.float32)
     grad_out = torch.randn((B, N, H, D), dtype=torch.float32)
 
-    gate_kwargs_seed = _make_gate_case(gate_case, H, M)
+    gate_kwargs_seed = _make_gate_case(gate_case)
 
     q_ref = q_seed.clone().requires_grad_(True)
     k_ref = k_seed.clone().requires_grad_(True)
@@ -319,21 +409,6 @@ def test_stablemax_write_gate_backward_matches_sequential_autograd(gate_case: st
     torch.testing.assert_close(q_dec.grad, q_dec_ref.grad, rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(k_dec.grad, k_dec_ref.grad, rtol=1e-4, atol=1e-5)
 
-    if gate_case == "head":
-        torch.testing.assert_close(
-            gate_kwargs["write_gate_scale"].grad,
-            gate_kwargs_ref["write_gate_scale"].grad,
-            rtol=1e-4,
-            atol=1e-5,
-        )
-        torch.testing.assert_close(
-            gate_kwargs["write_gate_bias"].grad,
-            gate_kwargs_ref["write_gate_bias"].grad,
-            rtol=1e-4,
-            atol=1e-5,
-        )
-
-
 def test_stablemax_write_gate_backward_handles_partial_requires_grad():
     torch.manual_seed(4)
 
@@ -349,7 +424,7 @@ def test_stablemax_write_gate_backward_handles_partial_requires_grad():
     v = torch.randn((B, N, H, D), dtype=torch.float32, requires_grad=True)
     q_dec = torch.randn((B, N, H, D), dtype=torch.float32)
     k_dec = torch.randn((H, M, D), dtype=torch.float32, requires_grad=True)
-    write_gate_scale = torch.linspace(-0.15, 0.2, H, dtype=torch.float32, requires_grad=True)
+    write_gate_tensor = torch.sigmoid(torch.randn((B, N, H, M), dtype=torch.float32)).requires_grad_(True)
     grad_out = torch.randn((B, N, H, D), dtype=torch.float32)
 
     y = flare_autoregressive_stablemax_pytorch(
@@ -362,11 +437,130 @@ def test_stablemax_write_gate_backward_handles_partial_requires_grad():
         K_dec=k_dec,
         write_gate=True,
         power=2.0,
-        write_gate_scale=write_gate_scale,
+        write_gate_tensor=write_gate_tensor,
     )
     (y * grad_out).sum().backward()
 
     assert q.grad is not None
     assert v.grad is not None
     assert k_dec.grad is not None
-    assert write_gate_scale.grad is not None
+    assert write_gate_tensor.grad is not None
+
+
+@pytest.mark.parametrize("decode_mode", ["separate", "shared"])
+def test_stablemax_write_gate_tensor_backward_matches_finite_difference(monkeypatch, decode_mode: str):
+    monkeypatch.setenv("FLARE_PYTORCH_MATCH_REFERENCE", "1")
+    case = _make_fd_case(decode_mode=decode_mode)
+
+    q = case["q"].clone().requires_grad_(True)
+    k = case["k"].clone().requires_grad_(True)
+    v = case["v"].clone().requires_grad_(True)
+    q_dec = None if case["q_dec"] is None else case["q_dec"].clone().requires_grad_(True)
+    k_dec = None if case["k_dec"] is None else case["k_dec"].clone().requires_grad_(True)
+    write_gate_tensor = torch.sigmoid(torch.randn((1, 5, 2, 3), dtype=torch.float64)).requires_grad_(True)
+
+    loss = _stablemax_gate_loss(
+        q=q,
+        k=k,
+        v=v,
+        q_dec=q_dec,
+        k_dec=k_dec,
+        grad_out=case["grad_out"],
+        scale=case["scale"],
+        chunk_size=case["chunk_size"],
+        power=case["power"],
+        write_gate_tensor=write_gate_tensor,
+    )
+    loss.backward()
+
+    def loss_with_q(q_var):
+        return _stablemax_gate_loss(q=q_var, k=k.detach(), v=v.detach(), q_dec=None if q_dec is None else q_dec.detach(), k_dec=None if k_dec is None else k_dec.detach(), grad_out=case["grad_out"], scale=case["scale"], chunk_size=case["chunk_size"], power=case["power"], write_gate_tensor=write_gate_tensor.detach())
+
+    def loss_with_k(k_var):
+        return _stablemax_gate_loss(q=q.detach(), k=k_var, v=v.detach(), q_dec=None if q_dec is None else q_dec.detach(), k_dec=None if k_dec is None else k_dec.detach(), grad_out=case["grad_out"], scale=case["scale"], chunk_size=case["chunk_size"], power=case["power"], write_gate_tensor=write_gate_tensor.detach())
+
+    def loss_with_v(v_var):
+        return _stablemax_gate_loss(q=q.detach(), k=k.detach(), v=v_var, q_dec=None if q_dec is None else q_dec.detach(), k_dec=None if k_dec is None else k_dec.detach(), grad_out=case["grad_out"], scale=case["scale"], chunk_size=case["chunk_size"], power=case["power"], write_gate_tensor=write_gate_tensor.detach())
+
+    def loss_with_gate(gate_var):
+        return _stablemax_gate_loss(q=q.detach(), k=k.detach(), v=v.detach(), q_dec=None if q_dec is None else q_dec.detach(), k_dec=None if k_dec is None else k_dec.detach(), grad_out=case["grad_out"], scale=case["scale"], chunk_size=case["chunk_size"], power=case["power"], write_gate_tensor=gate_var)
+
+    torch.testing.assert_close(q.grad[0, 1, 0], _finite_difference(loss_with_q, q.detach(), (0, 1, 0)), rtol=5e-3, atol=5e-4)
+    torch.testing.assert_close(k.grad[0, 2, 1, 0], _finite_difference(loss_with_k, k.detach(), (0, 2, 1, 0)), rtol=5e-3, atol=5e-4)
+    torch.testing.assert_close(v.grad[0, 3, 0, 1], _finite_difference(loss_with_v, v.detach(), (0, 3, 0, 1)), rtol=5e-3, atol=5e-4)
+    torch.testing.assert_close(write_gate_tensor.grad[0, 4, 1, 2], _finite_difference(loss_with_gate, write_gate_tensor.detach(), (0, 4, 1, 2)), rtol=5e-3, atol=5e-4)
+    if q_dec is not None:
+        def loss_with_q_dec(q_dec_var):
+            return _stablemax_gate_loss(q=q.detach(), k=k.detach(), v=v.detach(), q_dec=q_dec_var, k_dec=k_dec.detach(), grad_out=case["grad_out"], scale=case["scale"], chunk_size=case["chunk_size"], power=case["power"], write_gate_tensor=write_gate_tensor.detach())
+
+        def loss_with_k_dec(k_dec_var):
+            return _stablemax_gate_loss(q=q.detach(), k=k.detach(), v=v.detach(), q_dec=q_dec.detach(), k_dec=k_dec_var, grad_out=case["grad_out"], scale=case["scale"], chunk_size=case["chunk_size"], power=case["power"], write_gate_tensor=write_gate_tensor.detach())
+
+        torch.testing.assert_close(q_dec.grad[0, 1, 1, 0], _finite_difference(loss_with_q_dec, q_dec.detach(), (0, 1, 1, 0)), rtol=5e-3, atol=5e-4)
+        torch.testing.assert_close(k_dec.grad[1, 2, 0], _finite_difference(loss_with_k_dec, k_dec.detach(), (1, 2, 0)), rtol=5e-3, atol=5e-4)
+
+
+@pytest.mark.parametrize("fixed_value", [0.0, 1.0])
+def test_stablemax_write_gate_fixed_edge_backward_matches_finite_difference(monkeypatch, fixed_value: float):
+    monkeypatch.setenv("FLARE_PYTORCH_MATCH_REFERENCE", "1")
+    case = _make_fd_case(decode_mode="shared")
+
+    q = case["q"].clone().requires_grad_(True)
+    v = case["v"].clone().requires_grad_(True)
+    loss = _stablemax_gate_loss(
+        q=q,
+        k=case["k"],
+        v=v,
+        q_dec=None,
+        k_dec=None,
+        grad_out=case["grad_out"],
+        scale=case["scale"],
+        chunk_size=case["chunk_size"],
+        power=case["power"],
+        write_gate_fixed_value=fixed_value,
+    )
+    loss.backward()
+
+    def loss_with_q(q_var):
+        return _stablemax_gate_loss(q=q_var, k=case["k"], v=v.detach(), q_dec=None, k_dec=None, grad_out=case["grad_out"], scale=case["scale"], chunk_size=case["chunk_size"], power=case["power"], write_gate_fixed_value=fixed_value)
+
+    def loss_with_v(v_var):
+        return _stablemax_gate_loss(q=q.detach(), k=case["k"], v=v_var, q_dec=None, k_dec=None, grad_out=case["grad_out"], scale=case["scale"], chunk_size=case["chunk_size"], power=case["power"], write_gate_fixed_value=fixed_value)
+
+    torch.testing.assert_close(q.grad[0, 0, 1], _finite_difference(loss_with_q, q.detach(), (0, 0, 1)), rtol=5e-3, atol=5e-4)
+    torch.testing.assert_close(v.grad[0, 2, 1, 0], _finite_difference(loss_with_v, v.detach(), (0, 2, 1, 0)), rtol=5e-3, atol=5e-4)
+
+
+def test_stablemax_write_gate_tensor_validates_shape_and_range():
+    B = 1
+    N = 4
+    H = 2
+    M = 3
+    D = 2
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), dtype=torch.float32)
+    k = torch.randn((B, N, H, D), dtype=torch.float32)
+    v = torch.randn((B, N, H, D), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="write_gate_tensor must be \\[B, N, H, M\\] or \\[B, H, NC, C, M\\]"):
+        flare_autoregressive_stablemax_pytorch(
+            q,
+            k,
+            v,
+            scale=scale,
+            chunk_size=2,
+            write_gate=True,
+            write_gate_tensor=torch.zeros((B, N, M), dtype=torch.float32),
+        )
+
+    with pytest.raises(ValueError, match="write_gate_tensor entries must lie in \\[0, 1\\]"):
+        flare_autoregressive_stablemax_pytorch(
+            q,
+            k,
+            v,
+            scale=scale,
+            chunk_size=2,
+            write_gate=True,
+            write_gate_tensor=torch.full((B, N, H, M), 1.5, dtype=torch.float32),
+        )

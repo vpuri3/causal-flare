@@ -38,28 +38,33 @@ def _stablemax_score_transform_grad(x: torch.Tensor, power: float = 2.0) -> torc
     return torch.where(x >= 0, pos, neg)
 
 
-def _broadcast_stablemax_gate_param(param, *, H: int, M: int, device: torch.device, dtype: torch.dtype, name: str) -> torch.Tensor:
-    if torch.is_tensor(param):
-        param_t = param.to(device=device, dtype=dtype)
-    else:
-        param_t = torch.as_tensor(param, device=device, dtype=dtype)
-    if param_t.ndim == 0:
-        return param_t.view(1, 1, 1, 1, 1)
-    if param_t.ndim == 1 and param_t.shape[0] == H:
-        return param_t.view(1, H, 1, 1, 1)
-    if param_t.ndim == 2 and param_t.shape == (H, M):
-        return param_t.view(1, H, 1, 1, M)
-    raise ValueError(f"{name} must be scalar, [H], or [H, M]. Got {tuple(param_t.shape)}")
-
-
-def _reduce_broadcast_stablemax_gate_grad(grad: torch.Tensor, param: torch.Tensor, *, H: int, M: int, name: str) -> torch.Tensor:
-    if param.ndim == 0:
-        return grad.sum().to(dtype=param.dtype)
-    if param.ndim == 1 and param.shape[0] == H:
-        return grad.sum(dim=(0, 2, 3, 4)).to(dtype=param.dtype)
-    if param.ndim == 2 and param.shape == (H, M):
-        return grad.sum(dim=(0, 2, 3)).to(dtype=param.dtype)
-    raise ValueError(f"{name} must be scalar, [H], or [H, M]. Got {tuple(param.shape)}")
+def _pack_stablemax_gate_tensor(
+    gate_tensor,
+    *,
+    B: int,
+    N: int,
+    H: int,
+    M: int,
+    NC: int,
+    C: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    name: str,
+) -> torch.Tensor:
+    if not torch.is_tensor(gate_tensor):
+        raise ValueError(f"{name} must be a torch.Tensor. Got {type(gate_tensor).__name__}")
+    gate_t = gate_tensor.to(device=device, dtype=dtype)
+    if gate_t.ndim == 4 and gate_t.shape == (B, N, H, M):
+        padded_len = NC * C
+        if padded_len != N:
+            gate_t = torch.cat(
+                [gate_t, torch.zeros((B, padded_len - N, H, M), device=device, dtype=dtype)],
+                dim=1,
+            )
+        return gate_t.permute(0, 2, 1, 3).reshape(B, H, NC, C, M).contiguous()
+    if gate_t.ndim == 5 and gate_t.shape == (B, H, NC, C, M):
+        return gate_t.contiguous()
+    raise ValueError(f"{name} must be [B, N, H, M] or [B, H, NC, C, M]. Got {tuple(gate_t.shape)}")
 
 
 def _affine_prefix_scan_chunkwise(A: torch.Tensor, B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -79,55 +84,38 @@ def _affine_prefix_scan_chunkwise(A: torch.Tensor, B: torch.Tensor) -> tuple[tor
 def _stablemax_write_gate(
     score_chunk: torch.Tensor,
     *,
+    B: int,
+    N: int,
     H: int,
     M: int,
+    NC: int,
+    C: int,
     valid_chunk: torch.Tensor | None,
-    write_gate_mode: str,
-    write_gate_init: str,
     write_gate_fixed_value: float | None,
-    write_gate_scale,
-    write_gate_bias,
+    write_gate_tensor,
 ) -> torch.Tensor:
-    if write_gate_fixed_value is not None:
+    if write_gate_tensor is not None:
+        gate = _pack_stablemax_gate_tensor(
+            write_gate_tensor,
+            B=B,
+            N=N,
+            H=H,
+            M=M,
+            NC=NC,
+            C=C,
+            device=score_chunk.device,
+            dtype=score_chunk.dtype,
+            name="write_gate_tensor",
+        )
+        if torch.any(gate < 0.0) or torch.any(gate > 1.0):
+            raise ValueError("write_gate_tensor entries must lie in [0, 1]")
+    elif write_gate_fixed_value is not None:
         gate_value = float(write_gate_fixed_value)
         if gate_value < 0.0 or gate_value > 1.0:
             raise ValueError(f"write_gate_fixed_value must lie in [0, 1]. Got {gate_value}")
         gate = torch.full_like(score_chunk, gate_value)
     else:
-        if write_gate_mode != "postnorm_sigmoid":
-            raise ValueError(f"Unsupported write_gate_mode={write_gate_mode!r}. Expected 'postnorm_sigmoid'.")
-        if write_gate_init not in {"identity", "zero"}:
-            raise ValueError(f"Unsupported write_gate_init={write_gate_init!r}. Expected 'identity' or 'zero'.")
-        if write_gate_scale is None and write_gate_bias is None and write_gate_init == "identity":
-            gate = torch.ones_like(score_chunk)
-        else:
-            default_scale = 0.0
-            default_bias = 6.0 if write_gate_init == "identity" else 0.0
-            scale_t = (
-                torch.full((), default_scale, device=score_chunk.device, dtype=score_chunk.dtype).view(1, 1, 1, 1, 1)
-                if write_gate_scale is None else
-                _broadcast_stablemax_gate_param(
-                    write_gate_scale,
-                    H=H,
-                    M=M,
-                    device=score_chunk.device,
-                    dtype=score_chunk.dtype,
-                    name="write_gate_scale",
-                )
-            )
-            bias_t = (
-                torch.full((), default_bias, device=score_chunk.device, dtype=score_chunk.dtype).view(1, 1, 1, 1, 1)
-                if write_gate_bias is None else
-                _broadcast_stablemax_gate_param(
-                    write_gate_bias,
-                    H=H,
-                    M=M,
-                    device=score_chunk.device,
-                    dtype=score_chunk.dtype,
-                    name="write_gate_bias",
-                )
-            )
-            gate = torch.sigmoid(score_chunk * scale_t + bias_t)
+        gate = torch.ones_like(score_chunk)
     if valid_chunk is not None:
         gate = gate * valid_chunk.to(dtype=gate.dtype)
     return gate
@@ -558,11 +546,8 @@ def flare_autoregressive_stablemax_pytorch(
     K_dec=None,
     power: float = 2.0,
     write_gate: bool = False,
-    write_gate_mode: str = "postnorm_sigmoid",
-    write_gate_init: str = "identity",
     write_gate_fixed_value: float | None = None,
-    write_gate_scale=None,
-    write_gate_bias=None,
+    write_gate_tensor=None,
     state: dict[str, torch.Tensor] | None = None,
     attention_mask: torch.Tensor | None = None,
     return_state: bool = False,
@@ -579,9 +564,14 @@ def flare_autoregressive_stablemax_pytorch(
     if return_state:
         raise NotImplementedError("flare_autoregressive_stablemax_pytorch does not support return_state=True")
     if not write_gate:
-        if write_gate_fixed_value is not None or write_gate_scale is not None or write_gate_bias is not None:
+        if (
+            write_gate_fixed_value is not None or
+            write_gate_tensor is not None
+        ):
             raise ValueError("write_gate parameters require write_gate=True")
         return FLAREAutoregressiveStablemaxPyTorch.apply(Q, K, V, Q_dec_resolved, K_dec_resolved, scale, chunk_size, power)
+    if write_gate_tensor is not None and write_gate_fixed_value is not None:
+        raise ValueError("write_gate_tensor is mutually exclusive with write_gate_fixed_value")
     return FLAREAutoregressiveStablemaxWriteGatedPyTorch.apply(
         Q,
         K,
@@ -591,11 +581,8 @@ def flare_autoregressive_stablemax_pytorch(
         scale,
         chunk_size,
         power,
-        write_gate_mode,
-        write_gate_init,
         write_gate_fixed_value,
-        write_gate_scale,
-        write_gate_bias,
+        write_gate_tensor,
     )
 
 class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
@@ -610,11 +597,8 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
         scale=None,
         chunk_size=None,
         power: float = 2.0,
-        write_gate_mode: str = "postnorm_sigmoid",
-        write_gate_init: str = "identity",
         write_gate_fixed_value: float | None = None,
-        write_gate_scale=None,
-        write_gate_bias=None,
+        write_gate_tensor=None,
     ):
         compute_dtype = torch.float32
         if os.environ.get("FLARE_PYTORCH_MATCH_REFERENCE", "") == "1":
@@ -628,8 +612,6 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
         ctx.scale = scale
         ctx.chunk_size = chunk_size
         ctx.power = power
-        ctx.write_gate_mode = write_gate_mode
-        ctx.write_gate_init = write_gate_init
         ctx.write_gate_fixed_value = write_gate_fixed_value
         ctx.compute_dtype = compute_dtype
         ctx.b = B
@@ -648,16 +630,14 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
         ctx.v_dtype = V.dtype
         ctx.q_dec_dtype = Q_dec_resolved.dtype
         ctx.k_dec_dtype = K_dec_resolved.dtype
-        ctx.has_gate_scale_tensor = torch.is_tensor(write_gate_scale)
-        ctx.has_gate_bias_tensor = torch.is_tensor(write_gate_bias)
-        ctx.write_gate_scale_const = None if ctx.has_gate_scale_tensor else write_gate_scale
-        ctx.write_gate_bias_const = None if ctx.has_gate_bias_tensor else write_gate_bias
+        ctx.has_gate_tensor = torch.is_tensor(write_gate_tensor)
+        ctx.write_gate_tensor_const = None if ctx.has_gate_tensor else write_gate_tensor
 
         device = Q.device
         out_dtype = V.dtype
         scale_f = float(scale_resolved)
         power = float(power)
-        eps = torch.finfo(torch.float32).eps
+        eps = torch.finfo(compute_dtype).eps
 
         Q_f = Q.to(compute_dtype)
         K_f = K.to(compute_dtype)
@@ -699,8 +679,7 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
                 torch.empty((B, H, 0, C, M), device=device, dtype=compute_dtype),
                 torch.empty((B, H, 0, M), device=device, dtype=compute_dtype),
                 torch.empty((B, H, 0, M, D_value), device=device, dtype=compute_dtype),
-                *( [write_gate_scale] if ctx.has_gate_scale_tensor else [] ),
-                *( [write_gate_bias] if ctx.has_gate_bias_tensor else [] ),
+                *([write_gate_tensor] if ctx.has_gate_tensor else []),
             )
             return torch.empty((B, 0, H, D_value), device=device, dtype=out_dtype)
 
@@ -730,14 +709,15 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
 
         gate_chunk = _stablemax_write_gate(
             score_chunk,
+            B=B,
+            N=N,
             H=H,
             M=M,
+            NC=ctx.nc,
+            C=C,
             valid_chunk=valid_chunk,
-            write_gate_mode=write_gate_mode,
-            write_gate_init=write_gate_init,
             write_gate_fixed_value=write_gate_fixed_value,
-            write_gate_scale=write_gate_scale,
-            write_gate_bias=write_gate_bias,
+            write_gate_tensor=write_gate_tensor,
         )
 
         total_den = score_prev_den.unsqueeze(3) + stable_score_chunk.cumsum(dim=3)
@@ -760,8 +740,8 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
         chunk_A = prefix_prod[:, :, :, -1, :]
         chunk_B = torch.einsum("bhncm,bhncd->bhnmd", chunk_source_coeff, Vc)
 
-        z_prev_chunk = torch.empty((B, H, ctx.nc, M, D_value), device=device, dtype=torch.float32)
-        z_curr = torch.zeros((B, H, M, D_value), device=device, dtype=torch.float32)
+        z_prev_chunk = torch.empty((B, H, ctx.nc, M, D_value), device=device, dtype=compute_dtype)
+        z_curr = torch.zeros((B, H, M, D_value), device=device, dtype=compute_dtype)
         for chunk_idx in range(ctx.nc):
             z_prev_chunk[:, :, chunk_idx, :, :] = z_curr
             z_curr = chunk_A[:, :, chunk_idx, :].unsqueeze(-1) * z_curr + chunk_B[:, :, chunk_idx, :, :]
@@ -797,10 +777,8 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
             score_prev_den,
             z_prev_chunk,
         ]
-        if ctx.has_gate_scale_tensor:
-            saved.append(write_gate_scale)
-        if ctx.has_gate_bias_tensor:
-            saved.append(write_gate_bias)
+        if ctx.has_gate_tensor:
+            saved.append(write_gate_tensor)
         ctx.save_for_backward(*saved)
         return Y
 
@@ -823,9 +801,6 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
                 None,
                 None,
                 None,
-                None,
-                None,
-                None,
             )
 
         saved = list(ctx.saved_tensors)
@@ -839,8 +814,7 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
         decode_probs = saved.pop(0)
         score_prev_den = saved.pop(0)
         z_prev_chunk = saved.pop(0)
-        gate_scale_saved = saved.pop(0) if ctx.has_gate_scale_tensor else ctx.write_gate_scale_const
-        gate_bias_saved = saved.pop(0) if ctx.has_gate_bias_tensor else ctx.write_gate_bias_const
+        gate_tensor_saved = saved.pop(0) if ctx.has_gate_tensor else ctx.write_gate_tensor_const
 
         B = ctx.b
         N = ctx.n
@@ -880,49 +854,13 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
         grad_decode_probs = torch.zeros_like(decode_probs)
         grad_score_enc = torch.zeros_like(score_chunk)
         grad_V_total = torch.zeros_like(Vc)
-        grad_gate_scale = None
-        grad_gate_bias = None
+        grad_gate_tensor = None
 
-        use_parametric_gate = (
-            ctx.write_gate_fixed_value is None
-            and not (gate_scale_saved is None and gate_bias_saved is None and ctx.write_gate_init == "identity")
-        )
-        scale_broadcast = None
-        bias_broadcast = None
-        if use_parametric_gate:
-            scale_broadcast = (
-                torch.full((), 0.0, device=device, dtype=compute_dtype).view(1, 1, 1, 1, 1)
-                if gate_scale_saved is None else
-                _broadcast_stablemax_gate_param(
-                    gate_scale_saved,
-                    H=H,
-                    M=M,
-                    device=device,
-                    dtype=compute_dtype,
-                    name="write_gate_scale",
-                )
-            )
-            bias_broadcast = (
-                torch.full((), 6.0 if ctx.write_gate_init == "identity" else 0.0, device=device, dtype=compute_dtype).view(1, 1, 1, 1, 1)
-                if gate_bias_saved is None else
-                _broadcast_stablemax_gate_param(
-                    gate_bias_saved,
-                    H=H,
-                    M=M,
-                    device=device,
-                    dtype=compute_dtype,
-                    name="write_gate_bias",
-                )
-            )
-            if ctx.has_gate_scale_tensor and ctx.needs_input_grad[11]:
-                grad_gate_scale = torch.zeros_like(gate_scale_saved, dtype=compute_dtype)
-            if ctx.has_gate_bias_tensor and ctx.needs_input_grad[12]:
-                grad_gate_bias = torch.zeros_like(gate_bias_saved, dtype=compute_dtype)
+        use_direct_gate = gate_tensor_saved is not None
 
         stable_score_grad = _stablemax_score_transform_grad(score_chunk, power=power)
         causal_mask = torch.tril(torch.ones((C, C), device=device, dtype=torch.bool)).view(1, 1, 1, C, C)
 
-        score_chunk_all = score_chunk
         s_chunk = stable_score_chunk
         p_chunk = decode_probs
         v_chunk = Vc
@@ -931,22 +869,31 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
 
         total_den = d_start.unsqueeze(3) + s_chunk.cumsum(dim=3)
         total_den_safe = total_den.clamp_min(eps)
-        if ctx.write_gate_fixed_value is not None:
-            gate_chunk = torch.full_like(s_chunk, float(ctx.write_gate_fixed_value))
-            gate_sigmoid = None
-            gate_mask = None
-        elif use_parametric_gate:
-            gate_logits = score_chunk_all * scale_broadcast + bias_broadcast
-            gate_sigmoid = torch.sigmoid(gate_logits)
+        if use_direct_gate:
+            gate_chunk = _pack_stablemax_gate_tensor(
+                gate_tensor_saved,
+                B=B,
+                N=N,
+                H=H,
+                M=M,
+                NC=NC,
+                C=C,
+                device=device,
+                dtype=compute_dtype,
+                name="write_gate_tensor",
+            )
             if valid_chunk is not None:
                 gate_mask = valid_chunk.to(dtype=compute_dtype)
-                gate_chunk = gate_sigmoid * gate_mask
+                gate_chunk = gate_chunk * gate_mask
             else:
                 gate_mask = None
-                gate_chunk = gate_sigmoid
+            if ctx.has_gate_tensor and ctx.needs_input_grad[9]:
+                grad_gate_tensor = torch.zeros_like(gate_tensor_saved, dtype=compute_dtype)
+        elif ctx.write_gate_fixed_value is not None:
+            gate_chunk = torch.full_like(s_chunk, float(ctx.write_gate_fixed_value))
+            gate_mask = None
         else:
             gate_chunk = torch.ones_like(s_chunk)
-            gate_sigmoid = None
             gate_mask = None
 
         alpha_chunk = (s_chunk / total_den_safe) * gate_chunk
@@ -1035,25 +982,10 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
         grad_s_chunk = grad_s_chunk + grad_chunk_den.unsqueeze(3)
 
         grad_score_enc = grad_s_chunk * stable_score_grad
-        if use_parametric_gate:
-            grad_gate_pre = grad_gate_chunk if gate_mask is None else grad_gate_chunk * gate_mask
-            grad_gate_logit = grad_gate_pre * gate_sigmoid * (1.0 - gate_sigmoid)
-            grad_score_enc = grad_score_enc + grad_gate_logit * scale_broadcast
-            if grad_gate_scale is not None:
-                scale_contrib = grad_gate_logit * score_chunk_all
-                if gate_scale_saved.ndim == 0:
-                    grad_gate_scale = grad_gate_scale + scale_contrib.sum()
-                elif gate_scale_saved.ndim == 1:
-                    grad_gate_scale = grad_gate_scale + scale_contrib.sum(dim=(0, 2, 3, 4))
-                else:
-                    grad_gate_scale = grad_gate_scale + scale_contrib.sum(dim=(0, 2, 3))
-            if grad_gate_bias is not None:
-                if gate_bias_saved.ndim == 0:
-                    grad_gate_bias = grad_gate_bias + grad_gate_logit.sum()
-                elif gate_bias_saved.ndim == 1:
-                    grad_gate_bias = grad_gate_bias + grad_gate_logit.sum(dim=(0, 2, 3, 4))
-                else:
-                    grad_gate_bias = grad_gate_bias + grad_gate_logit.sum(dim=(0, 2, 3))
+        if use_direct_gate:
+            grad_gate_chunk = grad_gate_chunk if gate_mask is None else grad_gate_chunk * gate_mask
+            grad_gate_tensor_full = grad_gate_chunk.permute(0, 2, 3, 1, 4).reshape(B, PADDED_LEN, H, M)
+            grad_gate_tensor = grad_gate_tensor_full[:, :N, :, :]
 
         softmax_dot = (grad_decode_probs * decode_probs).sum(dim=-1, keepdim=True)
         grad_score_dec = decode_probs * (grad_decode_probs - softmax_dot)
@@ -1072,10 +1004,8 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
         grad_V = grad_V.to(ctx.v_dtype) if ctx.needs_input_grad[2] else None
         grad_Q_dec = grad_Q_dec.to(ctx.q_dec_dtype) if ctx.needs_input_grad[3] else None
         grad_K_dec = grad_K_dec.to(ctx.k_dec_dtype) if ctx.needs_input_grad[4] else None
-        if grad_gate_scale is not None:
-            grad_gate_scale = grad_gate_scale.to(dtype=gate_scale_saved.dtype)
-        if grad_gate_bias is not None:
-            grad_gate_bias = grad_gate_bias.to(dtype=gate_bias_saved.dtype)
+        if grad_gate_tensor is not None:
+            grad_gate_tensor = grad_gate_tensor.to(dtype=gate_tensor_saved.dtype)
 
         return (
             grad_Q,
@@ -1087,8 +1017,5 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
             None,
             None,
             None,
-            None,
-            None,
-            grad_gate_scale,
-            grad_gate_bias,
+            grad_gate_tensor,
         )
