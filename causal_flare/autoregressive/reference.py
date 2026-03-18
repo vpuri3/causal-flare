@@ -874,6 +874,52 @@ def _prepare_stablemax_custom_inputs(
 
 
 def _forward_stablemax_custom_prepared(prep: dict[str, object], return_cache: bool = False):
+    """Run the separate-weight stablemax prefill path on already-packed chunk tensors.
+
+    High-level math
+    ----------------
+    This computes the FLARE prefill output
+
+        y_t = sum_m p_dec[m, t] * (sum_{tau <= t} s(a_enc[m, tau]) v_tau) / (sum_{tau <= t} s(a_enc[m, tau]))
+
+    where:
+    - `a_enc[m, tau] = scale * <k_tau, q_m>` are encoder logits
+    - `s(.)` is the stablemax score transform
+    - `p_dec[:, t] = softmax(scale * <q_dec_t, k_dec_m>)` are decoder probabilities
+
+    Unlike the softmax reference path, the encoder side does not need max-tracking or
+    log-sum-exp rescaling. It only needs prefix sums of:
+    - encoder denominators: `sum s(a_enc)`
+    - encoder numerators: `sum s(a_enc) * v`
+
+    Tensor layout
+    -------------
+    The packed tensors use chunked shapes so the hot path can stay in batched matmuls:
+    - `Q_f`: `[H, M, D_score]`
+      Encoder query bank shared across the batch.
+    - `Kc`: `[B, H, NC, C, D_score]`
+      Keys, chunked into `NC` chunks of size `C`.
+    - `Vc`: `[B, H, NC, C, D_value]`
+      Values in the same chunk layout.
+    - `Q_dec_c`: `[B, H, NC, C, D_score]`
+      Decoder queries, chunked by target token position.
+    - `K_dec_f`: `[B, H, M, D_score]`
+      Decoder keys, one vector per latent slot.
+
+    Important derived tensors:
+    - `score_chunk`: `[B, H, NC, C, M]`
+      Encoder logits for every token position inside a chunk against every latent slot.
+    - `stable_score_chunk`: `[B, H, NC, C, M]`
+      Stablemax-transformed encoder weights.
+    - `score_chunk_den`: `[B, H, NC, M]`
+      Per-chunk encoder denominator contribution.
+    - `score_chunk_num`: `[B, H, NC, M, D_value]`
+      Per-chunk encoder numerator contribution.
+    - `score_prev_den`: `[B, H, NC, M]`
+      Strict-prefix denominator before each chunk.
+    - `score_prev_num`: `[B, H, NC, M, D_value]`
+      Strict-prefix numerator before each chunk.
+    """
     B = prep["B"]
     N = prep["N"]
     H = prep["H"]
@@ -896,30 +942,105 @@ def _forward_stablemax_custom_prepared(prep: dict[str, object], return_cache: bo
     if N == 0:
         return torch.empty((B, 0, H, D_value), device=device, dtype=out_dtype)
 
+    # Phase 1: encoder stablemax statistics per chunk.
+    #
+    # score_chunk[b, h, n, c, m] = scale * <K[b, n, c, h, :], Q[h, m, :]>
+    # Shapes:
+    # - Kc:          [B, H, NC, C, D_score]
+    # - Q_f:         [H, M, D_score]
+    # - score_chunk: [B, H, NC, C, M]
     score_chunk = scale_f * torch.einsum("bhncd,hmd->bhncm", Kc, Q_f)
+
+    # stable_score_chunk applies the positive stablemax transform pointwise:
+    # s(x) = (1 + x)^power      if x >= 0
+    #      = (1 - x)^(-power)   if x < 0
+    #
+    # This is the encoder-side analogue of exp(.) in softmax attention, but without
+    # any log-domain max correction. The encoder recurrence is therefore a plain sum.
     stable_score_chunk = _stablemax_score_transform(score_chunk, power=power)
+
+    # Per-chunk encoder denominator:
+    #   den_chunk[n, m] = sum_{c in chunk n} s(score_chunk[n, c, m])
+    # Shape: [B, H, NC, M]
     score_chunk_den = stable_score_chunk.sum(dim=3)
+
+    # Per-chunk encoder numerator:
+    #   num_chunk[n, m, d] = sum_{c in chunk n} s(score_chunk[n, c, m]) * V[n, c, d]
+    # Implemented as a batched matrix multiply over flattened [B, H, NC].
+    # Shape: [B, H, NC, M, D_value]
     score_chunk_num = torch.bmm(
         stable_score_chunk.reshape(BHNC, C, M).transpose(1, 2),
         Vc.reshape(BHNC, C, D_value),
     ).reshape(B, H, NC, M, D_value)
+
+    # Strict chunk prefix sums.
+    # These are the encoder stats from all chunks before the current chunk:
+    #   prev_den[n] = sum_{n' < n} den_chunk[n']
+    #   prev_num[n] = sum_{n' < n} num_chunk[n']
+    #
+    # Shapes:
+    # - score_prev_den: [B, H, NC, M]
+    # - score_prev_num: [B, H, NC, M, D_value]
     score_prev_den = torch.cumsum(score_chunk_den, dim=2) - score_chunk_den
     score_prev_num = torch.cumsum(score_chunk_num, dim=2) - score_chunk_num
 
+    # Phase 2: decoder softmax probabilities over the latent slots.
+    #
+    # decode_logits[b, h, n, c, m] = scale * <Q_dec[b, h, n, c, :], K_dec[b, h, m, :]>
+    # Shapes:
+    # - Q_dec_c:       [B, H, NC, C, D_score]
+    # - K_dec_f:       [B, H, M, D_score]
+    # - decode_logits: [B, H, NC, C, M]
     decode_logits = scale_f * torch.einsum("bhncd,bhmd->bhncm", Q_dec_c, K_dec_f)
     decode_probs = torch.softmax(decode_logits, dim=-1)
+
+    # Phase 3A: build the encoder normalization seen by each target token.
+    #
+    # chunk_den is the within-chunk encoder prefix:
+    #   chunk_den[n, c, m] = sum_{c' <= c} s(score_chunk[n, c', m])
+    #
+    # total_den is the full encoder denominator available at each target token:
+    #   total_den[n, c, m] = prev_den[n, m] + chunk_den[n, c, m]
+    #
+    # Shapes:
+    # - chunk_den:      [B, H, NC, C, M]
+    # - total_den:      [B, H, NC, C, M]
+    # - decode_over_den [B, H, NC, C, M]
     chunk_den = stable_score_chunk.cumsum(dim=3)
     total_den = score_prev_den.unsqueeze(3) + chunk_den
     total_den_safe = torch.where(total_den > 0, total_den, torch.ones_like(total_den))
     inv_total_den = total_den_safe.reciprocal()
     decode_over_den = decode_probs * inv_total_den
+
+    # Phase 3B: combine decoder weights with encoder numerators.
+    #
+    # Prefix contribution from previous chunks:
+    #   prefix_out[n, c, d] = sum_m decode_probs[n, c, m] / total_den[n, c, m] * prev_num[n, m, d]
+    #
+    # Shape: [B, H, NC, C, D_value]
     prefix_out = torch.einsum("bhncm,bhnmd->bhncd", decode_over_den, score_prev_num)
+
+    # Local causal mixing inside the active chunk.
+    #
+    # For a fixed chunk and target position c, we want:
+    #   sum_{tau <= c} sum_m decode_probs[c, m] * s(score_chunk[tau, m]) / total_den[c, m] * V[tau]
+    #
+    # Write this as:
+    #   local_mix[c, tau] = sum_m decode_probs[c, m] / total_den[c, m] * s(score_chunk[tau, m])
+    # then enforce tau <= c with a causal mask, and finally:
+    #   local_out[c] = sum_tau local_mix[c, tau] * V[tau]
+    #
+    # Shapes:
+    # - local_mix: [B, H, NC, C, C]
+    # - local_out: [B, H, NC, C, D_value]
     causal_mask = torch.tril(torch.ones((C, C), device=device, dtype=torch.bool)).view(1, 1, 1, C, C)
     local_mix = torch.matmul(decode_over_den, stable_score_chunk.transpose(-1, -2))
     local_mix = torch.where(causal_mask, local_mix, torch.zeros_like(local_mix))
     local_out = torch.matmul(local_mix.reshape(BHNC, C, C), Vc.reshape(BHNC, C, D_value)).reshape(B, H, NC, C, D_value)
     Yc = prefix_out + local_out
 
+    # Undo chunk packing and drop right-padding introduced during preparation.
+    # Y_out shape: [B, N, H, D_value]
     Y_out = Yc.reshape(B, H, PADDED_LEN, D_value)[:, :, :N, :].permute(0, 2, 1, 3).to(out_dtype)
     _check_finite("FLAREAutoregressiveStablemaxPyTorch.Y", Y_out)
     if return_cache:
@@ -1011,6 +1132,48 @@ class FLAREAutoregressiveStablemaxPyTorch(autograd.Function):
 
     @staticmethod
     def backward(ctx, dY):
+        """Backward for the chunked stablemax prefill path.
+
+        High-level differentiation structure
+        ------------------------------------
+        The forward can be written as
+
+            Y = prefix_out + local_out
+
+        with
+
+            prefix_out[c] = sum_m R[c, m] * prev_num[m]
+            local_out[c]  = sum_tau local_mix[c, tau] * V[tau]
+            local_mix     = tril(R @ W^T)
+            R             = decode_probs / total_den
+
+        where:
+        - `W = stable_score_chunk`
+        - `prev_num` and `prev_den` are strict chunk prefixes of encoder statistics
+        - `total_den = prev_den + cumsum(W, dim=token)`
+
+        The backward therefore naturally factors into:
+        1. Differentiate the output wrt `R`, `W`, `prev_num`, and `V`.
+        2. Differentiate `R = decode_probs / total_den`.
+        3. Backprop through the chunk-prefix scans producing `prev_num` / `prev_den`.
+        4. Backprop through the stablemax transform and the encoder/decoder projections.
+
+        Saved tensor shapes
+        -------------------
+        - `Q_f`:                [H, M, D_score]
+        - `Kc`:                 [B, H, NC, C, D_score]
+        - `Vc`:                 [B, H, NC, C, D_value]
+        - `Q_dec_c`:            [B, H, NC, C, D_score]
+        - `K_dec_f`:            [B, H, M, D_score]
+        - `score_chunk`:        [B, H, NC, C, M]
+        - `stable_score_chunk`: [B, H, NC, C, M]
+        - `decode_probs`:       [B, H, NC, C, M]
+        - `score_prev_num`:     [B, H, NC, M, D_value]
+        - `inv_total_den`:      [B, H, NC, C, M]
+
+        Incoming gradient:
+        - `dY`: [B, N, H, D_value]
+        """
         if getattr(ctx, "empty", False):
             B = ctx.b
             H = ctx.h
@@ -1059,6 +1222,13 @@ class FLAREAutoregressiveStablemaxPyTorch(autograd.Function):
             return empty_q, empty_kv, empty_v, empty_q_dec, empty_k_dec, None, None, None
 
         stable_score_grad = _stablemax_score_transform_grad(score_chunk, power=power)
+
+        # Reconstruct the forward-side encoder statistics needed by backward.
+        #
+        # Shapes:
+        # - score_chunk_den: [B, H, NC, M]
+        # - score_chunk_num: [B, H, NC, M, D_value]
+        # - score_prev_den:  [B, H, NC, M]
         score_chunk_den = stable_score_chunk.sum(dim=3)
         score_chunk_num = torch.bmm(
             stable_score_chunk.reshape(BHNC, C, M).transpose(1, 2),
@@ -1066,44 +1236,128 @@ class FLAREAutoregressiveStablemaxPyTorch(autograd.Function):
         ).reshape(B, H, NC, M, D_value)
         score_prev_den = torch.cumsum(score_chunk_den, dim=2) - score_chunk_den
         decode_over_den = decode_probs * inv_total_den
+
+        # local_mix[c, tau] = sum_m decode_over_den[c, m] * stable_score_chunk[tau, m],
+        # masked so only tau <= c contributes.
+        # Shape: [B, H, NC, C, C]
         causal_mask = torch.tril(torch.ones((C, C), device=device, dtype=torch.bool)).view(1, 1, 1, C, C)
         local_mix = torch.matmul(decode_over_den, stable_score_chunk.transpose(-1, -2))
         local_mix = torch.where(causal_mask, local_mix, torch.zeros_like(local_mix))
 
+        # Re-pack dY into chunk layout to match the forward intermediates.
+        # dYc shape: [B, H, NC, C, D_value]
         dY_f = dY.to(torch.float32)
         if PADDED_LEN != N:
             dY_f = torch.cat(
                 [dY_f, torch.zeros((B, PADDED_LEN - N, H, D_value), device=device, dtype=torch.float32)],
                 dim=1,
-            )
+        )
         dYc = dY_f.permute(0, 2, 1, 3).reshape(B, H, NC, C, D_value).contiguous()
 
+        # Step 1: differentiate Y = prefix_out + local_out.
+        #
+        # prefix_out = einsum(decode_over_den, score_prev_num)
+        # local_out  = local_mix @ V
+        #
+        # This yields gradients for:
+        # - decode_over_den: [B, H, NC, C, M]
+        # - prev_num:        [B, H, NC, M, D_value]
+        # - local_mix:       [B, H, NC, C, C]
+        # - V:               [B, H, NC, C, D_value]
         grad_decode_over_den = torch.einsum("bhncd,bhnmd->bhncm", dYc, score_prev_num)
         grad_prev_num = torch.einsum("bhncm,bhncd->bhnmd", decode_over_den, dYc)
         grad_local_mix = torch.matmul(dYc, Vc.transpose(-1, -2))
         grad_local_mix = torch.where(causal_mask, grad_local_mix, torch.zeros_like(grad_local_mix))
         grad_V_phase3 = torch.matmul(local_mix.transpose(-1, -2).reshape(BHNC, C, C), dYc.reshape(BHNC, C, D_value)).reshape(B, H, NC, C, D_value)
+
+        # local_mix = tril(decode_over_den @ stable_score_chunk^T)
+        #
+        # Differentiate the masked [C, C] matmul:
+        # - extra grad into decode_over_den from mixing with stable_score_chunk
+        # - phase-3 grad into stable_score_chunk from mixing with decode_over_den
         grad_decode_over_den = grad_decode_over_den + torch.matmul(grad_local_mix, stable_score_chunk)
         grad_w_phase3 = torch.matmul(grad_local_mix.transpose(-1, -2), decode_over_den)
 
+        # Step 2: differentiate R = decode_probs / total_den.
+        #
+        # Elementwise:
+        #   R = P * inv_total_den
+        # so:
+        #   dP          += dR * inv_total_den
+        #   dtotal_den  += -(dR * P) / total_den^2
+        #
+        # Shapes:
+        # - grad_decode_probs: [B, H, NC, C, M]
+        # - grad_total_den:    [B, H, NC, C, M]
         grad_decode_probs = grad_decode_over_den * inv_total_den
         grad_total_den = -(grad_decode_over_den * decode_probs) * inv_total_den.square()
+
+        # total_den = prev_den.unsqueeze(token) + cumsum(stable_score_chunk, dim=token)
+        #
+        # Gradient wrt prev_den is the sum over token positions in the chunk.
+        # Gradient wrt the within-chunk stable weights is a reverse cumsum over token
+        # positions, because each encoder token contributes to all later targets.
         grad_prev_den = grad_total_den.sum(dim=3)
         grad_w_phase3 = grad_w_phase3 + torch.flip(torch.cumsum(torch.flip(grad_total_den, dims=(3,)), dim=3), dims=(3,))
+
+        # Step 3: differentiate decoder softmax.
+        #
+        # For P = softmax(L), the Jacobian-vector product is:
+        #   dL = P * (dP - <dP, P>)
+        #
+        # Shape: [B, H, NC, C, M]
         softmax_dot = (grad_decode_probs * decode_probs).sum(dim=-1, keepdim=True)
         grad_score_dec = decode_probs * (grad_decode_probs - softmax_dot)
 
+        # Step 4: backprop through chunk-prefix scans.
+        #
+        # Forward used strict prefixes:
+        #   prev_den[n] = sum_{n' < n} score_chunk_den[n']
+        #   prev_num[n] = sum_{n' < n} score_chunk_num[n']
+        #
+        # Their reverse-mode adjoints are strict suffix sums:
+        #   dscore_chunk_*[n] = sum_{n' > n} dprev_*[n']
+        #
+        # Shapes:
+        # - grad_score_chunk_den: [B, H, NC, M]
+        # - grad_score_chunk_num: [B, H, NC, M, D_value]
         grad_score_chunk_den = torch.flip(torch.cumsum(torch.flip(grad_prev_den, dims=(2,)), dim=2), dims=(2,)) - grad_prev_den
         grad_score_chunk_num = torch.flip(torch.cumsum(torch.flip(grad_prev_num, dims=(2,)), dim=2), dims=(2,)) - grad_prev_num
 
+        # Step 5: combine all encoder-weight gradients.
+        #
+        # stable_score_chunk participates in three places:
+        # 1. directly in the local chunk mixing (`grad_w_phase3`)
+        # 2. in score_chunk_den = sum_c stable_score_chunk
+        # 3. in score_chunk_num = stable_score_chunk^T @ V
+        #
+        # Resulting shapes:
+        # - grad_w_total: [B, H, NC, C, M]
+        # - grad_V_total: [B, H, NC, C, D_value]
         grad_w_total = grad_w_phase3 + grad_score_chunk_den.unsqueeze(3)
         grad_w_total = grad_w_total + torch.einsum("bhnmd,bhncd->bhncm", grad_score_chunk_num, Vc)
         grad_V_total = grad_V_phase3 + torch.einsum("bhncm,bhnmd->bhncd", stable_score_chunk, grad_score_chunk_num)
 
+        # Step 6: differentiate the stablemax transform and the linear score projections.
+        #
+        # grad_score_enc has shape [B, H, NC, C, M].
+        # It contracts with:
+        # - encoder queries Q_f: [H, M, D_score]
+        # - encoder keys   Kc:   [B, H, NC, C, D_score]
+        #
+        # grad_score_dec has the same [B, H, NC, C, M] shape and contracts with:
+        # - decoder queries Q_dec_c: [B, H, NC, C, D_score]
+        # - decoder keys   K_dec_f:  [B, H, M, D_score]
         grad_score_enc = grad_w_total * stable_score_grad
         grad_Q_dec_c = scale_f * torch.einsum("bhncm,bhmd->bhncd", grad_score_dec, K_dec_f)
         grad_K_dec = (scale_f * torch.einsum("bhncm,bhncd->bhmd", grad_score_dec, Q_dec_c)).sum(dim=0)
 
+        # Unpack chunked gradients back to the public tensor layouts:
+        # - grad_Q:     [H, M, D_score]
+        # - grad_K:     [B, N, H, D_score]
+        # - grad_V:     [B, N, H, D_value]
+        # - grad_Q_dec: [B, N, H, D_score]
+        # - grad_K_dec: [H, M, D_score]
         grad_Q = scale_f * torch.einsum("bhncm,bhncd->hmd", grad_score_enc, Kc)
         grad_Kc = scale_f * torch.einsum("bhncm,hmd->bhncd", grad_score_enc, Q_f)
         grad_K = grad_Kc.permute(0, 2, 3, 1, 4).reshape(B, PADDED_LEN, H, D_score)[:, :N, :, :]
