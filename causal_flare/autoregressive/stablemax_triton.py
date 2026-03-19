@@ -256,26 +256,38 @@ def stablemax_prepare_kernel(
     # Build the encoder score tile
     # ----------------------------
     # `scores` corresponds to the reference `score_chunk` restricted to one
-    # chunk and one latent tile. We stream over the score-head dimension in
-    # BLOCK_K panels and accumulate in fp32.
+    # chunk and one latent tile.
+    #
+    # For the common `D_SCORE <= BLOCK_K` case, the full score-head dimension
+    # fits in one panel, so we load the entire `[C, D]` token tile and the
+    # entire `[BLOCK_M, D]` latent tile once and use a single dense `tl.dot`.
+    #
+    # Only larger score heads need the streamed helper.
     k_bh_base = K_ptr + pid_b * stride_k_b + pid_h * stride_k_h
     q_h_base = Q_ptr + pid_h * stride_q_h
-    scores = _stablemax_prepare_score_dot_streamed(
-        k_bh_base,
-        q_h_base,
-        global_tokens,
-        m_offsets,
-        mask_t,
-        mask_m,
-        stride_k_n,
-        stride_q_m,
-        stride_k_d,
-        stride_q_d,
-        D_SCORE=D_SCORE,
-        BLOCK_K=BLOCK_K,
-        INPUT_PRECISION=INPUT_PRECISION,
-        scale=scale,
-    )
+    if D_SCORE <= BLOCK_K:
+        k_ptrs = k_bh_base + global_tokens[:, None] * stride_k_n + tl.arange(0, BLOCK_K)[None, :] * stride_k_d
+        q_ptrs = q_h_base + m_offsets[:, None] * stride_q_m + tl.arange(0, BLOCK_K)[None, :] * stride_q_d
+        k_tile = tl.load(k_ptrs, mask=mask_t[:, None], other=0.0)
+        q_tile = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+        scores = _stablemax_score_dot_full_panel(k_tile, q_tile, INPUT_PRECISION=INPUT_PRECISION) * scale
+    else:
+        scores = _stablemax_prepare_score_dot_streamed(
+            k_bh_base,
+            q_h_base,
+            global_tokens,
+            m_offsets,
+            mask_t,
+            mask_m,
+            stride_k_n,
+            stride_q_m,
+            stride_k_d,
+            stride_q_d,
+            D_SCORE=D_SCORE,
+            BLOCK_K=BLOCK_K,
+            INPUT_PRECISION=INPUT_PRECISION,
+            scale=scale,
+        )
 
     # Apply the stablemax score transform elementwise:
     #
@@ -545,6 +557,10 @@ def stablemax_output_kernel(
     if D_SCORE <= BLOCK_K:
         qd_ptrs = qd_bh_base + global_t[:, None] * stride_qd_n + tl.arange(0, BLOCK_K)[None, :] * stride_qd_d
         qd_tile = tl.load(qd_ptrs, mask=mask_t[:, None], other=0.0)
+        # The encoder token tile is also fixed across the latent loop, so in
+        # the full-panel score case we can hoist it once here as well.
+        k_ptrs = k_bh_base + global_t[:, None] * stride_k_n + tl.arange(0, BLOCK_K)[None, :] * stride_k_d
+        k_tile_enc = tl.load(k_ptrs, mask=mask_t[:, None], other=0.0)
 
     for m0 in tl.range(0, M, BLOCK_M):
         m_offsets = m0 + tl.arange(0, BLOCK_M)
@@ -573,22 +589,27 @@ def stablemax_output_kernel(
             )
         dec_scores_log2 = tl.where(mask_t[:, None] & mask_m[None, :], dec_scores_log2, -float("inf"))
 
-        enc_scores = _stablemax_prepare_score_dot_streamed(
-            k_bh_base,
-            q_h_base,
-            global_t,
-            m_offsets,
-            mask_t,
-            mask_m,
-            stride_k_n,
-            stride_q_m,
-            stride_k_d,
-            stride_q_d,
-            D_SCORE=D_SCORE,
-            BLOCK_K=BLOCK_K,
-            INPUT_PRECISION=INPUT_PRECISION,
-            scale=scale,
-        )
+        if D_SCORE <= BLOCK_K:
+            q_ptrs = q_h_base + m_offsets[:, None] * stride_q_m + tl.arange(0, BLOCK_K)[None, :] * stride_q_d
+            q_tile = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+            enc_scores = _stablemax_score_dot_full_panel(k_tile_enc, q_tile, INPUT_PRECISION=INPUT_PRECISION) * scale
+        else:
+            enc_scores = _stablemax_prepare_score_dot_streamed(
+                k_bh_base,
+                q_h_base,
+                global_t,
+                m_offsets,
+                mask_t,
+                mask_m,
+                stride_k_n,
+                stride_q_m,
+                stride_k_d,
+                stride_q_d,
+                D_SCORE=D_SCORE,
+                BLOCK_K=BLOCK_K,
+                INPUT_PRECISION=INPUT_PRECISION,
+                scale=scale,
+            )
         stable_full = _stablemax_transform(enc_scores, power, POWER_MODE=POWER_MODE)
         stable_full = tl.where(mask_t[:, None] & mask_m[None, :], stable_full, 0.0)
 
@@ -635,7 +656,16 @@ def stablemax_output_kernel(
             input_precision=INPUT_PRECISION,
         )
 
-        w = tl.dot(p_tile_eff, tl.trans(stable_full), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        # Follow the FA2 pattern for the hot value-side contractions: keep the
+        # online-softmax and denominator state in fp32, but cast the actual dot
+        # operands down to the public value dtype so Triton can use the bf16/fp16
+        # tensor-core path while still accumulating in fp32.
+        w = tl.dot(
+            p_tile_eff.to(v_tile.dtype),
+            tl.trans(stable_full.to(v_tile.dtype)),
+            out_dtype=tl.float32,
+            input_precision=INPUT_PRECISION,
+        )
         w = tl.where(mask_t[:, None] & mask_t[None, :] & causal_mask, w, 0.0)
         local_partial = tl.dot(w.to(v_tile.dtype), v_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
