@@ -2,6 +2,7 @@
 """
 Fast benchmark for one forward+backward training step:
 - FLARE chunk Triton (`flare_autoregressive_triton`) for multiple latent counts M
+- FLARE stablemax Triton (`flare_autoregressive_stablemax_triton`) for multiple latent counts M
 - FlashAttention2 Triton (`flash_attention2_triton_bnhd`)
 
 Benchmarks are saved incrementally to raw JSONL so long runs are resumable.
@@ -24,10 +25,36 @@ import torch
 import triton.testing
 
 from causal_flare import flare_autoregressive_triton
+from causal_flare.autoregressive.stablemax_triton import flare_autoregressive_stablemax_triton
 
 
 DEFAULT_SEQ_LENGTHS = [2048, 4096, 8192, 16384, 32768, 65536, 131072]
 DEFAULT_FLARE_M = [32, 64, 128, 256]
+DEFAULT_PROVIDERS = ["fa2_triton", "flare_autoregressive_triton", "flare_autoregressive_stablemax_triton"]
+
+PROVIDER_ORDER = {
+    "fa2_triton": 0,
+    "flare_autoregressive_triton": 1,
+    "flare_autoregressive_stablemax_triton": 2,
+}
+
+PROVIDER_LABELS = {
+    "fa2_triton": "FlashAttention2 Triton",
+    "flare_autoregressive_triton": "FLARE Chunk Triton",
+    "flare_autoregressive_stablemax_triton": "FLARE Stablemax Triton",
+}
+
+PROVIDER_STYLES = {
+    ("fa2_triton", None): {"color": "#000000", "marker": "o", "linestyle": "-"},
+    ("flare_autoregressive_triton", 32): {"color": "#ff7f0e", "marker": "s", "linestyle": "--"},
+    ("flare_autoregressive_triton", 64): {"color": "#2ca02c", "marker": "s", "linestyle": "--"},
+    ("flare_autoregressive_triton", 128): {"color": "#d62728", "marker": "s", "linestyle": "--"},
+    ("flare_autoregressive_triton", 256): {"color": "#9467bd", "marker": "s", "linestyle": "--"},
+    ("flare_autoregressive_stablemax_triton", 32): {"color": "#ff7f0e", "marker": "*", "linestyle": ":"},
+    ("flare_autoregressive_stablemax_triton", 64): {"color": "#2ca02c", "marker": "*", "linestyle": ":"},
+    ("flare_autoregressive_stablemax_triton", 128): {"color": "#d62728", "marker": "*", "linestyle": ":"},
+    ("flare_autoregressive_stablemax_triton", 256): {"color": "#9467bd", "marker": "*", "linestyle": ":"},
+}
 
 
 @dataclass(frozen=True)
@@ -67,15 +94,16 @@ def parse_tokens_list(values: list[str] | None) -> list[int]:
     return out
 
 
-def build_cases(seq_lengths: list[int], flare_m_list: list[int], include_fa2: bool, include_flare: bool) -> list[BenchCase]:
+def build_cases(seq_lengths: list[int], flare_m_list: list[int], providers: list[str]) -> list[BenchCase]:
     cases: list[BenchCase] = []
-    if include_fa2:
-        for n in seq_lengths:
-            cases.append(BenchCase(provider="fa2_triton", n=n, m=None))
-    if include_flare:
+    for provider in providers:
+        if provider == "fa2_triton":
+            for n in seq_lengths:
+                cases.append(BenchCase(provider=provider, n=n, m=None))
+            continue
         for m in flare_m_list:
             for n in seq_lengths:
-                cases.append(BenchCase(provider="flare_autoregressive_triton", n=n, m=m))
+                cases.append(BenchCase(provider=provider, n=n, m=m))
     return cases
 
 
@@ -156,7 +184,13 @@ def write_summary_files(rows: list[dict[str, Any]], csv_path: Path, json_path: P
     summary_rows = summarize_latest(rows)
     df = pd.DataFrame(summary_rows)
     if not df.empty:
-        df = df.sort_values(["provider", "M", "N"], na_position="first").reset_index(drop=True)
+        provider_order = df["provider"].map(lambda provider: PROVIDER_ORDER.get(provider, len(PROVIDER_ORDER)))
+        df = (
+            df.assign(_provider_order=provider_order)
+            .sort_values(["_provider_order", "M", "N"], na_position="first")
+            .drop(columns="_provider_order")
+            .reset_index(drop=True)
+        )
     df.to_csv(csv_path, index=False)
     df.to_json(json_path, orient="records", indent=2)
     return df
@@ -202,6 +236,53 @@ def _build_flare_step_fn(
             chunk_size=flare_chunk_size,
             input_precision=flare_input_precision,
         )
+        loss = y.float().square().mean()
+        loss.backward()
+
+    return run_step
+
+
+def _build_flare_stablemax_step_fn(
+    *,
+    b: int,
+    h: int,
+    n: int,
+    m: int,
+    d_score: int,
+    d_value: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    scale: float,
+    flare_chunk_size: int | None,
+    flare_input_precision: str | None,
+):
+    q = torch.randn(h, m, d_score, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(b, n, h, d_score, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(b, n, h, d_value, device=device, dtype=dtype, requires_grad=True)
+    tensors = [q, k, v]
+    stablemax_chunk_size = flare_chunk_size
+    if stablemax_chunk_size is None:
+        if m >= 256:
+            stablemax_chunk_size = 64 if d_score <= 32 else 128
+        elif d_score <= 32 and m <= 64 and n >= 1024:
+            stablemax_chunk_size = 64
+        elif d_score <= 64 and m <= 128 and n >= 1024:
+            stablemax_chunk_size = 128
+        else:
+            stablemax_chunk_size = 256 if n >= 256 else 32
+
+    def run_step() -> None:
+        _clear_grads(tensors)
+        y = flare_autoregressive_stablemax_triton(
+            q,
+            k,
+            v,
+            scale=scale,
+            chunk_size=stablemax_chunk_size,
+            input_precision=flare_input_precision,
+        )
+        if isinstance(y, tuple):
+            y = y[0]
         loss = y.float().square().mean()
         loss.backward()
 
@@ -285,7 +366,7 @@ def benchmark_one_case(
         "p80_ms": math.nan,
         "error": "",
     }
-    if case.provider == "flare_autoregressive_triton":
+    if case.provider in {"flare_autoregressive_triton", "flare_autoregressive_stablemax_triton"}:
         base_row["flare_chunk_size"] = flare_chunk_size
         base_row["flare_input_precision"] = flare_input_precision
     if case.provider == "fa2_triton":
@@ -296,6 +377,22 @@ def benchmark_one_case(
             if case.m is None:
                 raise ValueError("FLARE case missing M.")
             run_step = _build_flare_step_fn(
+                b=batch_size,
+                h=num_heads,
+                n=case.n,
+                m=case.m,
+                d_score=score_head_dim,
+                d_value=value_head_dim,
+                dtype=dtype,
+                device=device,
+                scale=scale,
+                flare_chunk_size=flare_chunk_size,
+                flare_input_precision=flare_input_precision,
+            )
+        elif case.provider == "flare_autoregressive_stablemax_triton":
+            if case.m is None:
+                raise ValueError("Stablemax FLARE case missing M.")
+            run_step = _build_flare_stablemax_step_fn(
                 b=batch_size,
                 h=num_heads,
                 n=case.n,
@@ -369,13 +466,10 @@ def run_benchmark(args: argparse.Namespace, output_dir: Path) -> pd.DataFrame:
     all_rows = load_jsonl(raw_jsonl_path)
     existing_keys = {_case_key_from_row(row) for row in all_rows}
 
-    include_fa2 = not args.skip_fa2
-    include_flare = not args.skip_flare
     cases = build_cases(
         seq_lengths=args.seq_lengths,
         flare_m_list=args.flare_m,
-        include_fa2=include_fa2,
-        include_flare=include_flare,
+        providers=args.providers,
     )
 
     run_tag = f"run_{int(time.time())}"
@@ -447,11 +541,10 @@ def run_benchmark(args: argparse.Namespace, output_dir: Path) -> pd.DataFrame:
 
 
 def _curve_label(provider: str, m: int | None) -> str:
-    if provider == "fa2_triton":
-        return "FlashAttention2 Triton"
-    if provider == "flare_autoregressive_triton":
-        return f"FLARE Chunk Triton (M={m})"
-    return provider
+    label = PROVIDER_LABELS.get(provider, provider)
+    if m is None:
+        return label
+    return f"{label} (M={m})"
 
 
 def plot_summary(df: pd.DataFrame, png_path: Path, pdf_path: Path, title: str) -> None:
@@ -463,16 +556,9 @@ def plot_summary(df: pd.DataFrame, png_path: Path, pdf_path: Path, title: str) -
         raise ValueError("No successful benchmark rows to plot.")
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-    styles = {
-        ("fa2_triton", None): ("#1f77b4", "o"),
-        ("flare_autoregressive_triton", 32): ("#ff7f0e", "o"),
-        ("flare_autoregressive_triton", 64): ("#2ca02c", "o"),
-        ("flare_autoregressive_triton", 128): ("#d62728", "o"),
-        ("flare_autoregressive_triton", 256): ("#9467bd", "o"),
-    }
 
     groups = []
-    for provider in ["fa2_triton", "flare_autoregressive_triton"]:
+    for provider in DEFAULT_PROVIDERS:
         sub = ok[ok["provider"] == provider]
         if sub.empty:
             continue
@@ -484,15 +570,24 @@ def plot_summary(df: pd.DataFrame, png_path: Path, pdf_path: Path, title: str) -
 
     for provider, m, sub in groups:
         sub = sub.sort_values("N")
-        color, marker = styles.get((provider, m), ("#7f7f7f", "o"))
+        style = PROVIDER_STYLES.get((provider, m), {"color": "#7f7f7f", "marker": "o", "linestyle": "-"})
         label = _curve_label(provider, m)
         x = sub["N"].to_numpy()
         y = sub["median_ms"].to_numpy()
         y_lo = sub["p20_ms"].to_numpy()
         y_hi = sub["p80_ms"].to_numpy()
 
-        ax.plot(x, y, marker=marker, color=color, linewidth=2.0, label=label)
-        ax.fill_between(x, y_lo, y_hi, color=color, alpha=0.15)
+        ax.plot(
+            x,
+            y,
+            marker=style["marker"],
+            linestyle=style["linestyle"],
+            color=style["color"],
+            linewidth=2.0,
+            markersize=8 if style["marker"] == "*" else 6,
+            label=label,
+        )
+        ax.fill_between(x, y_lo, y_hi, color=style["color"], alpha=0.15)
 
     ax.set_title(title)
     ax.set_xlabel("Sequence length N")
@@ -551,12 +646,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="FLARE latent counts M (comma-separated and/or space-separated), e.g. 32 64 128 256",
     )
+    parser.add_argument(
+        "--providers",
+        nargs="+",
+        choices=DEFAULT_PROVIDERS,
+        default=None,
+        help=(
+            "Benchmark only the selected providers. "
+            "Defaults to all providers: fa2_triton flare_autoregressive_triton flare_autoregressive_stablemax_triton"
+        ),
+    )
     parser.add_argument("--warmup", type=int, default=2, help="Warmup iterations for triton.testing.do_bench")
     parser.add_argument("--rep", type=int, default=5, help="Timed repetitions for triton.testing.do_bench")
     parser.add_argument("--no-precompile", action="store_true", help="Disable one compile warmup step before timing")
     parser.add_argument("--rerun-existing", action="store_true", help="Rerun cases even if already present in raw JSONL")
     parser.add_argument("--skip-fa2", action="store_true", help="Skip FlashAttention2 runs. Required for mixed D_k/D_v benchmarks.")
     parser.add_argument("--skip-flare", action="store_true")
+    parser.add_argument("--skip-stablemax", action="store_true")
     parser.add_argument("--flare-chunk-size", type=int, default=None)
     parser.add_argument(
         "--flare-input-precision",
@@ -575,7 +681,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--figure-title",
         type=str,
-        default="FLARE chunk vs FA2 Triton: one training step latency",
+        default="FLARE vs FLARE Stablemax vs FA2 Triton: one training step latency",
     )
     return parser
 
@@ -586,11 +692,23 @@ def main() -> None:
 
     args.seq_lengths = parse_tokens_list(args.seq_lengths) if args.seq_lengths is not None else list(DEFAULT_SEQ_LENGTHS)
     args.flare_m = parse_tokens_list(args.flare_m) if args.flare_m is not None else list(DEFAULT_FLARE_M)
+    if args.providers is None:
+        args.providers = list(DEFAULT_PROVIDERS)
+    else:
+        args.providers = list(dict.fromkeys(args.providers))
+    if args.skip_fa2:
+        args.providers = [provider for provider in args.providers if provider != "fa2_triton"]
+    if args.skip_flare:
+        args.providers = [provider for provider in args.providers if provider != "flare_autoregressive_triton"]
+    if args.skip_stablemax:
+        args.providers = [provider for provider in args.providers if provider != "flare_autoregressive_stablemax_triton"]
     if args.value_head_dim is None:
         args.value_head_dim = args.score_head_dim
 
     if args.num_heads <= 0 or args.score_head_dim <= 0 or args.value_head_dim <= 0:
         raise ValueError("num-heads, score-head-dim, and value-head-dim must be > 0.")
+    if not args.providers:
+        raise ValueError("No providers selected. Use --providers or remove skip flags.")
     if any(n <= 0 for n in args.seq_lengths):
         raise ValueError(f"All sequence lengths must be > 0, got {args.seq_lengths}")
     if any(m <= 0 for m in args.flare_m):
@@ -601,7 +719,7 @@ def main() -> None:
         raise ValueError(f"All sequence lengths must be multiples of 128 for FA2 Triton backward: {args.seq_lengths}")
     if any((m % 16) != 0 for m in args.flare_m):
         raise ValueError(f"All FLARE M values must be multiples of 16: {args.flare_m}")
-    if not args.skip_fa2:
+    if "fa2_triton" in args.providers:
         if args.score_head_dim != args.value_head_dim:
             raise ValueError(
                 "FA2 benchmarking fundamentally requires score_head_dim == value_head_dim. "
