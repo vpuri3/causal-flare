@@ -21,6 +21,8 @@ def _stablemax_pick_allowed_cover(size: int) -> int:
 
 
 def _stablemax_pick_allowed_block_k(D: int) -> int:
+    if D in (32, 64, 128, 256):
+        return D
     for candidate in (256, 128, 64, 32):
         if D % candidate == 0:
             return candidate
@@ -82,7 +84,7 @@ def _stablemax_forward_config(*, M: int, D_score: int, D_value: int, chunk_size:
         "prefix_num_warps": 4,
         "prefix_num_stages": 2,
         "output_num_warps": 4,
-        "output_num_stages": 2,
+        "output_num_stages": 3 if D_score <= 64 else 2,
     }
 
 
@@ -127,7 +129,6 @@ def _stablemax_prepare_score_dot_streamed(
         scores += _stablemax_score_dot_full_panel(row_tile, col_tile, INPUT_PRECISION=INPUT_PRECISION)
     return scores * scale
 
-
 @triton.jit
 def _stablemax_transform(scores, power, POWER_MODE: tl.constexpr):
     # Same piecewise transform as the PyTorch implementation:
@@ -152,6 +153,113 @@ def _stablemax_transform(scores, power, POWER_MODE: tl.constexpr):
         pos = tl.math.exp2(power * tl.math.log2(pos_base))
         neg = tl.math.exp2(-power * tl.math.log2(neg_base))
     return tl.where(scores >= 0, pos, neg)
+
+
+@triton.jit
+def _stablemax_output_apply_tile(
+    dec_scores_log2,
+    enc_scores,
+    m_offsets,
+    mask_m,
+    Z_ENC_ptr,
+    PrefixDen_ptr,
+    PrefixNum_ptr,
+    stride_zenc_b,
+    stride_zenc_h,
+    stride_zenc_n,
+    stride_zenc_m,
+    stride_pden_bh,
+    stride_pden_nc,
+    stride_pden_m,
+    stride_pnum_bh,
+    stride_pnum_nc,
+    stride_pnum_m,
+    stride_pnum_d,
+    pid_b,
+    pid_h,
+    pid_bh,
+    pid_nc,
+    pid_d,
+    global_t,
+    mask_t,
+    d_offsets,
+    mask_d,
+    causal_mask,
+    v_tile,
+    row_max,
+    row_sum,
+    y_num,
+    scale,
+    power,
+    INPUT_PRECISION: tl.constexpr,
+    POWER_MODE: tl.constexpr,
+):
+    # Consume one completed `(decoder scores, encoder scores)` latent tile in
+    # the fused output phase. This keeps the score-building policy separate from
+    # the replay/output math so the streamed path can batch score construction
+    # across multiple latent tiles while reusing the same row-side loads.
+    dec_scores_log2 = tl.where(mask_t[:, None] & mask_m[None, :], dec_scores_log2, -float("inf"))
+    stable_full = _stablemax_transform(enc_scores, power, POWER_MODE=POWER_MODE)
+    stable_full = tl.where(mask_t[:, None] & mask_m[None, :], stable_full, 0.0)
+
+    pden_ptrs = PrefixDen_ptr + pid_bh * stride_pden_bh + pid_nc * stride_pden_nc + m_offsets * stride_pden_m
+    prefix_den = tl.load(pden_ptrs, mask=mask_m, other=0.0).to(tl.float32)
+    local_den = tl.cumsum(stable_full, axis=0)
+    total_den = prefix_den[None, :] + local_den
+    inv_total_den = tl.where(total_den > 0, 1.0 / total_den, 0.0)
+
+    if pid_d == 0:
+        zenc_ptrs = (
+            Z_ENC_ptr
+            + pid_b * stride_zenc_b
+            + pid_h * stride_zenc_h
+            + global_t[:, None] * stride_zenc_n
+            + m_offsets[None, :] * stride_zenc_m
+        )
+        tl.store(zenc_ptrs, total_den, mask=mask_t[:, None] & mask_m[None, :])
+
+    block_max = tl.max(dec_scores_log2, axis=1)
+    new_max = tl.maximum(row_max, block_max)
+    new_max_safe = tl.where(new_max == -float("inf"), 0.0, new_max)
+    rescale_prev = tl.where(row_max == -float("inf"), 0.0, tl.math.exp2(row_max - new_max_safe))
+    both_inf = new_max == -float("inf")
+    rescale_prev = tl.where(both_inf & (row_max == -float("inf")), 1.0, rescale_prev)
+    p_tile = tl.math.exp2(dec_scores_log2 - new_max_safe[:, None])
+    p_tile = tl.where(mask_t[:, None] & mask_m[None, :], p_tile, 0.0)
+
+    pnum_ptrs = (
+        PrefixNum_ptr
+        + pid_bh * stride_pnum_bh
+        + pid_nc * stride_pnum_nc
+        + m_offsets[:, None] * stride_pnum_m
+        + d_offsets[None, :] * stride_pnum_d
+    )
+    prefix_num = tl.load(pnum_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+    p_tile_eff = p_tile * inv_total_den
+    prefix_partial = tl.dot(
+        p_tile_eff.to(prefix_num.dtype),
+        prefix_num,
+        out_dtype=tl.float32,
+        input_precision=INPUT_PRECISION,
+    )
+
+    # Follow the FA2 pattern for the hot value-side contractions: keep the
+    # online-softmax and denominator state in fp32, but cast the actual dot
+    # operands down to the public value dtype so Triton can use the bf16/fp16
+    # tensor-core path while still accumulating in fp32.
+    w = tl.dot(
+        p_tile_eff.to(v_tile.dtype),
+        tl.trans(stable_full.to(v_tile.dtype)),
+        out_dtype=tl.float32,
+        input_precision=INPUT_PRECISION,
+    )
+    w = tl.where(mask_t[:, None] & mask_t[None, :] & causal_mask, w, 0.0)
+    local_partial = tl.dot(w.to(v_tile.dtype), v_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+
+    y_num = y_num * rescale_prev[:, None] + prefix_partial + local_partial
+    row_sum = row_sum * rescale_prev + tl.sum(p_tile, axis=1)
+    row_max = new_max
+    return row_max, row_sum, y_num
 
 
 @triton.jit
@@ -562,15 +670,69 @@ def stablemax_output_kernel(
         k_ptrs = k_bh_base + global_t[:, None] * stride_k_n + tl.arange(0, BLOCK_K)[None, :] * stride_k_d
         k_tile_enc = tl.load(k_ptrs, mask=mask_t[:, None], other=0.0)
 
-    for m0 in tl.range(0, M, BLOCK_M):
-        m_offsets = m0 + tl.arange(0, BLOCK_M)
-        mask_m = m_offsets < M
+    if D_SCORE <= BLOCK_K:
+        for m0 in tl.range(0, M, BLOCK_M):
+            m_offsets = m0 + tl.arange(0, BLOCK_M)
+            mask_m = m_offsets < M
 
-        if D_SCORE <= BLOCK_K:
             kd_ptrs = kd_h_base + m_offsets[:, None] * stride_kd_m + tl.arange(0, BLOCK_K)[None, :] * stride_kd_d
             kd_tile = tl.load(kd_ptrs, mask=mask_m[:, None], other=0.0)
             dec_scores_log2 = _stablemax_score_dot_full_panel(qd_tile, kd_tile, INPUT_PRECISION=INPUT_PRECISION) * score_scale_log2
-        else:
+
+            q_ptrs = q_h_base + m_offsets[:, None] * stride_q_m + tl.arange(0, BLOCK_K)[None, :] * stride_q_d
+            q_tile = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+            enc_scores = _stablemax_score_dot_full_panel(k_tile_enc, q_tile, INPUT_PRECISION=INPUT_PRECISION) * scale
+
+            row_max, row_sum, y_num = _stablemax_output_apply_tile(
+                dec_scores_log2,
+                enc_scores,
+                m_offsets,
+                mask_m,
+                Z_ENC_ptr,
+                PrefixDen_ptr,
+                PrefixNum_ptr,
+                stride_zenc_b,
+                stride_zenc_h,
+                stride_zenc_n,
+                stride_zenc_m,
+                stride_pden_bh,
+                stride_pden_nc,
+                stride_pden_m,
+                stride_pnum_bh,
+                stride_pnum_nc,
+                stride_pnum_m,
+                stride_pnum_d,
+                pid_b,
+                pid_h,
+                pid_bh,
+                pid_nc,
+                pid_d,
+                global_t,
+                mask_t,
+                d_offsets,
+                mask_d,
+                causal_mask,
+                v_tile,
+                row_max,
+                row_sum,
+                y_num,
+                scale,
+                power,
+                INPUT_PRECISION=INPUT_PRECISION,
+                POWER_MODE=POWER_MODE,
+            )
+    else:
+        # Streamed fallback:
+        # When the score head dimension is larger than `BLOCK_K`, keep the score
+        # build simple and stream over the score dimension one `BLOCK_K` slice at
+        # a time. The default config now chooses `BLOCK_K = D_SCORE` for the
+        # supported score sizes {32, 64, 128, 256}, so this path is mainly a
+        # fallback for any future non-full-panel regimes rather than the primary
+        # hot path.
+        for m0 in tl.range(0, M, BLOCK_M):
+            m_offsets = m0 + tl.arange(0, BLOCK_M)
+            mask_m = m_offsets < M
+
             dec_scores_log2 = _stablemax_prepare_score_dot_streamed(
                 qd_bh_base,
                 kd_h_base,
@@ -587,13 +749,6 @@ def stablemax_output_kernel(
                 INPUT_PRECISION=INPUT_PRECISION,
                 scale=score_scale_log2,
             )
-        dec_scores_log2 = tl.where(mask_t[:, None] & mask_m[None, :], dec_scores_log2, -float("inf"))
-
-        if D_SCORE <= BLOCK_K:
-            q_ptrs = q_h_base + m_offsets[:, None] * stride_q_m + tl.arange(0, BLOCK_K)[None, :] * stride_q_d
-            q_tile = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-            enc_scores = _stablemax_score_dot_full_panel(k_tile_enc, q_tile, INPUT_PRECISION=INPUT_PRECISION) * scale
-        else:
             enc_scores = _stablemax_prepare_score_dot_streamed(
                 k_bh_base,
                 q_h_base,
@@ -610,68 +765,45 @@ def stablemax_output_kernel(
                 INPUT_PRECISION=INPUT_PRECISION,
                 scale=scale,
             )
-        stable_full = _stablemax_transform(enc_scores, power, POWER_MODE=POWER_MODE)
-        stable_full = tl.where(mask_t[:, None] & mask_m[None, :], stable_full, 0.0)
 
-        pden_ptrs = PrefixDen_ptr + pid_bh * stride_pden_bh + pid_nc * stride_pden_nc + m_offsets * stride_pden_m
-        prefix_den = tl.load(pden_ptrs, mask=mask_m, other=0.0).to(tl.float32)
-        local_den = tl.cumsum(stable_full, axis=0)
-        total_den = prefix_den[None, :] + local_den
-        inv_total_den = tl.where(total_den > 0, 1.0 / total_den, 0.0)
-
-        if pid_d == 0:
-            zenc_ptrs = (
-                Z_ENC_ptr
-                + pid_b * stride_zenc_b
-                + pid_h * stride_zenc_h
-                + global_t[:, None] * stride_zenc_n
-                + m_offsets[None, :] * stride_zenc_m
+            row_max, row_sum, y_num = _stablemax_output_apply_tile(
+                dec_scores_log2,
+                enc_scores,
+                m_offsets,
+                mask_m,
+                Z_ENC_ptr,
+                PrefixDen_ptr,
+                PrefixNum_ptr,
+                stride_zenc_b,
+                stride_zenc_h,
+                stride_zenc_n,
+                stride_zenc_m,
+                stride_pden_bh,
+                stride_pden_nc,
+                stride_pden_m,
+                stride_pnum_bh,
+                stride_pnum_nc,
+                stride_pnum_m,
+                stride_pnum_d,
+                pid_b,
+                pid_h,
+                pid_bh,
+                pid_nc,
+                pid_d,
+                global_t,
+                mask_t,
+                d_offsets,
+                mask_d,
+                causal_mask,
+                v_tile,
+                row_max,
+                row_sum,
+                y_num,
+                scale,
+                power,
+                INPUT_PRECISION=INPUT_PRECISION,
+                POWER_MODE=POWER_MODE,
             )
-            tl.store(zenc_ptrs, total_den, mask=mask_t[:, None] & mask_m[None, :])
-
-        block_max = tl.max(dec_scores_log2, axis=1)
-        new_max = tl.maximum(row_max, block_max)
-        new_max_safe = tl.where(new_max == -float("inf"), 0.0, new_max)
-        rescale_prev = tl.where(row_max == -float("inf"), 0.0, tl.math.exp2(row_max - new_max_safe))
-        both_inf = new_max == -float("inf")
-        rescale_prev = tl.where(both_inf & (row_max == -float("inf")), 1.0, rescale_prev)
-        p_tile = tl.math.exp2(dec_scores_log2 - new_max_safe[:, None])
-        p_tile = tl.where(mask_t[:, None] & mask_m[None, :], p_tile, 0.0)
-
-        pnum_ptrs = (
-            PrefixNum_ptr
-            + pid_bh * stride_pnum_bh
-            + pid_nc * stride_pnum_nc
-            + m_offsets[:, None] * stride_pnum_m
-            + d_offsets[None, :] * stride_pnum_d
-        )
-        # Prefix numerators are stored in the public V dtype. Keep that dtype on
-        # load and let the dense contractions promote into fp32 accumulators.
-        prefix_num = tl.load(pnum_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-        p_tile_eff = p_tile * inv_total_den
-        prefix_partial = tl.dot(
-            p_tile_eff.to(prefix_num.dtype),
-            prefix_num,
-            out_dtype=tl.float32,
-            input_precision=INPUT_PRECISION,
-        )
-
-        # Follow the FA2 pattern for the hot value-side contractions: keep the
-        # online-softmax and denominator state in fp32, but cast the actual dot
-        # operands down to the public value dtype so Triton can use the bf16/fp16
-        # tensor-core path while still accumulating in fp32.
-        w = tl.dot(
-            p_tile_eff.to(v_tile.dtype),
-            tl.trans(stable_full.to(v_tile.dtype)),
-            out_dtype=tl.float32,
-            input_precision=INPUT_PRECISION,
-        )
-        w = tl.where(mask_t[:, None] & mask_t[None, :] & causal_mask, w, 0.0)
-        local_partial = tl.dot(w.to(v_tile.dtype), v_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
-        y_num = y_num * rescale_prev[:, None] + prefix_partial + local_partial
-        row_sum = row_sum * rescale_prev + tl.sum(p_tile, axis=1)
-        row_max = new_max
 
     if pid_d == 0:
         z_dec = (row_max + tl.math.log2(tl.maximum(row_sum, 1e-20))) * LN2
