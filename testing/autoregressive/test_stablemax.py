@@ -273,6 +273,62 @@ def test_stablemax_triton_forward_matches_pytorch_large_bf16():
     assert z_dec.shape == (B, H, N)
     torch.testing.assert_close(y_tri.float(), y_ref.float(), atol=7e-3, rtol=7e-3)
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton path")
+def test_stablemax_triton_backward_matches_pytorch_small_fp32():
+    torch.manual_seed(4)
+
+    B = 2
+    H = 2
+    M = 32
+    N = 128
+    D = 32
+    scale = D ** -0.5
+
+    q_ref = torch.randn((H, M, D), device="cuda", dtype=torch.float32, requires_grad=True)
+    k_ref = torch.randn((B, N, H, D), device="cuda", dtype=torch.float32, requires_grad=True)
+    v_ref = torch.randn((B, N, H, D), device="cuda", dtype=torch.float32, requires_grad=True)
+    q_dec_ref = torch.randn((B, N, H, D), device="cuda", dtype=torch.float32, requires_grad=True)
+    k_dec_ref = torch.randn((H, M, D), device="cuda", dtype=torch.float32, requires_grad=True)
+
+    grad_out = torch.randn((B, N, H, D), device="cuda", dtype=torch.float32)
+
+    y_ref = flare_autoregressive_stablemax_pytorch(
+        q_ref,
+        k_ref,
+        v_ref,
+        scale=scale,
+        chunk_size=64,
+        Q_dec=q_dec_ref,
+        K_dec=k_dec_ref,
+        power=2.0,
+    )
+    (y_ref * grad_out).sum().backward()
+
+    q_tri = q_ref.detach().clone().requires_grad_(True)
+    k_tri = k_ref.detach().clone().requires_grad_(True)
+    v_tri = v_ref.detach().clone().requires_grad_(True)
+    q_dec_tri = q_dec_ref.detach().clone().requires_grad_(True)
+    k_dec_tri = k_dec_ref.detach().clone().requires_grad_(True)
+
+    y_tri, _, _ = flare_autoregressive_stablemax_triton(
+        q_tri,
+        k_tri,
+        v_tri,
+        scale=scale,
+        chunk_size=64,
+        Q_dec=q_dec_tri,
+        K_dec=k_dec_tri,
+        power=2.0,
+    )
+    (y_tri.float() * grad_out).sum().backward()
+
+    torch.testing.assert_close(q_tri.grad, q_ref.grad, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(k_tri.grad, k_ref.grad, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(v_tri.grad, v_ref.grad, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(q_dec_tri.grad, q_dec_ref.grad, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(k_dec_tri.grad, k_dec_ref.grad, atol=2e-3, rtol=2e-3)
+
 @torch.no_grad()
 @pytest.mark.parametrize("gate_case", ["fixed_0.5"])
 def test_stablemax_write_gate_matches_tiny_sequential_reference(gate_case: str):
