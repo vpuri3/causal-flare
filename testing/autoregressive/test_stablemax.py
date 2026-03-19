@@ -5,6 +5,7 @@ from causal_flare.autoregressive.stablemax import (
     _stablemax_score_transform,
     flare_autoregressive_stablemax_pytorch,
 )
+from causal_flare.autoregressive.stablemax_triton import flare_autoregressive_stablemax_triton
 
 
 def _sequential_stablemax_write_gated_reference(
@@ -218,9 +219,59 @@ def test_stablemax_write_gate_identity_matches_baseline():
         write_gate=True,
         write_gate_fixed_value=1.0,
     )
-
     torch.testing.assert_close(y_gated, y_base, rtol=1e-4, atol=1e-5)
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton path")
+def test_stablemax_triton_forward_matches_pytorch_large_bf16():
+    torch.manual_seed(0)
+
+    # Requested validation shape:
+    # - N = 2048 tokens
+    # - B * H = 128 batch-head lanes
+    # - M = 128 latent slots (matching the train-like FLARE shapes in this repo)
+    # - D = 32 for both score and value heads
+    B = 8
+    H = 16
+    M = 128
+    N = 2048
+    D = 32
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((B, N, H, D), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((B, N, H, D), device="cuda", dtype=torch.bfloat16)
+    q_dec = torch.randn((B, N, H, D), device="cuda", dtype=torch.bfloat16)
+    k_dec = torch.randn((H, M, D), device="cuda", dtype=torch.bfloat16)
+
+    y_ref = flare_autoregressive_stablemax_pytorch(
+        q,
+        k,
+        v,
+        scale=scale,
+        chunk_size=None,
+        Q_dec=q_dec,
+        K_dec=k_dec,
+        power=2.0,
+    )
+    y_tri, z_enc, z_dec = flare_autoregressive_stablemax_triton(
+        q,
+        k,
+        v,
+        scale=scale,
+        chunk_size=None,
+        Q_dec=q_dec,
+        K_dec=k_dec,
+        power=2.0,
+    )
+
+    assert y_tri.dtype == torch.bfloat16
+    assert y_tri.shape == y_ref.shape
+    assert z_enc.dtype == torch.float32
+    assert z_enc.shape == (B, H, N, M)
+    assert z_dec.dtype == torch.float32
+    assert z_dec.shape == (B, H, N)
+    torch.testing.assert_close(y_tri.float(), y_ref.float(), atol=7e-3, rtol=7e-3)
 
 @torch.no_grad()
 @pytest.mark.parametrize("gate_case", ["fixed_0.5"])
