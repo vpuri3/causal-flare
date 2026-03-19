@@ -371,6 +371,28 @@ def stablemax_bwd_output_kernel(
     H: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
+    # Output-phase reverse mode for one `(batch-head, chunk)`.
+    #
+    # Forward phase 3 computes, for each token row `t` in the chunk,
+    #
+    #   y_t = sum_m p_dec[t, m] * z_t[m]
+    #
+    # where
+    #
+    #   z_t[m] = (prefix_num[m] + sum_{tau <= t} stable[tau, m] * v_tau) / Z_ENC[t, m]
+    #
+    # This kernel handles every gradient that depends on decoder probabilities or
+    # on the chunk-local replay:
+    #
+    # - `dQ_dec`, `dK_dec` through the decoder softmax
+    # - the phase-3 contribution to `dV`
+    # - `d prefix_den` / `d prefix_num`, emitted as chunk-summary adjoints
+    # - cached `stable` and `decode_over_den`, which the encoder kernel reuses
+    #
+    # The key design choice is that the program owns the full chunk token axis.
+    # That lets us form the chunk-local `[C, C]` replay adjoint with dense tensor
+    # ops once and reuse it across all latent tiles instead of rebuilding it
+    # tile-by-tile.
     pid_bh = tl.program_id(0)
     pid_nc = tl.program_id(1)
     pid_b = pid_bh // H
@@ -411,9 +433,11 @@ def stablemax_bwd_output_kernel(
     zdec_ptrs = Z_DEC_ptr + pid_b * stride_zdec_b + pid_h * stride_zdec_h + global_t * stride_zdec_n
     z_dec = tl.load(zdec_ptrs, mask=mask_t, other=0.0).to(tl.float32)
 
-    # `grad_local_mix = dO @ V^T` is chunk-local and independent of the latent
-    # tile. Compute it once per `(bh, chunk)` and reuse it through the latent
-    # loop rather than rebuilding it once per tile.
+    # `grad_local_mix = dO @ V^T` is the reverse-mode analogue of the final
+    # local replay contraction `(W * causal_mask) @ V`.
+    #
+    # It only depends on chunk-local token rows and value vectors, so we build
+    # it once up front and reuse it across every latent tile in the loop below.
     grad_local_mix = tl.dot(do_lowp, tl.trans(v_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     grad_local_mix = tl.where(mask_t[:, None] & mask_t[None, :] & causal_mask, grad_local_mix, 0.0)
     delta_ptrs = Delta_ptr + pid_bh * stride_delta_bh + global_t * stride_delta_n
@@ -422,6 +446,13 @@ def stablemax_bwd_output_kernel(
     dv_phase3_total = tl.zeros((CHUNK_SIZE, D_VALUE), dtype=tl.float32)
 
     for m0 in tl.range(0, M, BLOCK_M):
+        # One latent tile gives us:
+        # - decoder scores / probabilities for this `m` slice
+        # - encoder stable weights for the same `m` slice
+        # - chunk-summary adjoints that will be suffix-scanned later
+        #
+        # The loop is over latent tiles only; there is no token streaming here.
+        # All token interactions stay in `[C, BLOCK_M]` or `[C, C]` tensor math.
         m_offsets = m0 + tl.arange(0, BLOCK_M)
         mask_m = m_offsets < M
 
@@ -448,6 +479,9 @@ def stablemax_bwd_output_kernel(
         p_dec = tl.where(mask_t[:, None] & mask_m[None, :], p_dec, 0.0)
         decode_over_den = p_dec * inv_total_den
 
+        # Cache the encoder-side quantities that the later encoder kernel needs.
+        # This avoids paying for a second encoder transform / normalization
+        # rebuild in the backward half that propagates through `stable`.
         sbuf_ptrs = (
             StableBuf_ptr
             + pid_b * stride_sbuf_b
@@ -474,6 +508,17 @@ def stablemax_bwd_output_kernel(
         )
         prefix_num = tl.load(pnum_ptrs, mask=mask_m[:, None], other=0.0)
 
+        # Reverse-mode of
+        #
+        #   y = p_dec @ (prefix_num / Z_ENC) + (p_dec / Z_ENC @ stable^T * causal) @ V
+        #
+        # `grad_decode_over_den` is the adjoint of the normalized replay weight
+        #
+        #   decode_over_den = p_dec / Z_ENC
+        #
+        # for this latent tile. It has two sources:
+        # - the prefix replay term `p_dec @ prefix_num`
+        # - the local replay term that goes through `stable` and `V`
         grad_decode_over_den = tl.dot(
             do_lowp,
             tl.trans(prefix_num),
@@ -487,12 +532,22 @@ def stablemax_bwd_output_kernel(
             input_precision=INPUT_PRECISION,
         )
 
+        # `grad_prev_num` is the chunk-summary adjoint of `prefix_num`. The
+        # reverse scan kernel will turn these strict-prefix adjoints into the
+        # per-chunk summary gradients that feed earlier chunks.
         grad_prev_num = tl.dot(
             tl.trans(decode_over_den.to(v_tile.dtype)),
             do_lowp,
             out_dtype=tl.float32,
             input_precision=INPUT_PRECISION,
         )
+
+        # Rebuild the same local replay mixing matrix used in forward:
+        #
+        #   local_mix[t, tau] = sum_m decode_over_den[t, m] * stable[tau, m]
+        #
+        # then mask it to the causal lower triangle and send the resulting value
+        # adjoint back into `V`.
         local_mix = tl.dot(
             decode_over_den.to(v_tile.dtype),
             tl.trans(stable.to(v_tile.dtype)),
@@ -507,6 +562,11 @@ def stablemax_bwd_output_kernel(
             input_precision=INPUT_PRECISION,
         )
 
+        # Decoder softmax backward:
+        # - `grad_decode_probs` is the adjoint of the normalized decoder
+        #   probability itself
+        # - `grad_total_den` is the part that flows through `1 / Z_ENC`
+        # - `delta` encodes the row-wise dot-product softmax correction
         grad_decode_probs = grad_decode_over_den * inv_total_den
         grad_total_den = -(grad_decode_over_den * p_dec) * inv_total_den * inv_total_den
         grad_prev_den = tl.sum(grad_total_den, axis=0)
@@ -607,6 +667,12 @@ def stablemax_bwd_reverse_scan_num_kernel(
     NUM_CHUNKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
+    # Same reverse strict-prefix logic as the denominator scan, but now for the
+    # value-expanded chunk summaries:
+    #
+    #   prefix_num[c] = sum_{c' < c} chunk_num[c']
+    #
+    # so every `d prefix_num[c]` contributes to all earlier chunks `c' < c`.
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
     m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -727,6 +793,21 @@ def stablemax_bwd_encoder_kernel(
     H: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
+    # Encoder-side reverse mode for one `(batch-head, chunk)`.
+    #
+    # By the time we reach this kernel, the output kernel and reverse scans have
+    # already produced:
+    # - cached `stable[t, m]`
+    # - cached `decode_over_den[t, m] = p_dec[t, m] / Z_ENC[t, m]`
+    # - suffix-scanned chunk-summary adjoints `grad_chunk_den` / `grad_chunk_num`
+    #
+    # This kernel combines those three sources into the adjoint of encoder
+    # stable weights, then projects that gradient back through:
+    #
+    #   stable = stablemax_transform(enc_scores)
+    #   enc_scores = scale * K_chunk @ Q_tile^T
+    #
+    # It also accumulates the summary-path contribution to `dV`.
     pid_bh = tl.program_id(0)
     pid_nc = tl.program_id(1)
     pid_b = pid_bh // H
@@ -760,6 +841,10 @@ def stablemax_bwd_encoder_kernel(
     do_tile = tl.load(do_ptrs, mask=mask_t[:, None], other=0.0)
     v_tile = tl.load(v_ptrs, mask=mask_t[:, None], other=0.0)
     do_lowp = do_tile.to(v_tile.dtype)
+
+    # As in the output kernel, `grad_local_mix = dO @ V^T` is purely chunk-local
+    # and shared by every latent tile. Hoist it once so the latent loop only
+    # pays for latent-dependent work.
     grad_local_mix = tl.dot(do_lowp, tl.trans(v_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     grad_local_mix = tl.where(mask_t[:, None] & mask_t[None, :] & causal_mask, grad_local_mix, 0.0)
     k_ptrs = k_bh_base + global_t[:, None] * stride_k_n + k_offsets[None, :] * stride_k_d
@@ -770,6 +855,11 @@ def stablemax_bwd_encoder_kernel(
     rev_causal = global_t[:, None] <= global_t[None, :]
 
     for m0 in tl.range(0, M, BLOCK_M):
+        # This loop reconstructs the adjoint of encoder stable weights for one
+        # latent tile by combining:
+        # - phase-3 local replay gradients
+        # - summary-prefix gradients emitted by later chunks
+        # - the stablemax transform derivative
         m_offsets = m0 + tl.arange(0, BLOCK_M)
         mask_m = m_offsets < M
 
@@ -829,8 +919,18 @@ def stablemax_bwd_encoder_kernel(
             out_dtype=tl.float32,
             input_precision=INPUT_PRECISION,
         )
+
+        # Reverse-mode of `decode_over_den = p_dec / Z_ENC` with respect to the
+        # encoder normalization `Z_ENC`. This contributes to the adjoint of the
+        # cumulative stable weights before we fold in the summary-path terms.
         grad_total_den = -(grad_decode_over_den * decode_over_den) * inv_total_den
 
+        # `grad_w_phase3` is the adjoint of the cumulative encoder replay
+        #
+        #   W[t, m] = sum_{tau <= t} stable[tau, m]
+        #
+        # coming only from phase 3. The first term comes from the local replay
+        # matrix, and the second term is the cumulative effect of `Z_ENC`.
         grad_w_phase3 = tl.dot(
             tl.trans(grad_local_mix.to(v_tile.dtype)),
             decode_over_den.to(v_tile.dtype),
@@ -855,10 +955,16 @@ def stablemax_bwd_encoder_kernel(
         )
         grad_chunk_num = tl.load(gcn_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
 
+        # Add the summary-path adjoints:
+        # - `grad_chunk_den` contributes a per-latent bias to every token row
+        # - `grad_chunk_num` contributes through the summary contraction
+        #   `chunk_num = stable^T @ V`
         grad_w_total = grad_w_phase3 + grad_chunk_den[None, :]
         grad_w_total += tl.dot(v_tile, tl.trans(grad_chunk_num.to(v_tile.dtype)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dv_summary_total += tl.dot(stable.to(v_tile.dtype), grad_chunk_num.to(v_tile.dtype), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
+        # Finally, push through the stablemax transform and the encoder score
+        # projection `enc_scores = scale * K_chunk @ Q_tile^T`.
         grad_score_enc = grad_w_total * stable_grad
         dk_total += tl.dot(grad_score_enc.to(q_tile.dtype), q_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION) * scale
         dq = tl.dot(tl.trans(grad_score_enc.to(k_tile.dtype)), k_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION) * scale
@@ -1881,6 +1987,23 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         chunk_size = ctx.chunk_size
         num_chunks = ctx.num_chunks
 
+        # Backward mirrors the PyTorch reference in four stages:
+        #
+        # 1. preprocess `delta[t] = <O[t], dO[t]>` for decoder-softmax backward
+        # 2. phase-3/output adjoints:
+        #    - propagate through decoder probabilities and replay to get
+        #      `dQ_dec`, `dK_dec`, the phase-3 contribution to `dV`, and strict
+        #      prefix-summary adjoints for `prefix_den/prefix_num`
+        # 3. reverse-scan those strict-prefix adjoints over chunks
+        # 4. encoder adjoints:
+        #    - combine phase-3 and summary-path gradients
+        #    - propagate through stablemax and encoder score projections to get
+        #      `dQ`, `dK`, and the summary contribution to `dV`
+        #
+        # `Z_ENC` / `Z_DEC` were already saved in forward, so backward can stay
+        # faithful to the PyTorch algorithm without re-deriving those
+        # normalizers on the host.
+
         # Backward has different pressure points than forward. The hot chunk-owned
         # kernels benefit from owning a much larger latent tile so they amortize
         # the `[C, C]` replay math across fewer `m` iterations.
@@ -1923,6 +2046,10 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         dV = torch.zeros((B, N, H, D_value), device=dY.device, dtype=torch.float32)
         dQ_dec = torch.zeros((B, N, H, D_score), device=dY.device, dtype=torch.float32)
         dK_dec = torch.zeros((H, M, D_score), device=dY.device, dtype=torch.float32)
+
+        # Saved chunk-local encoder quantities reused between the two hot
+        # backward kernels. Caching them here is cheaper than recomputing the
+        # same encoder transform and normalization in both kernels.
         stable_buf = torch.empty((B, H, N, M), device=dY.device, dtype=V.dtype)
         decode_over_den_buf = torch.empty((B, H, N, M), device=dY.device, dtype=V.dtype)
         grad_prev_den = torch.empty((B * H, num_chunks, M), device=dY.device, dtype=torch.float32)
@@ -1937,6 +2064,7 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         def delta_grid(_meta):
             return (B * H, num_chunks)
 
+        # Stage 1: row-wise decoder-softmax preprocess.
         stablemax_bwd_preprocess_delta_kernel[delta_grid](
             O,
             dO,
@@ -1956,6 +2084,7 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         def output_bwd_grid(_meta):
             return (B * H, num_chunks)
 
+        # Stage 2: output/decoder adjoints plus cached encoder-side state.
         stablemax_bwd_output_kernel[output_bwd_grid](
             Q,
             K,
@@ -2012,6 +2141,7 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         def reverse_den_grid(_meta):
             return (B * H, config["NUM_M_TILES"])
 
+        # Stage 3: reverse strict-prefix scans over chunk summaries.
         stablemax_bwd_reverse_scan_den_kernel[reverse_den_grid](
             grad_prev_den,
             grad_chunk_den,
@@ -2037,6 +2167,7 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
             num_stages=2,
         )
 
+        # Stage 4: encoder adjoints plus summary-path contribution to `dV`.
         stablemax_bwd_encoder_kernel[output_bwd_grid](
             Q,
             K,
