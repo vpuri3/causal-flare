@@ -1987,7 +1987,32 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         chunk_size = ctx.chunk_size
         num_chunks = ctx.num_chunks
 
-        # Backward mirrors the PyTorch reference in four stages:
+        # Backward mirrors the PyTorch reference in four stages.
+        #
+        # Notation used below for one token row `t`, one latent `j`, and one
+        # encoder/source token `u` inside the current causal prefix:
+        #
+        #   s_enc[t, u, j]   = encoder score before stablemax
+        #   a[t, u, j]       = stablemax(s_enc[t, u, j])
+        #   D[t, j]          = total encoder denominator seen by token `t`
+        #                    = prefix_den[chunk_of_t - 1, j] + sum_{u <= t} a[t, u, j]
+        #   N[t, j]          = matching encoder numerator
+        #                    = prefix_num[chunk_of_t - 1, j] + sum_{u <= t} a[t, u, j] * v_u
+        #   z_dec[t, j]      = decoder-side latent score
+        #   p_dec[t, j]      = softmax_j(z_dec[t, j])
+        #   y_t              = final token output
+        #
+        # So the forward row is
+        #
+        #   y_t = sum_j p_dec[t, j] * (N[t, j] / D[t, j]).
+        #
+        # The backward pass therefore has two intertwined pieces:
+        #
+        # 1. decoder softmax backward across latents `j`
+        # 2. encoder-summary backward through the ratio `N / D`, then through
+        #    the stablemax-transformed encoder weights `a`
+        #
+        # The kernels are organized to follow exactly that split.
         #
         # 1. preprocess `delta[t] = <O[t], dO[t]>` for decoder-softmax backward
         # 2. phase-3/output adjoints:
@@ -2003,6 +2028,26 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         # `Z_ENC` / `Z_DEC` were already saved in forward, so backward can stay
         # faithful to the PyTorch algorithm without re-deriving those
         # normalizers on the host.
+        #
+        # In symbols, the output stage differentiates
+        #
+        #   y_t = sum_j p_dec[t, j] * (
+        #           prefix_num_t[j] / prefix_den_t[j]
+        #           + sum_{u <= t in current chunk} stable[t, u, j] / total_den[t, j] * v_u
+        #         )
+        #
+        # where:
+        #
+        # - `prefix_*_t` means the strict prefix summary available before the
+        #   current chunk starts
+        # - `stable` is the stablemax-transformed encoder score
+        # - `total_den[t, j]` is the strict-prefix denominator plus the local
+        #   within-chunk cumulative denominator for row `t`
+        # - `p_dec[t, j] = exp(z_dec[t, j] - Z_DEC[t])`
+        #
+        # The reverse scan then converts "gradient wrt all later uses of a
+        # strict prefix summary" into "gradient wrt the chunk summary produced
+        # at this chunk".
 
         # Backward has different pressure points than forward. The hot chunk-owned
         # kernels benefit from owning a much larger latent tile so they amortize
@@ -2050,6 +2095,20 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         # Saved chunk-local encoder quantities reused between the two hot
         # backward kernels. Caching them here is cheaper than recomputing the
         # same encoder transform and normalization in both kernels.
+        #
+        # `stable_buf[b, h, t, j]`
+        #   stablemax-transformed encoder mass assigned from row `t` to latent
+        #   `j` for tokens in the current chunk.
+        #
+        # `decode_over_den_buf[b, h, t, j]`
+        #   p_dec[t, j] / D[t, j].
+        #
+        # This factor appears repeatedly because
+        #
+        #   y_t = sum_j p_dec[t, j] * N[t, j] / D[t, j]
+        #
+        # so gradients wrt both `N[t, j]` and the local `a[t, u, j]` terms
+        # inherit the same multiplicative `p_dec[t, j] / D[t, j]`.
         stable_buf = torch.empty((B, H, N, M), device=dY.device, dtype=V.dtype)
         decode_over_den_buf = torch.empty((B, H, N, M), device=dY.device, dtype=V.dtype)
         grad_prev_den = torch.empty((B * H, num_chunks, M), device=dY.device, dtype=torch.float32)
@@ -2065,6 +2124,13 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
             return (B * H, num_chunks)
 
         # Stage 1: row-wise decoder-softmax preprocess.
+        # For softmax rows, the backward identity is
+        #
+        #   dL/dz_i = p_i * (dL/dp_i - sum_k p_k * dL/dp_k).
+        #
+        # `delta[t] = <O[t], dO[t]>` is that row-wise inner product term
+        # `sum_k p_k * dL/dp_k` after the value projection has already been
+        # folded into `O[t]`.
         stablemax_bwd_preprocess_delta_kernel[delta_grid](
             O,
             dO,
@@ -2085,6 +2151,41 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
             return (B * H, num_chunks)
 
         # Stage 2: output/decoder adjoints plus cached encoder-side state.
+        # This kernel handles the derivatives of the explicit output formula:
+        #
+        # - decoder-score path:
+        #     z_dec -> softmax(p_dec) -> output
+        # - replay/value path:
+        #     V -> output
+        # - summary consumers:
+        #     prefix_den / prefix_num -> output
+        #
+        # It also caches two encoder-side quantities that are expensive to
+        # rebuild in the encoder kernel:
+        #
+        # - `stable_buf`        : stablemax(score_enc)
+        # - `decode_over_den`   : decoder weights divided by encoder totals
+        #
+        # The latter is the factor multiplying both summary numerators and the
+        # local encoder replay in the chain rule.
+        #
+        # More concretely, for fixed `(t, j)`:
+        #
+        #   y_t contributes
+        #     dL/dN[t, j] = <dY_t, p_dec[t, j] / D[t, j]>
+        #
+        # and
+        #
+        #   dL/dD[t, j] = - <dY_t, p_dec[t, j] * N[t, j] / D[t, j]^2>.
+        #
+        # Since both `N[t, j]` and `D[t, j]` depend on the local stablemax
+        # weights `a[t, u, j]`, this stage computes the gradients wrt the
+        # chunk-local summary inputs and stores them as:
+        #
+        # - `grad_prev_den/grad_prev_num`: adjoints wrt the strict prefix
+        #   summaries consumed by each later chunk
+        # - `dQ_dec/dK_dec`: decoder score gradients after the softmax Jacobian
+        # - phase-3 `dV`: the direct value contribution from replay/output
         stablemax_bwd_output_kernel[output_bwd_grid](
             Q,
             K,
@@ -2142,6 +2243,21 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
             return (B * H, config["NUM_M_TILES"])
 
         # Stage 3: reverse strict-prefix scans over chunk summaries.
+        # Forward summary construction is a prefix scan over chunks:
+        #
+        #   prefix_{c+1} = prefix_c + chunk_c.
+        #
+        # Therefore backward is the reverse cumulative sum:
+        #
+        #   d chunk_c = sum_{r > c} d prefix_r.
+        #
+        # We do that separately for the scalar denominator summaries and the
+        # vector numerator summaries. After this step:
+        #
+        # - `grad_chunk_den[c, j]` is the total adjoint wrt the denominator
+        #   summary emitted by chunk `c`
+        # - `grad_chunk_num[c, j, :]` is the matching adjoint wrt the value
+        #   numerator summary emitted by chunk `c`
         stablemax_bwd_reverse_scan_den_kernel[reverse_den_grid](
             grad_prev_den,
             grad_chunk_den,
@@ -2168,6 +2284,42 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         )
 
         # Stage 4: encoder adjoints plus summary-path contribution to `dV`.
+        # At this point we have:
+        #
+        # - direct output-path gradients from stage 2
+        # - per-chunk summary adjoints from stage 3
+        #
+        # This kernel combines them and differentiates the encoder-side chain
+        #
+        #   score_enc
+        #     -> stable = stablemax(score_enc)
+        #     -> {chunk_den, chunk_num}
+        #     -> {prefix_den, prefix_num}
+        #     -> output
+        #
+        # yielding:
+        #
+        # - `dQ`, `dK` from the score projection
+        # - the remaining encoder-side contribution to `dV`
+        #
+        # Inside this kernel, the main algebra is:
+        #
+        #   dL/da[t, u, j]
+        #     = contribution through N[t, j]
+        #     + contribution through D[t, j]
+        #     + contribution through future chunk summaries
+        #
+        # then
+        #
+        #   da/ds_enc = d stablemax(s_enc) / d s_enc
+        #
+        # and finally
+        #
+        #   s_enc[t, u, j] = scale * <q_j, k_u>.
+        #
+        # So the kernel finishes by contracting the score adjoints into `dQ`
+        # and `dK`, while also adding the encoder-side `a * v` gradient into
+        # `dV`.
         stablemax_bwd_encoder_kernel[output_bwd_grid](
             Q,
             K,
