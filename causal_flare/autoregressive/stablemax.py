@@ -5,7 +5,7 @@ from causal_flare._reference_utils import (
 )
 
 
-def _resolve_stablemax_chunk_size(N: int, M: int, D_score: int, chunk_size) -> int:
+def _resolve_stablemax_chunk_size_pytorch(N: int, M: int, D_score: int, chunk_size) -> int:
     if chunk_size is None:
         env_chunk = os.environ.get("FLARE_PYTORCH_CHUNK_SIZE", "")
         chunk_size = int(env_chunk) if env_chunk else None
@@ -16,6 +16,24 @@ def _resolve_stablemax_chunk_size(N: int, M: int, D_score: int, chunk_size) -> i
     if D_score <= 64 and M <= 128 and N >= 1024:
         return 128
     return max(64, min(2048, max(1, N // 2)))
+
+
+def _resolve_stablemax_chunk_size_triton(N: int, M: int, D_score: int, D_value: int, chunk_size) -> int:
+    if chunk_size is None:
+        env_chunk = os.environ.get("FLARE_PYTORCH_CHUNK_SIZE", "")
+        chunk_size = int(env_chunk) if env_chunk else None
+    if chunk_size is not None:
+        return int(chunk_size)
+    # The Triton backward output kernel keeps the full value-head dimension live
+    # inside a chunk-owned program. Large value heads can therefore overflow
+    # shared memory even when the forward-oriented `D_score` / `M` heuristic
+    # would have picked `128`.
+    if D_value > 128 and (M >= 256 or D_score >= 128):
+        return 64
+    if D_score <= 32 and M <= 64:
+        return 64
+    del N
+    return 128
 
 
 def _stablemax_score_transform(x: torch.Tensor, power: float = 2.0) -> torch.Tensor:
@@ -150,7 +168,7 @@ class FLAREAutoregressiveStablemaxPyTorch(autograd.Function):
         else:
             K_dec_f = Q_f.unsqueeze(0).expand(B, -1, -1, -1).contiguous()
 
-        C = _resolve_stablemax_chunk_size(N, M, D_score, chunk_size)
+        C = _resolve_stablemax_chunk_size_pytorch(N, M, D_score, chunk_size)
         NC = math.ceil(N / C) if N > 0 else 0
         PADDED_LEN = NC * C
         PAD = PADDED_LEN - N
@@ -621,7 +639,7 @@ class FLAREAutoregressiveStablemaxWriteGatedPyTorch(autograd.Function):
         ctx.d_score = D_score
         ctx.d_value = D_value
         ctx.scale_resolved = float(scale_resolved)
-        C = _resolve_stablemax_chunk_size(N, M, D_score, chunk_size)
+        C = _resolve_stablemax_chunk_size_pytorch(N, M, D_score, chunk_size)
         ctx.c = C
         ctx.nc = math.ceil(N / C) if N > 0 else 0
         ctx.padded_len = ctx.nc * C

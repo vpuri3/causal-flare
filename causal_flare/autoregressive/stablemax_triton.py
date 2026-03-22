@@ -3,7 +3,7 @@ from causal_flare._reference_utils import (
     resolve_flare_causal_decode_inputs as _resolve_flare_causal_decode_inputs,
     validate_flare_qkv_layouts as _validate_flare_qkv_layouts,
 )
-from causal_flare.autoregressive.stablemax import _resolve_stablemax_chunk_size
+from causal_flare.autoregressive.stablemax import _resolve_stablemax_chunk_size_triton
 
 
 def _stablemax_block_k_divisor(D: int, preferred: int) -> int:
@@ -38,6 +38,10 @@ def _stablemax_power_mode(power: float) -> int:
         return 1
     if power == 2.0:
         return 2
+    if power == 3.0:
+        return 3
+    if power == 4.0:
+        return 4
     return 0
 
 
@@ -135,9 +139,11 @@ def _stablemax_transform(scores, power, POWER_MODE: tl.constexpr):
     # - x >= 0: (x + 1)^power
     # - x < 0:  (1 - x)^(-power)
     #
-    # Fast paths for the two common public settings:
+    # Fast paths for the common public settings:
     # - power == 1: linear / reciprocal
     # - power == 2: square / reciprocal-square
+    # - power == 3: cube / reciprocal-cube
+    # - power == 4: fourth-power / reciprocal-fourth-power
     #
     # The generic path stays in log2/exp2 form so Triton uses the same base-2
     # math family as the online-softmax paths elsewhere in this file.
@@ -149,6 +155,14 @@ def _stablemax_transform(scores, power, POWER_MODE: tl.constexpr):
     elif POWER_MODE == 2:
         pos = pos_base * pos_base
         neg = 1.0 / (neg_base * neg_base)
+    elif POWER_MODE == 3:
+        pos = pos_base * pos_base * pos_base
+        neg = 1.0 / (neg_base * neg_base * neg_base)
+    elif POWER_MODE == 4:
+        pos2 = pos_base * pos_base
+        neg2 = neg_base * neg_base
+        pos = pos2 * pos2
+        neg = 1.0 / (neg2 * neg2)
     else:
         pos = tl.math.exp2(power * tl.math.log2(pos_base))
         neg = tl.math.exp2(-power * tl.math.log2(neg_base))
@@ -178,6 +192,12 @@ def _stablemax_transform_grad(scores, power, POWER_MODE: tl.constexpr):
     elif POWER_MODE == 2:
         pos = 2.0 * pos_base
         neg = 2.0 / (neg_base * neg_base * neg_base)
+    elif POWER_MODE == 3:
+        pos = 3.0 * pos_base * pos_base
+        neg = 3.0 / (neg_base * neg_base * neg_base * neg_base)
+    elif POWER_MODE == 4:
+        pos = 4.0 * pos_base * pos_base * pos_base
+        neg = 4.0 / (neg_base * neg_base * neg_base * neg_base * neg_base)
     else:
         pos = power * tl.math.exp2((power - 1.0) * tl.math.log2(pos_base))
         neg = power * tl.math.exp2(-(power + 1.0) * tl.math.log2(neg_base))
@@ -187,7 +207,7 @@ def _stablemax_transform_grad(scores, power, POWER_MODE: tl.constexpr):
 @triton.jit
 def _stablemax_transform_grad_from_stable(stable, POWER_MODE: tl.constexpr):
     # Recover the stablemax transform derivative directly from the transformed
-    # value for the two fast-path power modes we actually optimize:
+    # value for the three fast-path power modes we actually optimize:
     #
     # power == 1:
     #   x >= 0 -> stable = x + 1        -> grad = 1
@@ -197,6 +217,14 @@ def _stablemax_transform_grad_from_stable(stable, POWER_MODE: tl.constexpr):
     #   x >= 0 -> stable = (x + 1)^2     -> grad = 2 * sqrt(stable)
     #   x <  0 -> stable = (1 - x)^(-2)  -> grad = 2 * stable^(3/2)
     #
+    # power == 3:
+    #   x >= 0 -> stable = (x + 1)^3     -> grad = 3 * stable^(2/3)
+    #   x <  0 -> stable = (1 - x)^(-3)  -> grad = 3 * stable^(4/3)
+    #
+    # power == 4:
+    #   x >= 0 -> stable = (x + 1)^4     -> grad = 4 * stable^(3/4)
+    #   x <  0 -> stable = (1 - x)^(-4)  -> grad = 4 * stable^(5/4)
+    #
     # We distinguish the branches from `stable >= 1`, which is equivalent to
     # `x >= 0` for these piecewise transforms.
     if POWER_MODE == 1:
@@ -204,6 +232,17 @@ def _stablemax_transform_grad_from_stable(stable, POWER_MODE: tl.constexpr):
     if POWER_MODE == 2:
         root = tl.sqrt(tl.maximum(stable, 0.0))
         return tl.where(stable >= 1.0, 2.0 * root, 2.0 * stable * root)
+    if POWER_MODE == 3:
+        stable_safe = tl.maximum(stable, 0.0)
+        cbrt = tl.math.exp2((1.0 / 3.0) * tl.math.log2(tl.maximum(stable_safe, 1e-20)))
+        cbrt2 = cbrt * cbrt
+        return tl.where(stable >= 1.0, 3.0 * cbrt2, 3.0 * stable * cbrt)
+    if POWER_MODE == 4:
+        stable_safe = tl.maximum(stable, 0.0)
+        fourth_root = tl.math.exp2(0.25 * tl.math.log2(tl.maximum(stable_safe, 1e-20)))
+        fourth_root2 = fourth_root * fourth_root
+        fourth_root3 = fourth_root2 * fourth_root
+        return tl.where(stable >= 1.0, 4.0 * fourth_root3, 4.0 * stable * fourth_root)
     return stable
 
 
@@ -1712,7 +1751,7 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         power_f = float(power)
         power_mode = _stablemax_power_mode(power_f)
         Q_dec_resolved, K_dec_resolved, _, _, _ = _resolve_flare_causal_decode_inputs(Q, K, Q_dec, K_dec)
-        chunk_size_resolved = _resolve_stablemax_chunk_size(N, M, D_score, chunk_size)
+        chunk_size_resolved = _resolve_stablemax_chunk_size_triton(N, M, D_score, D_value, chunk_size)
 
         # The current Triton path works chunk-at-a-time and keeps the full chunk
         # token axis live inside phase 3, so we require the resolved chunk size
@@ -1728,8 +1767,6 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
 
         if N == 0:
             O_empty = torch.empty((B, 0, H, D_value), device=V.device, dtype=out_dtype)
-            Z_ENC_empty = torch.empty((B, H, 0, M), device=V.device, dtype=torch.float32)
-            Z_DEC_empty = torch.empty((B, H, 0), device=V.device, dtype=torch.float32)
             ctx.empty = True
             ctx.b = B
             ctx.n = N
@@ -1742,8 +1779,7 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
             ctx.v_dtype = V.dtype
             ctx.q_dec_dtype = Q_dec_resolved.dtype
             ctx.k_dec_dtype = K_dec_resolved.dtype
-            ctx.mark_non_differentiable(Z_ENC_empty, Z_DEC_empty)
-            return O_empty, Z_ENC_empty, Z_DEC_empty
+            return O_empty
 
         # Chunk geometry.
         #
@@ -1937,11 +1973,9 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
             Z_ENC,
             Z_DEC,
         )
-        ctx.mark_non_differentiable(Z_ENC, Z_DEC)
-
         # All internal reductions accumulate in fp32. Only the public return
         # value is cast back to the caller-visible output dtype.
-        return O_out, Z_ENC, Z_DEC
+        return O_out
 
     @staticmethod
     def backward(ctx, dY, *unused):
@@ -2052,7 +2086,9 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
         # Backward has different pressure points than forward. The hot chunk-owned
         # kernels benefit from owning a much larger latent tile so they amortize
         # the `[C, C]` replay math across fewer `m` iterations.
-        if M >= 64:
+        if D_value > 128:
+            bwd_block_m = 32 if M >= 32 else (16 if M >= 16 else ctx.config_block_m)
+        elif M >= 64:
             bwd_block_m = 64
         elif M >= 32:
             bwd_block_m = 32
@@ -2071,7 +2107,7 @@ class FLAREAutoregressiveStablemaxTriton(autograd.Function):
             "output_num_stages": ctx.output_num_stages,
         }
         bwd_num_warps = 8
-        bwd_num_stages = 2
+        bwd_num_stages = 1 if D_value > 128 else 2
 
         if config["NUM_D_TILES"] != 1:
             raise NotImplementedError(

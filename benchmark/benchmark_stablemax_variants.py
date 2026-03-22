@@ -140,12 +140,14 @@ def precompute_reference_state(
     B, N, H, D_value = v.shape[0], v.shape[1], v.shape[2], v.shape[3]
     M = q.shape[1]
     power_mode = _stablemax_power_mode(float(power))
+    save_stable_is_bf16 = v.dtype == torch.bfloat16
     padded_len = math.ceil(N / chunk_size) * chunk_size
     num_chunks = padded_len // chunk_size
     chunk_den = torch.empty((B * H, num_chunks, M), device=q.device, dtype=torch.float32)
     chunk_num = torch.empty((B * H, num_chunks, M, D_value), device=q.device, dtype=v.dtype)
     prefix_den = torch.empty((B * H, num_chunks, M), device=q.device, dtype=torch.float32)
     prefix_num = torch.empty((B * H, num_chunks, M, D_value), device=q.device, dtype=v.dtype)
+    stable_enc = torch.empty((1,), device=q.device, dtype=v.dtype)
     num_d_tiles = triton.cdiv(D_value, 32)
 
     stablemax_prepare_kernel[(B * H, num_chunks, triton.cdiv(M, 32) * num_d_tiles)](
@@ -154,6 +156,7 @@ def precompute_reference_state(
         v,
         chunk_den,
         chunk_num,
+        stable_enc,
         *q.stride(),
         *k.stride(),
         *v.stride(),
@@ -171,6 +174,8 @@ def precompute_reference_state(
         BLOCK_D=32,
         BLOCK_K=32,
         INPUT_PRECISION=input_precision,
+        SAVE_STABLEMAX_ENCODE_SCORES=False,
+        SAVE_STABLE_IS_BF16=save_stable_is_bf16,
         H=H,
         num_warps=4,
         num_stages=2,
@@ -219,6 +224,7 @@ def tune_phases_for_chunk(
     B, N, H, D_value = v.shape[0], v.shape[1], v.shape[2], v.shape[3]
     M = q.shape[1]
     power_mode = _stablemax_power_mode(float(power))
+    save_stable_is_bf16 = v.dtype == torch.bfloat16
     num_d_tiles = triton.cdiv(D_value, 32)
     ref = precompute_reference_state(
         q,
@@ -237,6 +243,7 @@ def tune_phases_for_chunk(
     def build_prepare(params: dict[str, int]):
         chunk_den = torch.empty_like(ref["chunk_den"])
         chunk_num = torch.empty_like(ref["chunk_num"])
+        stable_enc = torch.empty((1,), device=q.device, dtype=v.dtype)
 
         def launch():
             stablemax_prepare_kernel[(B * H, num_chunks, triton.cdiv(M, params["BLOCK_M"]) * num_d_tiles)](
@@ -245,6 +252,7 @@ def tune_phases_for_chunk(
                 v,
                 chunk_den,
                 chunk_num,
+                stable_enc,
                 *q.stride(),
                 *k.stride(),
                 *v.stride(),
@@ -262,6 +270,8 @@ def tune_phases_for_chunk(
                 BLOCK_D=32,
                 BLOCK_K=32,
                 INPUT_PRECISION=input_precision,
+                SAVE_STABLEMAX_ENCODE_SCORES=False,
+                SAVE_STABLE_IS_BF16=save_stable_is_bf16,
                 H=H,
                 num_warps=params["num_warps"],
                 num_stages=params["num_stages"],
@@ -298,6 +308,7 @@ def tune_phases_for_chunk(
         z_enc = torch.empty((B, H, N, M), device=q.device, dtype=torch.float32)
         z_dec = torch.empty((B, H, N), device=q.device, dtype=torch.float32)
         out = torch.empty((B, N, H, D_value), device=q.device, dtype=torch.float32)
+        stable_enc = torch.empty((1,), device=q.device, dtype=v.dtype)
 
         def launch():
             stablemax_output_kernel[(B * H, num_chunks, num_d_tiles)](
@@ -305,6 +316,7 @@ def tune_phases_for_chunk(
                 k,
                 q_dec,
                 k_dec,
+                stable_enc,
                 z_enc,
                 z_dec,
                 ref["prefix_den"],
@@ -333,6 +345,8 @@ def tune_phases_for_chunk(
                 BLOCK_D=32,
                 BLOCK_K=32,
                 INPUT_PRECISION=input_precision,
+                SAVE_STABLEMAX_ENCODE_SCORES=False,
+                SAVE_STABLE_IS_BF16=save_stable_is_bf16,
                 H=H,
                 num_warps=params["num_warps"],
                 num_stages=params["num_stages"],
@@ -369,6 +383,7 @@ def run_tuned_stablemax_forward(
     M = q.shape[1]
     scale = q.shape[-1] ** -0.5
     power_mode = _stablemax_power_mode(float(power))
+    save_stable_is_bf16 = v.dtype == torch.bfloat16
     padded_len = math.ceil(N / chunk_size) * chunk_size
     num_chunks = padded_len // chunk_size
 
@@ -384,6 +399,7 @@ def run_tuned_stablemax_forward(
     chunk_num = torch.empty((B * H, num_chunks, M, D_value), device=q.device, dtype=v.dtype)
     prefix_den = torch.empty((B * H, num_chunks, M), device=q.device, dtype=torch.float32)
     prefix_num = torch.empty((B * H, num_chunks, M, D_value), device=q.device, dtype=v.dtype)
+    stable_enc = torch.empty((1,), device=q.device, dtype=v.dtype)
     z_enc = torch.empty((B, H, N, M), device=q.device, dtype=torch.float32)
     z_dec = torch.empty((B, H, N), device=q.device, dtype=torch.float32)
     out = torch.empty((B, N, H, D_value), device=q.device, dtype=torch.float32)
@@ -394,6 +410,7 @@ def run_tuned_stablemax_forward(
         v,
         chunk_den,
         chunk_num,
+        stable_enc,
         *q.stride(),
         *k.stride(),
         *v.stride(),
@@ -411,6 +428,8 @@ def run_tuned_stablemax_forward(
         BLOCK_D=32,
         BLOCK_K=32,
         INPUT_PRECISION=input_precision,
+        SAVE_STABLEMAX_ENCODE_SCORES=False,
+        SAVE_STABLE_IS_BF16=save_stable_is_bf16,
         H=H,
         num_warps=prepare_params["num_warps"],
         num_stages=prepare_params["num_stages"],
@@ -439,6 +458,7 @@ def run_tuned_stablemax_forward(
         k,
         q_dec,
         k_dec,
+        stable_enc,
         z_enc,
         z_dec,
         prefix_den,
@@ -467,6 +487,8 @@ def run_tuned_stablemax_forward(
         BLOCK_D=32,
         BLOCK_K=32,
         INPUT_PRECISION=input_precision,
+        SAVE_STABLEMAX_ENCODE_SCORES=False,
+        SAVE_STABLE_IS_BF16=save_stable_is_bf16,
         H=H,
         num_warps=output_params["num_warps"],
         num_stages=output_params["num_stages"],

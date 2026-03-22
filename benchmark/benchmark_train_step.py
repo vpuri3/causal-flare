@@ -281,8 +281,6 @@ def _build_flare_stablemax_step_fn(
             chunk_size=stablemax_chunk_size,
             input_precision=flare_input_precision,
         )
-        if isinstance(y, tuple):
-            y = y[0]
         loss = y.float().square().mean()
         loss.backward()
 
