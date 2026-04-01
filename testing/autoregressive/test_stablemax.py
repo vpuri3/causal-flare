@@ -4,6 +4,7 @@ import torch
 from causal_flare.autoregressive.stablemax import (
     _resolve_stablemax_chunk_size_triton,
     _stablemax_score_transform,
+    flare_autoregressive_stablemax_mat_decode_pytorch,
     flare_autoregressive_stablemax_pytorch,
 )
 from causal_flare.autoregressive.stablemax_triton import flare_autoregressive_stablemax_triton
@@ -66,6 +67,37 @@ def _make_gate_case(case: str):
     if case == "fixed_0.5":
         return {"write_gate_fixed_value": 0.5}
     raise ValueError(f"Unknown gate case: {case}")
+
+
+def _sequential_stablemax_mat_decode_reference(
+    q,
+    k,
+    v,
+    *,
+    c_dec,
+    scale,
+    power,
+):
+    B, N, H, _ = k.shape
+    _, M, _ = q.shape
+    Dv = v.size(-1)
+    q_f = q.float()
+    k_f = k.float()
+    v_f = v.float()
+    c_dec_f = c_dec.float()
+
+    y = torch.empty((B, N, H, Dv), dtype=torch.float32)
+    den = torch.zeros((B, H, M), dtype=torch.float32)
+    num = torch.zeros((B, H, M, Dv), dtype=torch.float32)
+
+    for t in range(N):
+        score_t = float(scale) * torch.einsum("bhd,hmd->bhm", k_f[:, t], q_f)
+        stable_t = _stablemax_score_transform(score_t, power=power)
+        den = den + stable_t
+        num = num + stable_t.unsqueeze(-1) * v_f[:, t, :, None, :]
+        y[:, t] = torch.einsum("bhm,bhmd->bhd", c_dec_f[:, t] / den.clamp_min(torch.finfo(torch.float32).eps), num)
+
+    return y
 
 
 def _sequential_stablemax_write_gated_reference_autograd(
@@ -243,6 +275,105 @@ def test_stablemax_write_gate_identity_matches_baseline():
         write_gate_fixed_value=1.0,
     )
     torch.testing.assert_close(y_gated, y_base, rtol=1e-4, atol=1e-5)
+
+
+@torch.no_grad()
+def test_stablemax_mat_decode_matches_tiny_sequential_reference():
+    torch.manual_seed(21)
+
+    B = 1
+    N = 8
+    H = 2
+    M = 4
+    D = 3
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), dtype=torch.float32)
+    k = torch.randn((B, N, H, D), dtype=torch.float32)
+    v = torch.randn((B, N, H, D), dtype=torch.float32)
+    c_dec = torch.randn((B, N, H, M), dtype=torch.float32)
+
+    y_ref = _sequential_stablemax_mat_decode_reference(
+        q,
+        k,
+        v,
+        c_dec=c_dec,
+        scale=scale,
+        power=2.0,
+    )
+
+    for chunk_size in (1, 2, 4, 8):
+        y = flare_autoregressive_stablemax_mat_decode_pytorch(
+            q,
+            k,
+            v,
+            c_dec,
+            scale=scale,
+            chunk_size=chunk_size,
+            power=2.0,
+        )
+        torch.testing.assert_close(y, y_ref, rtol=1e-5, atol=1e-6)
+
+
+def test_stablemax_mat_decode_backward_matches_finite_difference(monkeypatch):
+    monkeypatch.setenv("FLARE_PYTORCH_MATCH_REFERENCE", "1")
+    torch.manual_seed(22)
+
+    B = 1
+    N = 5
+    H = 2
+    M = 4
+    D = 2
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), dtype=torch.float64, requires_grad=True)
+    k = torch.randn((B, N, H, D), dtype=torch.float64, requires_grad=True)
+    v = torch.randn((B, N, H, D), dtype=torch.float64, requires_grad=True)
+    c_dec = torch.randn((B, N, H, M), dtype=torch.float64, requires_grad=True)
+    grad_out = torch.randn((B, N, H, D), dtype=torch.float64)
+
+    def loss_fn(q_var, k_var, v_var, c_var):
+        y = flare_autoregressive_stablemax_mat_decode_pytorch(
+            q_var,
+            k_var,
+            v_var,
+            c_var,
+            scale=scale,
+            chunk_size=2,
+            power=2.0,
+        )
+        return (y * grad_out).sum()
+
+    loss = loss_fn(q, k, v, c_dec)
+    loss.backward()
+
+    torch.testing.assert_close(q.grad[0, 1, 0], _finite_difference(lambda x: loss_fn(x, k.detach(), v.detach(), c_dec.detach()), q.detach(), (0, 1, 0)), rtol=5e-3, atol=5e-4)
+    torch.testing.assert_close(k.grad[0, 2, 1, 0], _finite_difference(lambda x: loss_fn(q.detach(), x, v.detach(), c_dec.detach()), k.detach(), (0, 2, 1, 0)), rtol=5e-3, atol=5e-4)
+    torch.testing.assert_close(v.grad[0, 3, 0, 1], _finite_difference(lambda x: loss_fn(q.detach(), k.detach(), x, c_dec.detach()), v.detach(), (0, 3, 0, 1)), rtol=5e-3, atol=5e-4)
+    torch.testing.assert_close(c_dec.grad[0, 4, 1, 2], _finite_difference(lambda x: loss_fn(q.detach(), k.detach(), v.detach(), x), c_dec.detach(), (0, 4, 1, 2)), rtol=5e-3, atol=5e-4)
+
+
+def test_stablemax_mat_decode_validates_shape():
+    B = 1
+    N = 4
+    H = 2
+    M = 3
+    D = 2
+    scale = D ** -0.5
+
+    q = torch.randn((H, M, D), dtype=torch.float32)
+    k = torch.randn((B, N, H, D), dtype=torch.float32)
+    v = torch.randn((B, N, H, D), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="C_dec must be \\[B, N, H, M\\]"):
+        flare_autoregressive_stablemax_mat_decode_pytorch(
+            q,
+            k,
+            v,
+            torch.zeros((B, N, M), dtype=torch.float32),
+            scale=scale,
+            chunk_size=2,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA Triton path")
