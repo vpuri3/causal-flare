@@ -311,6 +311,65 @@ def _main_chunk_forward_impl(
     return out, state1
 
 
+def _main_ssd_forward_chunked(
+    initial_state: torch.Tensor,
+    U_chunk: torch.Tensor,
+    retain_chunk: torch.Tensor,
+    write_chunk: torch.Tensor,
+    decode_chunk: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if initial_state.ndim != 3:
+        raise ValueError(f"initial_state must be [P,M,D]. Got {tuple(initial_state.shape)}.")
+    if U_chunk.ndim != 4:
+        raise ValueError(f"U_chunk must be [P,NC,C,D]. Got {tuple(U_chunk.shape)}.")
+    if retain_chunk.ndim != 3:
+        raise ValueError(f"retain_chunk must be [P,NC,C]. Got {tuple(retain_chunk.shape)}.")
+    if write_chunk.ndim != 4:
+        raise ValueError(f"write_chunk must be [P,NC,C,M]. Got {tuple(write_chunk.shape)}.")
+    if decode_chunk.ndim != 4:
+        raise ValueError(f"decode_chunk must be [P,NC,C,M]. Got {tuple(decode_chunk.shape)}.")
+    if U_chunk.shape[:3] != retain_chunk.shape:
+        raise ValueError(f"retain_chunk must match U_chunk in [P,NC,C]. Got U={tuple(U_chunk.shape)}, retain={tuple(retain_chunk.shape)}.")
+    if write_chunk.shape[:3] != retain_chunk.shape or decode_chunk.shape[:3] != retain_chunk.shape:
+        raise ValueError(
+            "write_chunk and decode_chunk must match retain_chunk in [P,NC,C]. "
+            f"Got retain={tuple(retain_chunk.shape)}, write={tuple(write_chunk.shape)}, decode={tuple(decode_chunk.shape)}."
+        )
+
+    flat_batch, nchunks, chunk_size, value_dim = U_chunk.shape
+    nslots = write_chunk.shape[-1]
+
+    tiny = torch.finfo(retain_chunk.dtype).tiny
+    log_retain = retain_chunk.clamp_min(tiny).log()
+    a_cumsum = torch.cumsum(log_retain, dim=-1)
+
+    decay_intra = torch.exp(_segment_log_sums(log_retain))
+    chunk_B = torch.einsum(
+        'pcsm,pcs,pcsd->pcmd',
+        write_chunk,
+        torch.exp(a_cumsum[..., -1:] - a_cumsum),
+        U_chunk,
+    )
+    chunk_A = torch.exp(a_cumsum[..., -1])
+    if initial_state.shape != (flat_batch, nslots, value_dim):
+        raise ValueError(
+            "initial_state must match [P,M,D] implied by write_chunk/U_chunk. "
+            f"Got initial_state={tuple(initial_state.shape)}, expected={(flat_batch, nslots, value_dim)}."
+        )
+
+    start_states, final_state = chunkwise_affine_state_scan(
+        chunk_A.unsqueeze(-1).expand(-1, -1, nslots * value_dim),
+        chunk_B.reshape(flat_batch, nchunks, -1),
+        initial_state.reshape(flat_batch, -1),
+    )
+    start_states = start_states.reshape(flat_batch, nchunks, nslots, value_dim)
+    final_state = final_state.reshape(flat_batch, nslots, value_dim)
+
+    y_diag = torch.einsum('pctm,pcsm,pcts,pcsd->pctd', decode_chunk, write_chunk, decay_intra, U_chunk)
+    y_off = torch.einsum('pctm,pcmd,pct->pctd', decode_chunk, start_states, torch.exp(a_cumsum))
+    return y_diag + y_off, final_state, start_states
+
+
 def _main_block_forward_impl(
     state0: torch.Tensor,
     retain_block: torch.Tensor,
@@ -320,31 +379,13 @@ def _main_block_forward_impl(
     *,
     rmsnorm_read_contrib: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    flat_batch, block_chunks, chunk_size, value_dim = U_block.shape
-    nslots = write_block.shape[-1]
-    write_value_block = write_block.unsqueeze(-1) * U_block.unsqueeze(-2)
-    chunk_A_flat, chunk_B_flat = _chunk_summary_terms_flat(
-        retain_block.reshape(flat_batch * block_chunks, chunk_size),
-        write_value_block.reshape(flat_batch * block_chunks, chunk_size, nslots, value_dim),
+    return _main_ssd_forward_chunked(
+        initial_state=state0,
+        U_chunk=U_block,
+        retain_chunk=retain_block,
+        write_chunk=write_block,
+        decode_chunk=decode_block,
     )
-    chunk_A = chunk_A_flat.reshape(flat_batch, block_chunks)
-    chunk_B = chunk_B_flat.reshape(flat_batch, block_chunks, nslots, value_dim)
-    start_states, final_state = chunkwise_affine_state_scan(
-        chunk_A.unsqueeze(-1).expand(-1, -1, nslots * value_dim),
-        chunk_B.reshape(flat_batch, block_chunks, -1),
-        state0.reshape(flat_batch, -1),
-    )
-    start_states = start_states.reshape(flat_batch, block_chunks, nslots, value_dim)
-    final_state = final_state.reshape(flat_batch, nslots, value_dim)
-    out = _main_chunk_output(
-        start_states.reshape(flat_batch * block_chunks, nslots, value_dim),
-        retain_block.reshape(flat_batch * block_chunks, chunk_size),
-        write_block.reshape(flat_batch * block_chunks, chunk_size, nslots),
-        U_block.reshape(flat_batch * block_chunks, chunk_size, value_dim),
-        decode_block.reshape(flat_batch * block_chunks, chunk_size, nslots),
-        rmsnorm_read_contrib=rmsnorm_read_contrib,
-    ).reshape(flat_batch, block_chunks, chunk_size, value_dim)
-    return out, final_state, start_states
 
 
 def _aux_chunk_forward_impl(
@@ -581,7 +622,6 @@ def _main_chunk_backward_batch_manual(
         grad_out=flat_grad_out,
         rmsnorm_read_contrib=rmsnorm_read_contrib,
     )
-
     zero_state = torch.zeros_like(flat_state0)
     _, grad_state_from_output = _chunk_reverse_scan(retain_acc, grad_from_output, zero_state)
     grad_state_from_output = grad_state_from_output.reshape(state0.shape[0], block_chunks, nslots, value_dim)
@@ -901,27 +941,13 @@ class FLAREAutoregressiveSeparatedFunction(autograd.Function):
     ) -> torch.Tensor:
         flat_batch, nchunks, chunk_size, value_dim = U_chunk.shape
         nslots = write_chunk.shape[-1]
-        write_value_chunk = write_chunk.unsqueeze(-1) * U_chunk.unsqueeze(-2)
-        chunk_A_flat, chunk_B_flat = _chunk_summary_terms_flat(
-            retain_chunk.reshape(flat_batch * nchunks, chunk_size),
-            write_value_chunk.reshape(flat_batch * nchunks, chunk_size, nslots, value_dim),
+        out_chunk, _, start_states = _main_ssd_forward_chunked(
+            initial_state=U_chunk.new_zeros((flat_batch, nslots, value_dim)),
+            U_chunk=U_chunk,
+            retain_chunk=retain_chunk,
+            write_chunk=write_chunk,
+            decode_chunk=decode_chunk,
         )
-        chunk_A = chunk_A_flat.reshape(flat_batch, nchunks)
-        chunk_B = chunk_B_flat.reshape(flat_batch, nchunks, nslots, value_dim)
-        start_states, _ = chunkwise_affine_state_scan(
-            chunk_A.unsqueeze(-1).expand(-1, -1, nslots * value_dim),
-            chunk_B.reshape(flat_batch, nchunks, -1),
-            U_chunk.new_zeros((flat_batch, nslots * value_dim)),
-        )
-        start_states = start_states.reshape(flat_batch, nchunks, nslots, value_dim)
-        out_chunk = _main_chunk_output(
-            start_states.reshape(flat_batch * nchunks, nslots, value_dim),
-            retain_chunk.reshape(flat_batch * nchunks, chunk_size),
-            write_chunk.reshape(flat_batch * nchunks, chunk_size, nslots),
-            U_chunk.reshape(flat_batch * nchunks, chunk_size, value_dim),
-            decode_chunk.reshape(flat_batch * nchunks, chunk_size, nslots),
-            rmsnorm_read_contrib=False,
-        ).reshape(flat_batch, nchunks, chunk_size, value_dim)
 
         ctx.save_for_backward(U_chunk, retain_chunk, write_chunk, decode_chunk, start_states)
         return out_chunk
@@ -1127,7 +1153,13 @@ def flare_autoregressive_separated_pytorch(
         flat_batch, nchunks, chunk_size, nslots
     )
 
-    out_chunk = FLAREAutoregressiveSeparatedFunction.apply(U_chunk, retain_chunk, write_chunk, decode_chunk)
+    out_chunk, _, _ = _main_ssd_forward_chunked(
+        initial_state=U_chunk.new_zeros((flat_batch, nslots, value_dim)),
+        U_chunk=U_chunk,
+        retain_chunk=retain_chunk,
+        write_chunk=write_chunk,
+        decode_chunk=decode_chunk,
+    )
 
     out = out_chunk.reshape(bsz, nheads, nchunks, chunk_size, value_dim).permute(0, 2, 3, 1, 4).reshape(
         bsz,
