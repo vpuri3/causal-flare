@@ -1,5 +1,4 @@
 import math
-import os
 
 import torch
 import triton
@@ -1654,38 +1653,6 @@ def flare_autoregressive_separated_trition(
 # Keep a correctly spelled alias so later integrations do not need to preserve
 # the filename typo in user-facing APIs.
 flare_autoregressive_separated_triton = flare_autoregressive_separated_trition
-
-
-def _can_use_parallel_history_triton(
-    *,
-    U: torch.Tensor,
-    slot_embed: torch.Tensor,
-    retain: torch.Tensor,
-    write: torch.Tensor,
-    readout: torch.Tensor | None,
-    chunk_size: int | None,
-    training: bool,
-) -> bool:
-    if os.environ.get("FLARE_DISABLE_AUX_TRITON", "") == "1":
-        return False
-    if training and os.environ.get("FLARE_ENABLE_TRAINING_TRITON", "") != "1":
-        return False
-    if not (U.is_cuda and slot_embed.is_cuda and retain.is_cuda and write.is_cuda):
-        return False
-    if readout is None or not readout.is_cuda:
-        return False
-    if slot_embed.ndim != 4:
-        return False
-    eff_chunk_size = _resolve_separated_trition_chunk_size(U.shape[1], retain.shape[-1], U.shape[-1], chunk_size)
-    if eff_chunk_size not in (16, 32):
-        return False
-    aux_dim = slot_embed.shape[2]
-    if aux_dim > 16:
-        return False
-    if retain.shape[-1] > 64 or U.shape[-1] > 256:
-        return False
-    return True
-
 
 def _parallel_history_slot_scan_forward_triton(
     *,
