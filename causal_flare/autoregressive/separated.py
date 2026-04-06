@@ -188,15 +188,34 @@ def _chunk_summary_terms_flat(
     write_value_chunk: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     chunk_A, suffix_exclusive, _, _ = _chunk_retention_terms(retain_chunk)
-    chunk_B = torch.einsum('pmc,pcmd->pmd', suffix_exclusive, write_value_chunk)
+    if retain_chunk.ndim == 2:
+        chunk_B = torch.einsum('pc,pcmd->pmd', suffix_exclusive, write_value_chunk)
+    else:
+        chunk_B = torch.einsum('pmc,pcmd->pmd', suffix_exclusive, write_value_chunk)
     return chunk_A, chunk_B
 
 
 def _chunk_retention_terms(
     retain_chunk: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if retain_chunk.ndim != 3:
-        raise ValueError(f"retain_chunk must be [P,C,M]. Got {tuple(retain_chunk.shape)}.")
+    if retain_chunk.ndim not in {2, 3}:
+        raise ValueError(f"retain_chunk must be [P,C] or [P,C,M]. Got {tuple(retain_chunk.shape)}.")
+    if retain_chunk.ndim == 2:
+        tiny = torch.finfo(retain_chunk.dtype).tiny
+        log_retain = retain_chunk.clamp_min(tiny).log()
+        prefix = torch.cumsum(log_retain, dim=-1)
+        decay_out = torch.exp(prefix)
+        diff = prefix.unsqueeze(-1) - prefix.unsqueeze(-2)
+        lower_tri = _lower_tri_float(
+            retain_chunk.shape[1],
+            device=retain_chunk.device,
+            dtype=retain_chunk.dtype,
+        ).unsqueeze(0)
+        diff = diff.masked_fill(lower_tri == 0, -torch.inf)
+        decay_intra = torch.exp(diff)
+        chunk_A = torch.exp(prefix[..., -1])
+        suffix_exclusive = torch.exp(prefix[..., -1:] - prefix)
+        return chunk_A, suffix_exclusive, decay_intra, decay_out
     tiny = torch.finfo(retain_chunk.dtype).tiny
     log_retain = retain_chunk.clamp_min(tiny).log().transpose(1, 2)
     prefix = torch.cumsum(log_retain, dim=-1)
@@ -220,8 +239,12 @@ def _chunk_inclusive_states_flat(
     write_value_chunk: torch.Tensor,
 ) -> torch.Tensor:
     _, _, decay_intra, decay_out = _chunk_retention_terms(retain_chunk)
-    off_state = decay_out.unsqueeze(-1) * state0.unsqueeze(1)
-    diag_state = torch.einsum('pmts,psmd->ptmd', decay_intra, write_value_chunk)
+    if retain_chunk.ndim == 2:
+        off_state = decay_out.unsqueeze(-1).unsqueeze(-1) * state0.unsqueeze(1)
+        diag_state = torch.einsum('pts,psmd->ptmd', decay_intra, write_value_chunk)
+    else:
+        off_state = decay_out.unsqueeze(-1) * state0.unsqueeze(1)
+        diag_state = torch.einsum('pmts,psmd->ptmd', decay_intra, write_value_chunk)
     return off_state + diag_state
 
 
@@ -236,8 +259,8 @@ def _main_chunk_output(
 ) -> torch.Tensor:
     if state0.ndim != 3:
         raise ValueError(f"state0 must be [P,M,D]. Got {tuple(state0.shape)}.")
-    if retain_chunk.ndim != 3:
-        raise ValueError(f"retain_chunk must be [P,C,M]. Got {tuple(retain_chunk.shape)}.")
+    if retain_chunk.ndim != 2:
+        raise ValueError(f"retain_chunk must be [P,C]. Got {tuple(retain_chunk.shape)}.")
     if write_chunk.ndim != 3:
         raise ValueError(f"write_chunk must be [P,C,M]. Got {tuple(write_chunk.shape)}.")
     if U_chunk.ndim != 3:
@@ -245,19 +268,17 @@ def _main_chunk_output(
     if decode_chunk.ndim != 3:
         raise ValueError(f"decode_chunk must be [P,C,M]. Got {tuple(decode_chunk.shape)}.")
 
-    _, _, decay_intra, decay_out = _chunk_retention_terms(retain_chunk)
-    if not rmsnorm_read_contrib:
-        y_off = torch.einsum('ptm,ptm,pmd->ptd', decode_chunk, decay_out, state0)
-        local_kernel = torch.einsum('ptm,pmts,psm->pts', decode_chunk, decay_intra, write_chunk)
-        y_diag = torch.einsum('pts,psd->ptd', local_kernel, U_chunk)
-        return y_off + y_diag
+    if rmsnorm_read_contrib:
+        # TODO(vedantpu): reintroduce a fast chunk-local path for
+        # `rmsnorm_read_contrib=True` after the non-RMSNorm recurrence is fully
+        # optimized and stable.
+        raise NotImplementedError("rmsnorm_read_contrib=True is temporarily unsupported in separated.py.")
 
-    write_value_chunk = write_chunk.unsqueeze(-1) * U_chunk.unsqueeze(-2)
-    states = decay_out.unsqueeze(-1) * state0.unsqueeze(1) + torch.einsum('pmts,psmd->ptmd', decay_intra, write_value_chunk)
-    contrib = decode_chunk.unsqueeze(-1) * states
-    eps = torch.finfo(contrib.dtype).eps
-    contrib = _rms_normalize_last_dim(contrib, eps=eps, scale_by_sqrt_dim=False)
-    return contrib.sum(dim=2)
+    _, _, decay_intra, decay_out = _chunk_retention_terms(retain_chunk)
+    y_off = torch.einsum('ptm,pt,pmd->ptd', decode_chunk, decay_out, state0)
+    local_kernel = torch.einsum('ptm,pts,psm->pts', decode_chunk, decay_intra, write_chunk)
+    y_diag = torch.einsum('pts,psd->ptd', local_kernel, U_chunk)
+    return y_off + y_diag
 
 
 def _exclusive_chunk_states(state0: torch.Tensor, inclusive_states: torch.Tensor) -> torch.Tensor:
@@ -275,20 +296,18 @@ def _main_chunk_forward_impl(
     *,
     rmsnorm_read_contrib: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if rmsnorm_read_contrib:
+        # TODO(vedantpu): restore an optimized RMSNorm-read-contrib path once the
+        # non-RMSNorm implementation is in its final form.
+        raise NotImplementedError("rmsnorm_read_contrib=True is temporarily unsupported in separated.py.")
+
     chunk_A, suffix_exclusive, decay_intra, decay_out = _chunk_retention_terms(retain_chunk)
-    if not rmsnorm_read_contrib:
-        y_off = torch.einsum('ptm,ptm,pmd->ptd', decode_chunk, decay_out, state0)
-        local_kernel = torch.einsum('ptm,pmts,psm->pts', decode_chunk, decay_intra, write_chunk)
-        out = y_off + torch.einsum('pts,psd->ptd', local_kernel, U_chunk)
-    else:
-        write_value_chunk = write_chunk.unsqueeze(-1) * U_chunk.unsqueeze(-2)
-        states = decay_out.unsqueeze(-1) * state0.unsqueeze(1) + torch.einsum('pmts,psmd->ptmd', decay_intra, write_value_chunk)
-        contrib = decode_chunk.unsqueeze(-1) * states
-        eps = torch.finfo(contrib.dtype).eps
-        out = _rms_normalize_last_dim(contrib, eps=eps, scale_by_sqrt_dim=False).sum(dim=2)
+    y_off = torch.einsum('ptm,pt,pmd->ptd', decode_chunk, decay_out, state0)
+    local_kernel = torch.einsum('ptm,pts,psm->pts', decode_chunk, decay_intra, write_chunk)
+    out = y_off + torch.einsum('pts,psd->ptd', local_kernel, U_chunk)
     write_value_chunk = write_chunk.unsqueeze(-1) * U_chunk.unsqueeze(-2)
-    chunk_B = torch.einsum('pmc,pcmd->pmd', suffix_exclusive, write_value_chunk)
-    state1 = chunk_A.unsqueeze(-1) * state0 + chunk_B
+    chunk_B = torch.einsum('pc,pcmd->pmd', suffix_exclusive, write_value_chunk)
+    state1 = chunk_A.unsqueeze(-1).unsqueeze(-1) * state0 + chunk_B
     return out, state1
 
 
@@ -302,18 +321,24 @@ def _main_block_forward_impl(
     rmsnorm_read_contrib: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     flat_batch, block_chunks, chunk_size, value_dim = U_block.shape
-    nslots = retain_block.shape[-1]
+    nslots = write_block.shape[-1]
     write_value_block = write_block.unsqueeze(-1) * U_block.unsqueeze(-2)
     chunk_A_flat, chunk_B_flat = _chunk_summary_terms_flat(
-        retain_block.reshape(flat_batch * block_chunks, chunk_size, nslots),
+        retain_block.reshape(flat_batch * block_chunks, chunk_size),
         write_value_block.reshape(flat_batch * block_chunks, chunk_size, nslots, value_dim),
     )
-    chunk_A = chunk_A_flat.reshape(flat_batch, block_chunks, nslots)
+    chunk_A = chunk_A_flat.reshape(flat_batch, block_chunks)
     chunk_B = chunk_B_flat.reshape(flat_batch, block_chunks, nslots, value_dim)
-    start_states, final_state = chunkwise_affine_state_scan_slots(chunk_A, chunk_B, state0)
+    start_states, final_state = chunkwise_affine_state_scan(
+        chunk_A.unsqueeze(-1).expand(-1, -1, nslots * value_dim),
+        chunk_B.reshape(flat_batch, block_chunks, -1),
+        state0.reshape(flat_batch, -1),
+    )
+    start_states = start_states.reshape(flat_batch, block_chunks, nslots, value_dim)
+    final_state = final_state.reshape(flat_batch, nslots, value_dim)
     out = _main_chunk_output(
         start_states.reshape(flat_batch * block_chunks, nslots, value_dim),
-        retain_block.reshape(flat_batch * block_chunks, chunk_size, nslots),
+        retain_block.reshape(flat_batch * block_chunks, chunk_size),
         write_block.reshape(flat_batch * block_chunks, chunk_size, nslots),
         U_block.reshape(flat_batch * block_chunks, chunk_size, value_dim),
         decode_block.reshape(flat_batch * block_chunks, chunk_size, nslots),
@@ -414,6 +439,9 @@ def _main_chunk_backward_prepare(
     grad_out: torch.Tensor,
     rmsnorm_read_contrib: bool,
 ) -> tuple[torch.dtype, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if rmsnorm_read_contrib:
+        raise NotImplementedError("rmsnorm_read_contrib=True is temporarily unsupported in separated.py.")
+
     accum_dtype = torch.float32 if state0.dtype in {torch.float16, torch.bfloat16} else state0.dtype
     state0_acc = state0.to(accum_dtype)
     retain_acc = retain_chunk.to(accum_dtype)
@@ -427,18 +455,8 @@ def _main_chunk_backward_prepare(
     states = _chunk_inclusive_states_flat(state0_acc, retain_acc, write_value_chunk)
     prev_states = torch.cat([state0_acc.unsqueeze(1), states[:, :-1]], dim=1)
 
-    if rmsnorm_read_contrib:
-        contrib = decode_acc.unsqueeze(-1) * states
-        eps = torch.finfo(state0.dtype).eps
-        grad_y = grad_out_acc.unsqueeze(2).expand_as(contrib)
-        rms = torch.sqrt(contrib.square().mean(dim=-1, keepdim=True) + eps)
-        dot = (grad_y * contrib).sum(dim=-1, keepdim=True)
-        grad_contrib = grad_y / rms - contrib * (dot / (contrib.shape[-1] * rms.pow(3)))
-        grad_decode = (grad_contrib * states).sum(dim=-1)
-        grad_from_output = grad_contrib * decode_acc.unsqueeze(-1)
-    else:
-        grad_decode = (grad_out_acc.unsqueeze(2) * states).sum(dim=-1)
-        grad_from_output = decode_acc.unsqueeze(-1) * grad_out_acc.unsqueeze(2)
+    grad_decode = (grad_out_acc.unsqueeze(2) * states).sum(dim=-1)
+    grad_from_output = decode_acc.unsqueeze(-1) * grad_out_acc.unsqueeze(2)
 
     return accum_dtype, chunk_A, retain_acc, write_acc, U_acc, prev_states, grad_from_output, grad_decode
 
@@ -453,7 +471,10 @@ def _chunk_reverse_scan(
     rev_input[:, 0] = rev_input[:, 0] + grad_state1
     zero_state = torch.zeros_like(grad_state1)
     grad_state_post = _chunk_inclusive_states_flat(zero_state, rev_retain, rev_input).flip(1)
-    grad_state0 = retain_acc[:, 0].unsqueeze(-1) * grad_state_post[:, 0]
+    if retain_acc.ndim == 2:
+        grad_state0 = retain_acc[:, 0].unsqueeze(-1).unsqueeze(-1) * grad_state_post[:, 0]
+    else:
+        grad_state0 = retain_acc[:, 0].unsqueeze(-1) * grad_state_post[:, 0]
     return grad_state_post, grad_state0
 
 
@@ -470,7 +491,7 @@ def _main_chunk_backward_finalize(
     U_dtype: torch.dtype,
     decode_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    grad_retain = (grad_state_post * prev_states).sum(dim=-1)
+    grad_retain = (grad_state_post * prev_states).sum(dim=(-1, -2))
     grad_write = (grad_state_post * U_acc.unsqueeze(2)).sum(dim=-1)
     grad_U = (grad_state_post * write_acc.unsqueeze(-1)).sum(dim=2)
     return (
@@ -492,6 +513,9 @@ def _main_chunk_backward_manual(
     grad_state1: torch.Tensor,
     rmsnorm_read_contrib: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if rmsnorm_read_contrib:
+        raise NotImplementedError("rmsnorm_read_contrib=True is temporarily unsupported in separated.py.")
+
     accum_dtype = torch.float32 if state0.dtype in {torch.float16, torch.bfloat16} else state0.dtype
     state0_acc = state0.to(accum_dtype)
     retain_acc = retain_chunk.to(accum_dtype)
@@ -505,27 +529,17 @@ def _main_chunk_backward_manual(
     states = _chunk_inclusive_states_flat(state0_acc, retain_acc, write_value_chunk)
     prev_states = torch.cat([state0_acc.unsqueeze(1), states[:, :-1]], dim=1)
 
-    if rmsnorm_read_contrib:
-        contrib = decode_acc.unsqueeze(-1) * states
-        eps = torch.finfo(state0.dtype).eps
-        grad_y = grad_out_acc.unsqueeze(2).expand_as(contrib)
-        rms = torch.sqrt(contrib.square().mean(dim=-1, keepdim=True) + eps)
-        dot = (grad_y * contrib).sum(dim=-1, keepdim=True)
-        grad_contrib = grad_y / rms - contrib * (dot / (contrib.shape[-1] * rms.pow(3)))
-        grad_decode = (grad_contrib * states).sum(dim=-1)
-        grad_from_output = grad_contrib * decode_acc.unsqueeze(-1)
-    else:
-        grad_decode = (grad_out_acc.unsqueeze(2) * states).sum(dim=-1)
-        grad_from_output = decode_acc.unsqueeze(-1) * grad_out_acc.unsqueeze(2)
+    grad_decode = (grad_out_acc.unsqueeze(2) * states).sum(dim=-1)
+    grad_from_output = decode_acc.unsqueeze(-1) * grad_out_acc.unsqueeze(2)
 
     rev_retain = torch.cat([torch.zeros_like(retain_acc[:, :1]), retain_acc[:, 1:].flip(1)], dim=1)
     rev_input = grad_from_output.flip(1)
     rev_input[:, 0] = rev_input[:, 0] + grad_state
     grad_state_post = _chunk_inclusive_states_flat(torch.zeros_like(state0_acc), rev_retain, rev_input).flip(1)
-    grad_retain = (grad_state_post * prev_states).sum(dim=-1)
+    grad_retain = (grad_state_post * prev_states).sum(dim=(-1, -2))
     grad_write = (grad_state_post * U_acc.unsqueeze(2)).sum(dim=-1)
     grad_U = (grad_state_post * write_acc.unsqueeze(-1)).sum(dim=2)
-    grad_state = retain_acc[:, 0].unsqueeze(-1) * grad_state_post[:, 0]
+    grad_state = retain_acc[:, 0].unsqueeze(-1).unsqueeze(-1) * grad_state_post[:, 0]
 
     return (
         grad_state,
@@ -552,7 +566,7 @@ def _main_chunk_backward_batch_manual(
     value_dim = state0.shape[3]
     chunk_size = U_chunk.shape[2]
     flat_state0 = state0.reshape(-1, nslots, value_dim)
-    flat_retain = retain_chunk.reshape(-1, chunk_size, nslots)
+    flat_retain = retain_chunk.reshape(-1, chunk_size)
     flat_write = write_chunk.reshape(-1, chunk_size, nslots)
     flat_U = U_chunk.reshape(-1, chunk_size, value_dim)
     flat_decode = decode_chunk.reshape(-1, chunk_size, nslots)
@@ -571,13 +585,14 @@ def _main_chunk_backward_batch_manual(
     zero_state = torch.zeros_like(flat_state0)
     _, grad_state_from_output = _chunk_reverse_scan(retain_acc, grad_from_output, zero_state)
     grad_state_from_output = grad_state_from_output.reshape(state0.shape[0], block_chunks, nslots, value_dim)
-    chunk_A = chunk_A.reshape(state0.shape[0], block_chunks, nslots)
-    rev_chunk_starts, grad_state_block = chunkwise_affine_state_scan_slots(
-        chunk_A.flip(1),
-        grad_state_from_output.flip(1),
-        grad_state1.to(accum_dtype),
+    chunk_A = chunk_A.reshape(state0.shape[0], block_chunks)
+    rev_chunk_starts, grad_state_block = chunkwise_affine_state_scan(
+        chunk_A.flip(1).unsqueeze(-1).expand(-1, -1, nslots * value_dim),
+        grad_state_from_output.flip(1).reshape(state0.shape[0], block_chunks, -1),
+        grad_state1.to(accum_dtype).reshape(state0.shape[0], -1),
     )
     grad_state1_chunk = rev_chunk_starts.flip(1).reshape(-1, nslots, value_dim)
+    grad_state_block = grad_state_block.reshape(state0.shape[0], nslots, value_dim)
     grad_state_post, _ = _chunk_reverse_scan(retain_acc, grad_from_output, grad_state1_chunk)
     grad_retain, grad_write, grad_U, grad_decode = _main_chunk_backward_finalize(
         retain_acc=retain_acc,
@@ -883,79 +898,64 @@ class FLAREAutoregressiveSeparatedFunction(autograd.Function):
         retain_chunk: torch.Tensor,
         write_chunk: torch.Tensor,
         decode_chunk: torch.Tensor,
-        rmsnorm_read_contrib: bool,
-        block_chunks: int,
     ) -> torch.Tensor:
         flat_batch, nchunks, chunk_size, value_dim = U_chunk.shape
-        nslots = retain_chunk.shape[-1]
-        state = U_chunk.new_zeros((flat_batch, nslots, value_dim))
-        nblocks = math.ceil(nchunks / block_chunks)
-        block_start_states = U_chunk.new_empty((flat_batch, nblocks, nslots, value_dim))
-        out_chunk = U_chunk.new_empty((flat_batch, nchunks, chunk_size, value_dim))
+        nslots = write_chunk.shape[-1]
+        write_value_chunk = write_chunk.unsqueeze(-1) * U_chunk.unsqueeze(-2)
+        chunk_A_flat, chunk_B_flat = _chunk_summary_terms_flat(
+            retain_chunk.reshape(flat_batch * nchunks, chunk_size),
+            write_value_chunk.reshape(flat_batch * nchunks, chunk_size, nslots, value_dim),
+        )
+        chunk_A = chunk_A_flat.reshape(flat_batch, nchunks)
+        chunk_B = chunk_B_flat.reshape(flat_batch, nchunks, nslots, value_dim)
+        start_states, _ = chunkwise_affine_state_scan(
+            chunk_A.unsqueeze(-1).expand(-1, -1, nslots * value_dim),
+            chunk_B.reshape(flat_batch, nchunks, -1),
+            U_chunk.new_zeros((flat_batch, nslots * value_dim)),
+        )
+        start_states = start_states.reshape(flat_batch, nchunks, nslots, value_dim)
+        out_chunk = _main_chunk_output(
+            start_states.reshape(flat_batch * nchunks, nslots, value_dim),
+            retain_chunk.reshape(flat_batch * nchunks, chunk_size),
+            write_chunk.reshape(flat_batch * nchunks, chunk_size, nslots),
+            U_chunk.reshape(flat_batch * nchunks, chunk_size, value_dim),
+            decode_chunk.reshape(flat_batch * nchunks, chunk_size, nslots),
+            rmsnorm_read_contrib=False,
+        ).reshape(flat_batch, nchunks, chunk_size, value_dim)
 
-        for block_idx, block_start in enumerate(range(0, nchunks, block_chunks)):
-            block_end = min(block_start + block_chunks, nchunks)
-            block_start_states[:, block_idx].copy_(state)
-            out_cur, state, _ = _main_block_forward_impl(
-                state,
-                retain_chunk[:, block_start:block_end],
-                write_chunk[:, block_start:block_end],
-                U_chunk[:, block_start:block_end],
-                decode_chunk[:, block_start:block_end],
-                rmsnorm_read_contrib=bool(rmsnorm_read_contrib),
-            )
-            out_chunk[:, block_start:block_end].copy_(out_cur)
-
-        ctx.save_for_backward(U_chunk, retain_chunk, write_chunk, decode_chunk, block_start_states)
-        ctx.rmsnorm_read_contrib = bool(rmsnorm_read_contrib)
-        ctx.block_chunks = int(block_chunks)
+        ctx.save_for_backward(U_chunk, retain_chunk, write_chunk, decode_chunk, start_states)
         return out_chunk
 
     @staticmethod
     def backward(ctx, grad_out_chunk: torch.Tensor):
-        U_chunk, retain_chunk, write_chunk, decode_chunk, block_start_states = ctx.saved_tensors
+        U_chunk, retain_chunk, write_chunk, decode_chunk, start_states = ctx.saved_tensors
         flat_batch, nchunks, _, value_dim = U_chunk.shape
-        nslots = retain_chunk.shape[-1]
-        block_chunks = ctx.block_chunks
-        nblocks = block_start_states.shape[1]
+        nslots = write_chunk.shape[-1]
 
         grad_U = torch.zeros_like(U_chunk) if U_chunk.requires_grad else None
         grad_retain = torch.zeros_like(retain_chunk) if retain_chunk.requires_grad else None
         grad_write = torch.zeros_like(write_chunk) if write_chunk.requires_grad else None
         grad_decode = torch.zeros_like(decode_chunk) if decode_chunk.requires_grad else None
-        grad_state = U_chunk.new_zeros((flat_batch, nslots, value_dim))
+        grad_state, grad_retain_cur, grad_write_cur, grad_U_cur, grad_decode_cur, _ = _main_chunk_backward_batch_manual(
+            state0=start_states,
+            retain_chunk=retain_chunk,
+            write_chunk=write_chunk,
+            U_chunk=U_chunk,
+            decode_chunk=decode_chunk,
+            grad_out=grad_out_chunk,
+            grad_state1=U_chunk.new_zeros((flat_batch, nslots, value_dim)),
+            rmsnorm_read_contrib=False,
+        )
+        if grad_retain is not None:
+            grad_retain.copy_(grad_retain_cur)
+        if grad_write is not None:
+            grad_write.copy_(grad_write_cur)
+        if grad_U is not None:
+            grad_U.copy_(grad_U_cur)
+        if grad_decode is not None:
+            grad_decode.copy_(grad_decode_cur)
 
-        for block_idx in range(nblocks - 1, -1, -1):
-            block_start = block_idx * block_chunks
-            block_end = min(block_start + block_chunks, nchunks)
-            _, _, start_states = _main_block_forward_impl(
-                block_start_states[:, block_idx],
-                retain_chunk[:, block_start:block_end],
-                write_chunk[:, block_start:block_end],
-                U_chunk[:, block_start:block_end],
-                decode_chunk[:, block_start:block_end],
-                rmsnorm_read_contrib=ctx.rmsnorm_read_contrib,
-            )
-            grad_state, grad_retain_cur, grad_write_cur, grad_U_cur, grad_decode_cur, _ = _main_chunk_backward_batch_manual(
-                state0=start_states,
-                retain_chunk=retain_chunk[:, block_start:block_end],
-                write_chunk=write_chunk[:, block_start:block_end],
-                U_chunk=U_chunk[:, block_start:block_end],
-                decode_chunk=decode_chunk[:, block_start:block_end],
-                grad_out=grad_out_chunk[:, block_start:block_end],
-                grad_state1=grad_state,
-                rmsnorm_read_contrib=ctx.rmsnorm_read_contrib,
-            )
-            if grad_retain is not None:
-                grad_retain[:, block_start:block_end].copy_(grad_retain_cur)
-            if grad_write is not None:
-                grad_write[:, block_start:block_end].copy_(grad_write_cur)
-            if grad_U is not None:
-                grad_U[:, block_start:block_end].copy_(grad_U_cur)
-            if grad_decode is not None:
-                grad_decode[:, block_start:block_end].copy_(grad_decode_cur)
-
-        return grad_U, grad_retain, grad_write, grad_decode, None, None
+        return grad_U, grad_retain, grad_write, grad_decode
 
 
 class ParallelHistorySlotScanFunction(autograd.Function):
@@ -1069,19 +1069,27 @@ def flare_autoregressive_separated_pytorch(
     chunk_size: int | None = None,
     rmsnorm_read_contrib: bool = False,
 ) -> torch.Tensor:
+    if rmsnorm_read_contrib:
+        # TODO(vedantpu): reintroduce the optimized
+        # `rmsnorm_read_contrib=True` path after the non-RMSNorm recurrence is
+        # fully optimized and stable.
+        raise NotImplementedError("rmsnorm_read_contrib=True is temporarily unsupported in separated.py.")
+
     if U.ndim != 4:
         raise ValueError(f"U must be [B,N,H,D]. Got {tuple(U.shape)}.")
-    if retain.ndim != 4:
-        raise ValueError(f"retain must be [B,N,H,M]. Got {tuple(retain.shape)}.")
+    if retain.ndim != 3:
+        raise ValueError(f"retain must be [B,N,H]. Got {tuple(retain.shape)}.")
     if write.ndim != 4:
         raise ValueError(f"write must be [B,N,H,M]. Got {tuple(write.shape)}.")
     if decode_weights.ndim != 4:
         raise ValueError(f"decode_weights must be [B,N,H,M]. Got {tuple(decode_weights.shape)}.")
 
     bsz, seqlen, nheads, value_dim = U.shape
-    if retain.shape[:3] != (bsz, seqlen, nheads) or write.shape[:3] != (bsz, seqlen, nheads):
-        raise ValueError("retain/write must share [B,N,H] with U.")
-    nslots = retain.shape[3]
+    if retain.shape != (bsz, seqlen, nheads):
+        raise ValueError("retain must share [B,N,H] with U.")
+    if write.shape[:3] != (bsz, seqlen, nheads):
+        raise ValueError("write must share [B,N,H] with U.")
+    nslots = write.shape[3]
     if write.shape != (bsz, seqlen, nheads, nslots):
         raise ValueError("write must match retain shape.")
     if decode_weights.shape != (bsz, seqlen, nheads, nslots):
@@ -1089,39 +1097,37 @@ def flare_autoregressive_separated_pytorch(
     if seqlen == 0:
         return U.new_empty((bsz, 0, nheads, value_dim))
 
+    accum_dtype = torch.float32 if U.dtype in {torch.float16, torch.bfloat16} else U.dtype
+    U_acc = U.to(accum_dtype)
+    retain_acc = retain.to(accum_dtype)
+    write_acc = write.to(accum_dtype)
+    decode_acc = decode_weights.to(accum_dtype)
+
     chunk_size = _resolve_separated_chunk_size(seqlen, nslots, value_dim, chunk_size)
     nchunks = math.ceil(seqlen / chunk_size)
     padded_len = nchunks * chunk_size
     pad = padded_len - seqlen
     if pad > 0:
-        U = _pad_sequence_dim(U, pad, fill_value=0.0)
-        retain = _pad_sequence_dim(retain, pad, fill_value=1.0)
-        write = _pad_sequence_dim(write, pad, fill_value=0.0)
-        decode_weights = _pad_sequence_dim(decode_weights, pad, fill_value=0.0)
+        U_acc = _pad_sequence_dim(U_acc, pad, fill_value=0.0)
+        retain_acc = _pad_sequence_dim(retain_acc, pad, fill_value=1.0)
+        write_acc = _pad_sequence_dim(write_acc, pad, fill_value=0.0)
+        decode_acc = _pad_sequence_dim(decode_acc, pad, fill_value=0.0)
 
     flat_batch = bsz * nheads
-    U_chunk = U.view(bsz, nchunks, chunk_size, nheads, value_dim).permute(0, 3, 1, 2, 4).reshape(
+    U_chunk = U_acc.view(bsz, nchunks, chunk_size, nheads, value_dim).permute(0, 3, 1, 2, 4).reshape(
         flat_batch, nchunks, chunk_size, value_dim
     )
-    retain_chunk = retain.view(bsz, nchunks, chunk_size, nheads, nslots).permute(0, 3, 1, 2, 4).reshape(
+    retain_chunk = retain_acc.view(bsz, nchunks, chunk_size, nheads).permute(0, 3, 1, 2).reshape(
+        flat_batch, nchunks, chunk_size
+    )
+    write_chunk = write_acc.view(bsz, nchunks, chunk_size, nheads, nslots).permute(0, 3, 1, 2, 4).reshape(
         flat_batch, nchunks, chunk_size, nslots
     )
-    write_chunk = write.view(bsz, nchunks, chunk_size, nheads, nslots).permute(0, 3, 1, 2, 4).reshape(
-        flat_batch, nchunks, chunk_size, nslots
-    )
-    decode_chunk = decode_weights.view(bsz, nchunks, chunk_size, nheads, nslots).permute(0, 3, 1, 2, 4).reshape(
+    decode_chunk = decode_acc.view(bsz, nchunks, chunk_size, nheads, nslots).permute(0, 3, 1, 2, 4).reshape(
         flat_batch, nchunks, chunk_size, nslots
     )
 
-    block_chunks = _resolve_chunk_block_size(nchunks, env_name="FLARE_SEPARATED_MAIN_CHUNK_BLOCKS", default=8)
-    out_chunk = FLAREAutoregressiveSeparatedFunction.apply(
-        U_chunk,
-        retain_chunk,
-        write_chunk,
-        decode_chunk,
-        rmsnorm_read_contrib,
-        block_chunks,
-    )
+    out_chunk = FLAREAutoregressiveSeparatedFunction.apply(U_chunk, retain_chunk, write_chunk, decode_chunk)
 
     out = out_chunk.reshape(bsz, nheads, nchunks, chunk_size, value_dim).permute(0, 2, 3, 1, 4).reshape(
         bsz,
@@ -1129,7 +1135,7 @@ def flare_autoregressive_separated_pytorch(
         nheads,
         value_dim,
     )
-    return out[:, :seqlen].contiguous()
+    return out[:, :seqlen].to(U.dtype).contiguous()
 
 
 def parallel_history_slot_scan(
