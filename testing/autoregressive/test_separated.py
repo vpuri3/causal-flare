@@ -1,4 +1,3 @@
-import pytest
 import torch
 
 from causal_flare.autoregressive.separated import flare_autoregressive_separated_pytorch
@@ -41,7 +40,6 @@ def test_separated_chunked_recurrence_matches_sequential_reference() -> None:
         write=write,
         decode_weights=decode_weights,
         chunk_size=2,
-        rmsnorm_read_contrib=False,
     )
     loss = (out * grad_out).sum()
     grads = torch.autograd.grad(loss, (U, retain, write, decode_weights))
@@ -62,20 +60,3 @@ def test_separated_chunked_recurrence_matches_sequential_reference() -> None:
     torch.testing.assert_close(out, ref, rtol=1e-9, atol=1e-9)
     for grad, ref_grad in zip(grads, ref_grads):
         torch.testing.assert_close(grad, ref_grad, rtol=1e-9, atol=1e-9)
-
-
-def test_separated_chunked_recurrence_rmsnorm_read_contrib_not_implemented() -> None:
-    U = torch.randn((2, 5, 3, 6), dtype=torch.float64)
-    retain = torch.rand((2, 5, 3), dtype=torch.float64)
-    write = torch.randn((2, 5, 3, 4), dtype=torch.float64)
-    decode_weights = torch.randn((2, 5, 3, 4), dtype=torch.float64)
-
-    with pytest.raises(NotImplementedError, match="rmsnorm_read_contrib=True"):
-        flare_autoregressive_separated_pytorch(
-            U=U,
-            retain=retain,
-            write=write,
-            decode_weights=decode_weights,
-            chunk_size=2,
-            rmsnorm_read_contrib=True,
-        )

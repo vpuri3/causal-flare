@@ -159,13 +159,7 @@ def flare_autoregressive_separated_pytorch(
     write: torch.Tensor,
     decode_weights: torch.Tensor,
     chunk_size: int | None = None,
-    rmsnorm_read_contrib: bool = False,
 ) -> torch.Tensor:
-    if rmsnorm_read_contrib:
-        # TODO(vedantpu): restore the `rmsnorm_read_contrib=True` path once the
-        # simplified separated implementation is stable again.
-        raise NotImplementedError("rmsnorm_read_contrib=True is temporarily unsupported in separated.py.")
-
     if U.ndim != 4:
         raise ValueError(f"U must be [B,N,H,D]. Got {tuple(U.shape)}.")
     if retain.ndim != 3:
