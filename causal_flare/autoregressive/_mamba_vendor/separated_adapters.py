@@ -104,15 +104,18 @@ class SeparatedChunkScanFn(torch.autograd.Function):
         if x.stride(-1) != 1 and x.stride(1) != 1:
             x = x.contiguous()
         CB = _bmm_chunk_fwd(C, B, chunk_size)
-        out, _ = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, prev_states)
-        ctx.save_for_backward(B, C, CB, x, dt, dA_cumsum, prev_states, out)
+        out, _, prev_term = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, prev_states, return_prev_term=True)
+        # Reuse the auxiliary buffer so backward can consume the local-only term
+        # directly instead of rebuilding the previous-state contribution eagerly.
+        out_local = prev_term.mul(-1).add_(out)
+        ctx.save_for_backward(B, C, CB, x, dt, dA_cumsum, prev_states, out_local)
         return out
 
     @staticmethod
     def backward(ctx, dout):
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
-        B, C, CB, x, dt, dA_cumsum, prev_states, out = ctx.saved_tensors
+        B, C, CB, x, dt, dA_cumsum, prev_states, out_local = ctx.saved_tensors
         _, _, ngroups, _ = B.shape
         dprev_states = _chunk_scan_bwd_dstates(C, dA_cumsum, dout, dtype=prev_states.dtype)
         dC, ddA_prev = _chunk_scan_bwd_dC(prev_states, dA_cumsum, dout, C=C, ngroups=ngroups)
@@ -125,7 +128,6 @@ class SeparatedChunkScanFn(torch.autograd.Function):
         dC = _bmm_chunk_bwd(B, dCB.transpose(-1, -2), residual=dC)
         dx, ddt = _chunk_scan_bwd_dx(CB, x, dt, dA_cumsum, dout, D=None)
 
-        out_local = out - _chunk_prev_term(C, dA_cumsum, prev_states)
         ddA_local, _ = _chunk_scan_bwd_ddAcs_unstable(
             x,
             dt,

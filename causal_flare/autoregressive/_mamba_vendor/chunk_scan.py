@@ -48,7 +48,7 @@ def init_to_zero(names):
 @triton.jit
 def _chunk_scan_fwd_kernel(
     # Pointers to matrices
-    cb_ptr, x_ptr, z_ptr, out_ptr, out_x_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, C_ptr, prev_states_ptr, D_ptr,
+    cb_ptr, x_ptr, z_ptr, out_ptr, out_x_ptr, prev_term_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, C_ptr, prev_states_ptr, D_ptr,
     # Matrix dimensions
     chunk_size, hdim, dstate,
     batch, seqlen, nheads_ngroups_ratio,
@@ -57,6 +57,7 @@ def _chunk_scan_fwd_kernel(
     stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
     stride_z_batch, stride_z_seqlen, stride_z_head, stride_z_hdim,
     stride_out_batch, stride_out_seqlen, stride_out_head, stride_out_hdim,
+    stride_prev_term_batch, stride_prev_term_seqlen, stride_prev_term_head, stride_prev_term_hdim,
     stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
     stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
     stride_seq_idx_batch, stride_seq_idx_seqlen,
@@ -68,6 +69,7 @@ def _chunk_scan_fwd_kernel(
     HAS_D: tl.constexpr,
     D_HAS_HDIM: tl.constexpr,
     HAS_Z: tl.constexpr,
+    HAS_PREV_TERM: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
@@ -126,6 +128,13 @@ def _chunk_scan_fwd_kernel(
                 C_ptrs += BLOCK_SIZE_K
                 prev_states_ptrs += BLOCK_SIZE_K
             acc *= scale_m[:, None]
+
+    if HAS_PREV_TERM:
+        prev_term_ptr += pid_b * stride_prev_term_batch + pid_c * chunk_size * stride_prev_term_seqlen + pid_h * stride_prev_term_head
+        prev_term_ptrs = prev_term_ptr + (
+            stride_prev_term_seqlen * offs_m[:, None] + offs_n[None, :] * stride_prev_term_hdim
+        )
+        tl.store(prev_term_ptrs, acc, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim))
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     cb_ptrs = cb_ptr + (offs_m[:, None] * stride_cb_csize_m + offs_k[None, :] * stride_cb_csize_k)
@@ -523,6 +532,10 @@ def _chunk_scan_bwd_dstates_kernel(
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=2, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=2, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=2, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=2, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
     ]),
     key=['chunk_size', 'dstate', 'hdim'],
 )
@@ -757,6 +770,10 @@ _CHUNK_SCAN_BWD_DX_MIN_BLOCK_N = min(
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=2),
         # triton.Config({'BLOCK_SIZE_M': 16}, num_stages=3, num_warps=4),
         # triton.Config({'BLOCK_SIZE_M': 32}, num_stages=3, num_warps=4),
         # triton.Config({'BLOCK_SIZE_M': 64}, num_stages=3, num_warps=4),
@@ -1256,7 +1273,7 @@ def _chunk_scan_bwd_ddAcs_prev_kernel(
     tl.atomic_add(ddA_cumsum_ptrs, ddA_cs, mask=offs_m < chunk_size)
 
 
-def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=None):
+def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=None, return_prev_term=False):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
     _, _, ngroups, dstate = C.shape
@@ -1279,18 +1296,29 @@ def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=Non
         assert out_x.stride() == out.stride()
     else:
         out_x = None
+    if return_prev_term:
+        prev_term = torch.empty(batch, seqlen, nheads, headdim, device=x.device, dtype=x.dtype)
+        assert prev_term.stride() == out.stride()
+    else:
+        prev_term = None
     grid = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(headdim, META['BLOCK_SIZE_N']),
                     batch * nchunks, nheads)
     z_strides = ((z.stride(0), z.stride(1), z.stride(2), z.stride(3))
                   if z is not None else (0, 0, 0, 0))
+    prev_term_strides = (
+        (prev_term.stride(0), prev_term.stride(1), prev_term.stride(2), prev_term.stride(3))
+        if prev_term is not None
+        else (0, 0, 0, 0)
+    )
     _chunk_scan_fwd_kernel[grid](
-        cb, x, z, out, out_x, dt, dA_cumsum, seq_idx, C, states, D,
+        cb, x, z, out, out_x, prev_term, dt, dA_cumsum, seq_idx, C, states, D,
         chunk_size, headdim, dstate,
         batch, seqlen, nheads // ngroups,
         cb.stride(0), cb.stride(1), cb.stride(2), cb.stride(3), cb.stride(4),
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
         z_strides[0], z_strides[1], z_strides[2], z_strides[3],
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        prev_term_strides[0], prev_term_strides[1], prev_term_strides[2], prev_term_strides[3],
         dt.stride(0), dt.stride(2), dt.stride(1), dt.stride(3),
         dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3),
         *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
@@ -1302,10 +1330,11 @@ def _chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states, D=None, z=None, seq_idx=Non
         D.dim() == 2 if D is not None else True,
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         HAS_Z=z is not None,
+        HAS_PREV_TERM=prev_term is not None,
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
     )
-    return out, out_x
+    return out, out_x, prev_term
 
 
 def _chunk_scan_fwd_wip(cb, x, dt, dA_cumsum, C, B, states, D=None, z=None, seq_idx=None):
@@ -1790,7 +1819,7 @@ class ChunkScanFn(torch.autograd.Function):
         if D is not None and D.stride(-1) != 1:
             D = D.contiguous()
         CB = _bmm_chunk_fwd(C, B, chunk_size)
-        out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, prev_states, D=D, z=z)
+        out, out_x, _ = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, prev_states, D=D, z=z)
         ctx.save_for_backward(out if z is None else out_x, B, C, CB, x, dt, dA_cumsum, prev_states, D, z)
         return out
 
