@@ -45,6 +45,7 @@
 - Linting: `ruff` with import-order checks.
 - Tests use `test_*.py` filenames in `testing/` and `test_*` function naming.
 - For Triton-backed implementations, do not add torch fallbacks in production paths; temporary debug fallbacks are allowed only while diagnosing issues and should be removed afterward.
+- Do not call a path `triton` if its active forward/backward implementation still silently runs PyTorch eager ops, nested `torch.autograd.grad`, or any other non-Triton fallback logic. Name those paths `hybrid`, `debug`, or similar until the Triton implementation is actually complete, and call the fallback out explicitly in code comments and user-facing summaries.
 
 ## Testing Guidelines
 - Framework: `pytest` (configured in `pyproject.toml`).

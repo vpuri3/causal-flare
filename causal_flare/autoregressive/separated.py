@@ -93,7 +93,7 @@ def _main_ssd_forward_chunked(
     U_chunk: torch.Tensor,
     retain_chunk: torch.Tensor,
     write_chunk: torch.Tensor,
-    decode_chunk: torch.Tensor,
+    decode_chunk: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if initial_state.ndim != 3:
         raise ValueError(f"initial_state must be [P,M,D]. Got {tuple(initial_state.shape)}.")
@@ -103,7 +103,7 @@ def _main_ssd_forward_chunked(
         raise ValueError(f"retain_chunk must be [P,NC,C]. Got {tuple(retain_chunk.shape)}.")
     if write_chunk.ndim != 4:
         raise ValueError(f"write_chunk must be [P,NC,C,M]. Got {tuple(write_chunk.shape)}.")
-    if decode_chunk.ndim != 4:
+    if decode_chunk is not None and decode_chunk.ndim != 4:
         raise ValueError(f"decode_chunk must be [P,NC,C,M]. Got {tuple(decode_chunk.shape)}.")
 
     flat_batch, nchunks, chunk_size, value_dim = U_chunk.shape
@@ -134,7 +134,15 @@ def _main_ssd_forward_chunked(
     )
     start_states = start_states.reshape(flat_batch, nchunks, nslots, value_dim)
 
-    # Stage 1: diagonal in-chunk contributions from writes inside the current chunk.
+    if decode_chunk is None:
+        states = (
+            torch.einsum("pcsm,pcts,pcsd->pctmd", write_chunk, decay_intra, U_chunk) +
+            torch.einsum("pcmd,pct->pctmd", start_states, torch.exp(a_cumsum))
+        )
+        return states, final_state
+
+    # Keep the decode path in [P, NC, C, D] form so training does not materialize
+    # per-token [M, D] states unless the caller explicitly requests them.
     y_diag = torch.einsum(
         "pctm,pcsm,pcts,pcsd->pctd",
         decode_chunk,
@@ -142,7 +150,6 @@ def _main_ssd_forward_chunked(
         decay_intra,
         U_chunk,
     )
-    # Stage 2: off-diagonal chunk-prefix contribution from the state entering each chunk.
     y_off = torch.einsum(
         "pctm,pcmd,pct->pctd",
         decode_chunk,
@@ -157,7 +164,7 @@ def flare_autoregressive_separated_pytorch(
     U: torch.Tensor,
     retain: torch.Tensor,
     write: torch.Tensor,
-    decode_weights: torch.Tensor,
+    decode_weights: torch.Tensor | None,
     chunk_size: int | None = None,
 ) -> torch.Tensor:
     if U.ndim != 4:
@@ -166,25 +173,26 @@ def flare_autoregressive_separated_pytorch(
         raise ValueError(f"retain must be [B,N,H]. Got {tuple(retain.shape)}.")
     if write.ndim != 4:
         raise ValueError(f"write must be [B,N,H,M]. Got {tuple(write.shape)}.")
-    if decode_weights.ndim != 4:
-        raise ValueError(f"decode_weights must be [B,N,H,M]. Got {tuple(decode_weights.shape)}.")
-
     bsz, seqlen, nheads, value_dim = U.shape
     if retain.shape != (bsz, seqlen, nheads):
         raise ValueError("retain must share [B,N,H] with U.")
     if write.shape[:3] != (bsz, seqlen, nheads):
         raise ValueError("write must share [B,N,H] with U.")
     nslots = write.shape[3]
-    if decode_weights.shape != (bsz, seqlen, nheads, nslots):
+    if decode_weights is not None and decode_weights.ndim != 4:
+        raise ValueError(f"decode_weights must be [B,N,H,M]. Got {tuple(decode_weights.shape)}.")
+    if decode_weights is not None and decode_weights.shape != (bsz, seqlen, nheads, nslots):
         raise ValueError("decode_weights must match [B,N,H,M].")
     if seqlen == 0:
+        if decode_weights is None:
+            return U.new_empty((bsz, 0, nheads, nslots, value_dim))
         return U.new_empty((bsz, 0, nheads, value_dim))
 
     accum_dtype = torch.float32 if U.dtype in {torch.float16, torch.bfloat16} else U.dtype
     U_acc = U.to(accum_dtype)
     retain_acc = retain.to(accum_dtype)
     write_acc = write.to(accum_dtype)
-    decode_acc = decode_weights.to(accum_dtype)
+    decode_acc = None if decode_weights is None else decode_weights.to(accum_dtype)
 
     chunk_size = _resolve_separated_chunk_size(seqlen, nslots, value_dim, chunk_size)
     nchunks = math.ceil(seqlen / chunk_size)
@@ -194,7 +202,8 @@ def flare_autoregressive_separated_pytorch(
         U_acc = _pad_sequence_dim(U_acc, pad, fill_value=0.0)
         retain_acc = _pad_sequence_dim(retain_acc, pad, fill_value=1.0)
         write_acc = _pad_sequence_dim(write_acc, pad, fill_value=0.0)
-        decode_acc = _pad_sequence_dim(decode_acc, pad, fill_value=0.0)
+        if decode_acc is not None:
+            decode_acc = _pad_sequence_dim(decode_acc, pad, fill_value=0.0)
 
     flat_batch = bsz * nheads
     U_chunk = U_acc.view(bsz, nchunks, chunk_size, nheads, value_dim).permute(0, 3, 1, 2, 4).reshape(
@@ -206,9 +215,11 @@ def flare_autoregressive_separated_pytorch(
     write_chunk = write_acc.view(bsz, nchunks, chunk_size, nheads, nslots).permute(0, 3, 1, 2, 4).reshape(
         flat_batch, nchunks, chunk_size, nslots
     )
-    decode_chunk = decode_acc.view(bsz, nchunks, chunk_size, nheads, nslots).permute(0, 3, 1, 2, 4).reshape(
-        flat_batch, nchunks, chunk_size, nslots
-    )
+    decode_chunk = None
+    if decode_acc is not None:
+        decode_chunk = decode_acc.view(bsz, nchunks, chunk_size, nheads, nslots).permute(0, 3, 1, 2, 4).reshape(
+            flat_batch, nchunks, chunk_size, nslots
+        )
 
     out_chunk, _ = _main_ssd_forward_chunked(
         initial_state=U_chunk.new_zeros((flat_batch, nslots, value_dim)),
@@ -217,6 +228,16 @@ def flare_autoregressive_separated_pytorch(
         write_chunk=write_chunk,
         decode_chunk=decode_chunk,
     )
+    if decode_chunk is None:
+        out = out_chunk.reshape(bsz, nheads, nchunks, chunk_size, nslots, value_dim).permute(0, 2, 3, 1, 4, 5).reshape(
+            bsz,
+            padded_len,
+            nheads,
+            nslots,
+            value_dim,
+        )
+        return out[:, :seqlen].to(U.dtype).contiguous()
+
     out = out_chunk.reshape(bsz, nheads, nchunks, chunk_size, value_dim).permute(0, 2, 3, 1, 4).reshape(
         bsz,
         padded_len,
