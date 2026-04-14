@@ -239,12 +239,7 @@ def _recurrent_cuda_forward(Q: torch.Tensor, K_bhtd: torch.Tensor, V_bhtd: torch
             from .cuda_ext import recurrent_flare_cuda as _rec_cuda_ext
             _RECURRENT_CUDA_EXT = _rec_cuda_ext
         except Exception as exc:  # pragma: no cover - optional fast path.
-            try:
-                # Compatibility fallback when this package is vendored under FLA.
-                from fla.models.flare.cuda_ext import recurrent_flare_cuda as _rec_cuda_ext  # type: ignore
-                _RECURRENT_CUDA_EXT = _rec_cuda_ext
-            except Exception:
-                _RECURRENT_CUDA_EXT_ERR = exc
+            _RECURRENT_CUDA_EXT_ERR = exc
     if _RECURRENT_CUDA_EXT is None:
         raise RuntimeError(f"Recurrent CUDA extension unavailable: {_RECURRENT_CUDA_EXT_ERR}")
     return _RECURRENT_CUDA_EXT.forward(Q, K_bhtd, V_bhtd, scale)
