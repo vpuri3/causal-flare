@@ -126,7 +126,6 @@ def flare_autoregressive_experimental_pytorch(
     eps=None,
     profile: bool = False,
     chunk_size=None,
-    power: float = 2.0,
     state: dict[str, torch.Tensor] | None = None,
     attention_mask: torch.Tensor | None = None,
     return_state: bool = False,
@@ -137,7 +136,7 @@ def flare_autoregressive_experimental_pytorch(
     - W_write: ``[B, N, H, M]``
     - V: ``[B, N, H, D_value]``
     - W_read: ``[B, N, H, M]``
-    - W_retain: ``[B, N, H]``
+    - W_retain: ``[B, N, H]`` or ``[B, N, H, G]`` where ``G`` divides ``M``
     """
     del eps
     if profile:
@@ -154,8 +153,46 @@ def flare_autoregressive_experimental_pytorch(
         raise ValueError(f"FLARE Experimental PyTorch expected V with shape [B, N, H, D_value], got {tuple(V.shape)}")
     if W_read.dim() != 4:
         raise ValueError(f"FLARE Experimental PyTorch expected W_read with shape [B, N, H, M], got {tuple(W_read.shape)}")
-    if W_retain.dim() != 3:
-        raise ValueError(f"FLARE Experimental PyTorch expected W_retain with shape [B, N, H], got {tuple(W_retain.shape)}")
+    if W_retain.dim() not in {3, 4}:
+        raise ValueError(
+            "FLARE Experimental PyTorch expected W_retain with shape [B, N, H] or [B, N, H, G], "
+            f"got {tuple(W_retain.shape)}",
+        )
+
+    if W_retain.dim() == 4:
+        B, N, H, M = W_write.shape
+        Bg, Ng, Hg, G = W_retain.shape
+        if (Bg, Ng, Hg) != (B, N, H):
+            raise ValueError(
+                f"Grouped W_retain leading dims must match W_write: got W_retain={tuple(W_retain.shape)}, "
+                f"W_write={tuple(W_write.shape)}"
+            )
+        if G <= 0:
+            raise ValueError(f"Grouped W_retain must have a positive group count. Got G={G}.")
+        if M % G != 0:
+            raise ValueError(f"Grouped W_retain requires G to divide M. Got M={M}, G={G}.")
+        slots_per_group = M // G
+        W_write_grouped = W_write.view(B, N, H, G, slots_per_group).permute(0, 3, 1, 2, 4).reshape(
+            B * G, N, H, slots_per_group
+        )
+        W_read_grouped = W_read.view(B, N, H, G, slots_per_group).permute(0, 3, 1, 2, 4).reshape(
+            B * G, N, H, slots_per_group
+        )
+        V_grouped = V.unsqueeze(1).expand(B, G, N, H, V.shape[-1]).reshape(B * G, N, H, V.shape[-1])
+        W_retain_grouped = W_retain.permute(0, 3, 1, 2).reshape(B * G, N, H)
+        Y_grouped = flare_autoregressive_experimental_pytorch(
+            W_write=W_write_grouped,
+            V=V_grouped,
+            W_read=W_read_grouped,
+            W_retain=W_retain_grouped,
+            eps=None,
+            profile=profile,
+            chunk_size=chunk_size,
+            state=state,
+            attention_mask=attention_mask,
+            return_state=return_state,
+        )
+        return Y_grouped.view(B, G, N, H, -1).sum(dim=1)
 
     B, N, H, M = W_write.shape
     Bv, Nv, Hv, _ = V.shape
@@ -174,7 +211,6 @@ def flare_autoregressive_experimental_pytorch(
             f"FLARE Experimental PyTorch W_retain shape must match W_write leading dims in [B,N,H]: got W_retain={tuple(W_retain.shape)}, W_write={tuple(W_write.shape)}"
         )
 
-    del power
     C = _resolve_experimental_chunk_size(N, M, M, chunk_size)
     compute_dtype = torch.float32
     if os.environ.get("FLARE_PYTORCH_MATCH_REFERENCE", "") == "1":
