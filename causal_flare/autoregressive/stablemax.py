@@ -42,6 +42,44 @@ def _resolve_stablemax_chunk_size_triton(N: int, M: int, D_score: int, D_value: 
     return 128
 
 
+def _affine_prefix_scan_flat(A: torch.Tensor, B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    scan_A = A
+    scan_B = B
+    length = A.size(1)
+    step = 1
+    while step < length:
+        shifted_A = torch.cat([torch.ones_like(scan_A[:, :step]), scan_A[:, :-step]], dim=1)
+        shifted_B = torch.cat([torch.zeros_like(scan_B[:, :step]), scan_B[:, :-step]], dim=1)
+        scan_B = scan_B + scan_A * shifted_B
+        scan_A = scan_A * shifted_A
+        step <<= 1
+    return scan_A, scan_B
+
+
+def _chunkwise_affine_state_scan(A: torch.Tensor, B: torch.Tensor, initial_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if A.shape != B.shape:
+        raise ValueError(f"A and B must have the same shape. Got A={tuple(A.shape)}, B={tuple(B.shape)}.")
+    if A.ndim != 3 or initial_state.ndim != 2:
+        raise ValueError(
+            "_chunkwise_affine_state_scan expects A=[P,NC,S], B=[P,NC,S], initial_state=[P,S]. "
+            f"Got A={tuple(A.shape)}, B={tuple(B.shape)}, initial_state={tuple(initial_state.shape)}."
+        )
+    if A.shape[0] != initial_state.shape[0] or A.shape[2] != initial_state.shape[1]:
+        raise ValueError(
+            "initial_state must match flattened P/S dimensions. "
+            f"Got A={tuple(A.shape)}, initial_state={tuple(initial_state.shape)}."
+        )
+    if A.shape[1] == 0:
+        return A.new_empty((A.shape[0], 0, A.shape[2])), initial_state
+
+    inc_A, inc_B = _affine_prefix_scan_flat(A, B)
+    excl_A = torch.cat([torch.ones_like(inc_A[:, :1]), inc_A[:, :-1]], dim=1)
+    excl_B = torch.cat([torch.zeros_like(inc_B[:, :1]), inc_B[:, :-1]], dim=1)
+    chunk_start = excl_A * initial_state.unsqueeze(1) + excl_B
+    final_state = inc_A[:, -1] * initial_state + inc_B[:, -1]
+    return chunk_start, final_state
+
+
 def _stablemax_score_transform(x: torch.Tensor, power: float = 2.0) -> torch.Tensor:
     one = torch.ones((), device=x.device, dtype=x.dtype)
     power_tensor = torch.as_tensor(power, device=x.device, dtype=x.dtype)
@@ -1098,251 +1136,3 @@ def flare_autoregressive_stablemax_mat_decode_pytorch(
     return FLAREAutoregressiveStablemaxMatDecodePyTorch.apply(Q, K, V, C_dec, scale, chunk_size, power)
 
 
-class FLAREAutoregressiveExperimentalPyTorch(autograd.Function):
-    @staticmethod
-    def forward(ctx, W_write, V, W_read, W_denom, chunk_size=None, power: float = 2.0):
-        compute_dtype = torch.float32
-        if os.environ.get("FLARE_PYTORCH_MATCH_REFERENCE", "") == "1":
-            compute_dtype = W_write.dtype
-
-        if W_write.dim() != 4:
-            raise ValueError(f"FLARE Experimental PyTorch expected W_write with shape [B, N, H, M], got {tuple(W_write.shape)}")
-        if V.dim() != 4:
-            raise ValueError(f"FLARE Experimental PyTorch expected V with shape [B, N, H, D_value], got {tuple(V.shape)}")
-        if W_read.dim() != 4:
-            raise ValueError(f"FLARE Experimental PyTorch expected W_read with shape [B, N, H, M], got {tuple(W_read.shape)}")
-        if W_denom.dim() != 4:
-            raise ValueError(f"FLARE Experimental PyTorch expected W_denom with shape [B, N, H, M], got {tuple(W_denom.shape)}")
-
-        B, N, H, M = W_write.shape
-        Bv, Nv, Hv, D_value = V.shape
-        Br, Nr, Hr, Mr = W_read.shape
-        Bd, Nd, Hd, Md = W_denom.shape
-        if (Bv, Nv, Hv) != (B, N, H):
-            raise ValueError(
-                f"FLARE Experimental PyTorch V leading dims must match W_write: "
-                f"got V={tuple(V.shape)}, W_write={tuple(W_write.shape)}"
-            )
-        if (Br, Nr, Hr, Mr) != (B, N, H, M):
-            raise ValueError(
-                f"FLARE Experimental PyTorch W_read shape must match W_write in [B,N,H,M]: "
-                f"got W_read={tuple(W_read.shape)}, W_write={tuple(W_write.shape)}"
-            )
-        if (Bd, Nd, Hd, Md) != (B, N, H, M):
-            raise ValueError(
-                f"FLARE Experimental PyTorch W_denom shape must match W_write in [B,N,H,M]: "
-                f"got W_denom={tuple(W_denom.shape)}, W_write={tuple(W_write.shape)}"
-            )
-
-        device = W_write.device
-        out_dtype = V.dtype
-        power = float(power)
-
-        W_write_f = W_write.to(compute_dtype)
-        V_f = V.to(compute_dtype)
-
-        C = _resolve_stablemax_chunk_size_pytorch(N, M, M, chunk_size)
-        NC = math.ceil(N / C) if N > 0 else 0
-        PADDED_LEN = NC * C
-        PAD = PADDED_LEN - N
-        if PAD > 0:
-            W_write_f = torch.cat([W_write_f, torch.zeros((B, PAD, H, M), device=device, dtype=compute_dtype)], dim=1)
-            V_f = torch.cat([V_f, torch.zeros((B, PAD, H, D_value), device=device, dtype=compute_dtype)], dim=1)
-
-        W_write_c = W_write_f.reshape(B, NC, C, H, M).permute(0, 3, 1, 2, 4).contiguous()
-        Vc = V_f.reshape(B, NC, C, H, D_value).permute(0, 3, 1, 2, 4).contiguous()
-        W_read_c = _pack_stablemax_decode_tensor(W_read, B=B, N=N, H=H, M=M, NC=NC, C=C, device=device, dtype=compute_dtype, name="W_read")
-        W_denom_c = _pack_stablemax_decode_tensor(
-            W_denom,
-            B=B,
-            N=N,
-            H=H,
-            M=M,
-            NC=NC,
-            C=C,
-            device=device,
-            dtype=compute_dtype,
-            name="W_denom",
-        )
-        BHNC = B * H * NC
-
-        ctx.empty = False
-        ctx.chunk_size = C
-        ctx.compute_dtype = compute_dtype
-        ctx.w_write_dtype = W_write.dtype
-        ctx.v_dtype = V.dtype
-        ctx.w_read_dtype = W_read.dtype
-        ctx.w_denom_dtype = W_denom.dtype
-        ctx.power = power
-        ctx.n = N
-        ctx.h = H
-        ctx.m = M
-        ctx.d_value = D_value
-        ctx.padded_len = PADDED_LEN
-        ctx.c = C
-        ctx.nc = NC
-        ctx.bhnc = BHNC
-
-        # Denominator construction:
-        # - stablemax(W_denom) provides positive per-token latent masses
-        # - we form both chunk-level exclusive prefixes and intra-chunk prefixes
-        # - their sum gives the running denominator per (token, latent).
-        stable_denom_chunk = _stablemax_score_transform(W_denom_c, power=power)
-        den_chunk_sum = stable_denom_chunk.sum(dim=3)
-        den_prev = torch.cumsum(den_chunk_sum, dim=2) - den_chunk_sum
-        den_chunk_prefix = stable_denom_chunk.cumsum(dim=3)
-        den_total = den_prev.unsqueeze(3) + den_chunk_prefix
-        den_pos_mask = den_total > 0
-        # Safe normalization: clamp non-positive denominator regions to 1 before reciprocal.
-        den_total_safe = torch.where(den_pos_mask, den_total, torch.ones_like(den_total))
-        den_inv = den_total_safe.reciprocal()
-        read_over_den = W_read_c * den_inv
-
-        # Modified recurrence in chunk-parallel form:
-        # write contribution is unnormalized (a_t * v_t), realized by scaling writes with den_total
-        # before prefix/local accumulation, while reads remain normalized by den_total.
-        write_weighted = W_write_c * den_total_safe
-        num_chunk = torch.bmm(write_weighted.reshape(BHNC, C, M).mT, Vc.reshape(BHNC, C, D_value)).reshape(B, H, NC, M, D_value)
-        num_prev = torch.cumsum(num_chunk, dim=2) - num_chunk
-
-        # Readout decomposition:
-        # - prefix_out handles contributions from previous chunks
-        # - local_out handles within-chunk causal contributions.
-        prefix_out = torch.einsum("bhncm,bhnmd->bhncd", read_over_den, num_prev)
-        causal_mask = torch.tril(torch.ones((C, C), device=device, dtype=torch.bool)).view(1, 1, 1, C, C)
-        local_mix = torch.matmul(read_over_den, write_weighted.mT)
-        local_mix = torch.where(causal_mask, local_mix, torch.zeros_like(local_mix))
-        local_out = torch.matmul(local_mix.reshape(BHNC, C, C), Vc.reshape(BHNC, C, D_value)).reshape(B, H, NC, C, D_value)
-        Yc = prefix_out + local_out
-
-        Y_out = Yc.reshape(B, H, PADDED_LEN, D_value)[:, :, :N, :].permute(0, 2, 1, 3).to(out_dtype)
-        _check_finite("FLAREAutoregressiveExperimentalPyTorch.Y", Y_out)
-
-        ctx.save_for_backward(
-            W_write_c,
-            Vc,
-            W_read_c,
-            W_denom_c,
-            num_prev,
-            den_inv,
-            den_total_safe,
-            den_pos_mask,
-        )
-        return Y_out
-
-    @staticmethod
-    def backward(ctx, dY):
-        if getattr(ctx, "empty", False):
-            B = ctx.b
-            H = ctx.h
-            M = ctx.m
-            N = ctx.n
-            D_value = ctx.d_value
-            empty_w_write = torch.zeros((B, N, H, M), device=dY.device, dtype=ctx.w_write_dtype)
-            empty_v = torch.zeros((B, N, H, D_value), device=dY.device, dtype=ctx.v_dtype)
-            empty_w_read = torch.zeros((B, N, H, M), device=dY.device, dtype=ctx.w_read_dtype)
-            empty_w_denom = torch.zeros((B, N, H, M), device=dY.device, dtype=ctx.w_denom_dtype)
-            return empty_w_write, empty_v, empty_w_read, empty_w_denom, None, None
-
-        (W_write_c, Vc, W_read_c, W_denom_c, num_prev, den_inv, den_total_safe, den_pos_mask) = ctx.saved_tensors
-        B = W_write_c.size(0)
-        H = ctx.h
-        N = ctx.n
-        C = ctx.c
-        NC = ctx.nc
-        M = ctx.m
-        D_value = ctx.d_value
-        PADDED_LEN = ctx.padded_len
-        BHNC = ctx.bhnc
-        device = W_write_c.device
-        compute_dtype = W_write_c.dtype
-        power = ctx.power
-
-        write_weighted = W_write_c * den_total_safe
-        causal_mask = torch.tril(torch.ones((C, C), device=device, dtype=torch.bool)).view(1, 1, 1, C, C)
-        read_over_den = W_read_c * den_inv
-        local_mix = torch.matmul(read_over_den, write_weighted.mT)
-        local_mix = torch.where(causal_mask, local_mix, torch.zeros_like(local_mix))
-
-        dY_f = dY.to(compute_dtype)
-        if PADDED_LEN != N:
-            dY_f = torch.cat(
-                [dY_f, torch.zeros((B, PADDED_LEN - N, H, D_value), device=device, dtype=compute_dtype)],
-                dim=1,
-            )
-        dYc = dY_f.permute(0, 2, 1, 3).reshape(B, H, NC, C, D_value).contiguous()
-
-        grad_read_over_den = torch.einsum("bhncd,bhnmd->bhncm", dYc, num_prev)
-        grad_num_prev = torch.einsum("bhncm,bhncd->bhnmd", read_over_den, dYc)
-        grad_local_mix = torch.matmul(dYc, Vc.transpose(-1, -2))
-        grad_local_mix = torch.where(causal_mask, grad_local_mix, torch.zeros_like(grad_local_mix))
-        grad_V_phase3 = torch.matmul(
-            local_mix.transpose(-1, -2).reshape(BHNC, C, C),
-            dYc.reshape(BHNC, C, D_value),
-        ).reshape(B, H, NC, C, D_value)
-
-        grad_read_over_den = grad_read_over_den + torch.matmul(grad_local_mix, write_weighted)
-        grad_num_local = torch.matmul(grad_local_mix.transpose(-1, -2), read_over_den)
-
-        grad_num_chunk = torch.flip(torch.cumsum(torch.flip(grad_num_prev, dims=(2,)), dim=2), dims=(2,)) - grad_num_prev
-
-        grad_write_weighted = grad_num_local + torch.einsum("bhnmd,bhncd->bhncm", grad_num_chunk, Vc)
-        grad_V_total = grad_V_phase3 + torch.einsum("bhncm,bhnmd->bhncd", write_weighted, grad_num_chunk)
-
-        grad_W_read = grad_read_over_den * den_inv
-        grad_den_total = -(grad_read_over_den * W_read_c) * den_inv.square()
-        grad_W_write = grad_write_weighted * den_total_safe
-        grad_den_total = grad_den_total + grad_write_weighted * W_write_c
-        grad_den_total = torch.where(den_pos_mask, grad_den_total, torch.zeros_like(grad_den_total))
-        grad_den_prev = grad_den_total.sum(dim=3)
-        grad_stable_denom_chunk = torch.flip(torch.cumsum(torch.flip(grad_den_total, dims=(3,)), dim=3), dims=(3,))
-        grad_den_chunk_sum = torch.flip(torch.cumsum(torch.flip(grad_den_prev, dims=(2,)), dim=2), dims=(2,)) - grad_den_prev
-        grad_stable_denom_chunk = grad_stable_denom_chunk + grad_den_chunk_sum.unsqueeze(3)
-        grad_W_denom = grad_stable_denom_chunk * _stablemax_score_transform_grad(W_denom_c, power=power)
-
-        grad_V = grad_V_total.permute(0, 2, 3, 1, 4).reshape(B, PADDED_LEN, H, D_value)[:, :N, :, :]
-        grad_W_read = grad_W_read.permute(0, 2, 3, 1, 4).reshape(B, PADDED_LEN, H, M)[:, :N, :, :]
-        grad_W_denom = grad_W_denom.permute(0, 2, 3, 1, 4).reshape(B, PADDED_LEN, H, M)[:, :N, :, :]
-        grad_W_write = grad_W_write.permute(0, 2, 3, 1, 4).reshape(B, PADDED_LEN, H, M)[:, :N, :, :]
-        return (
-            grad_W_write.to(ctx.w_write_dtype),
-            grad_V.to(ctx.v_dtype),
-            grad_W_read.to(ctx.w_read_dtype),
-            grad_W_denom.to(ctx.w_denom_dtype),
-            None,
-            None,
-        )
-
-def flare_autoregressive_experimental_pytorch(
-    W_write,
-    V,
-    W_read,
-    W_denom,
-    eps=None,
-    profile: bool = False,
-    chunk_size=None,
-    power: float = 2.0,
-    state: dict[str, torch.Tensor] | None = None,
-    attention_mask: torch.Tensor | None = None,
-    return_state: bool = False,
-):
-    """Experimental alias of the mat-decode FLARE autograd path.
-
-    Expected tensor shapes:
-    - W_write: ``[B, N, H, M]``
-      Precomputed write scores, typically ``einsum('bnhd,hmd->bnhm', Q, K) * scale``.
-    - V: ``[B, N, H, D_value]``
-    - W_read: ``[B, N, H, M]``
-    - W_denom: ``[B, N, H, M]``
-      Denominator logits consumed by stablemax + chunk/time cumsums.
-    """
-    del eps
-    if profile:
-        raise NotImplementedError("flare_autoregressive_experimental_pytorch does not support profile=True")
-    if state is not None:
-        raise NotImplementedError("flare_autoregressive_experimental_pytorch does not support recurrent state")
-    if attention_mask is not None:
-        raise NotImplementedError("flare_autoregressive_experimental_pytorch does not support attention_mask")
-    if return_state:
-        raise NotImplementedError("flare_autoregressive_experimental_pytorch does not support return_state=True")
-    return FLAREAutoregressiveExperimentalPyTorch.apply(W_write, V, W_read, W_denom, chunk_size, power)
