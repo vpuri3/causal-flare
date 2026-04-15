@@ -62,6 +62,77 @@ def _chunkwise_affine_state_scan(A: torch.Tensor, B: torch.Tensor, initial_state
     return chunk_start, final_state
 
 
+def _affine_prefix_scan_matrix(A: torch.Tensor, B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inclusive prefix scan for matrix affine maps x -> A_t @ x + B_t."""
+    if A.ndim != 4 or B.ndim != 4:
+        raise ValueError(f"_affine_prefix_scan_matrix expects rank-4 tensors. Got A={tuple(A.shape)}, B={tuple(B.shape)}.")
+    if A.shape[:2] != B.shape[:2] or A.shape[-1] != A.shape[-2] or A.shape[-2] != B.shape[-2]:
+        raise ValueError(f"Incompatible shapes for matrix affine scan. Got A={tuple(A.shape)}, B={tuple(B.shape)}.")
+
+    scan_A = A
+    scan_B = B
+    length = A.size(1)
+    k = A.size(-1)
+    identity = torch.eye(k, device=A.device, dtype=A.dtype).view(1, 1, k, k)
+    step = 1
+    while step < length:
+        shifted_A = torch.cat([identity.expand(scan_A.shape[0], step, k, k), scan_A[:, :-step]], dim=1)
+        shifted_B = torch.cat([torch.zeros_like(scan_B[:, :step]), scan_B[:, :-step]], dim=1)
+        scan_B = scan_B + torch.matmul(scan_A, shifted_B)
+        scan_A = torch.matmul(scan_A, shifted_A)
+        step <<= 1
+    return scan_A, scan_B
+
+
+def _chunkwise_affine_state_scan_matrix(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    initial_state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exclusive chunk-start states for matrix affine maps."""
+    if A.ndim != 4 or B.ndim != 4 or initial_state.ndim != 3:
+        raise ValueError(
+            "_chunkwise_affine_state_scan_matrix expects A=[P,NC,K,K], B=[P,NC,K,S], initial_state=[P,K,S]. "
+            f"Got A={tuple(A.shape)}, B={tuple(B.shape)}, initial_state={tuple(initial_state.shape)}."
+        )
+    if A.shape[0] != B.shape[0] or A.shape[1] != B.shape[1] or A.shape[2] != A.shape[3] or A.shape[2] != B.shape[2]:
+        raise ValueError(f"Incompatible A/B shapes. Got A={tuple(A.shape)}, B={tuple(B.shape)}.")
+    if initial_state.shape[0] != A.shape[0] or initial_state.shape[1] != A.shape[2] or initial_state.shape[2] != B.shape[3]:
+        raise ValueError(
+            "initial_state must match [P,K,S] implied by A/B. "
+            f"Got initial_state={tuple(initial_state.shape)}, A={tuple(A.shape)}, B={tuple(B.shape)}."
+        )
+    if A.shape[1] == 0:
+        return B.new_empty((A.shape[0], 0, A.shape[2], B.shape[-1])), initial_state
+
+    inc_A, inc_B = _affine_prefix_scan_matrix(A, B)
+    k = A.shape[2]
+    excl_A = torch.cat(
+        [torch.eye(k, device=A.device, dtype=A.dtype).view(1, 1, k, k).expand(A.shape[0], 1, k, k), inc_A[:, :-1]],
+        dim=1,
+    )
+    excl_B = torch.cat([torch.zeros_like(inc_B[:, :1]), inc_B[:, :-1]], dim=1)
+    chunk_start = torch.matmul(excl_A, initial_state.unsqueeze(1)) + excl_B
+    final_state = torch.matmul(inc_A[:, -1], initial_state) + inc_B[:, -1]
+    return chunk_start, final_state
+
+
+def _matrix_prefix_products(A: torch.Tensor) -> torch.Tensor:
+    """Inclusive prefix products where out[:, t] = A_t @ ... @ A_0."""
+    if A.ndim != 4 or A.shape[-1] != A.shape[-2]:
+        raise ValueError(f"_matrix_prefix_products expects A=[P,L,K,K]. Got {tuple(A.shape)}.")
+    prod = A
+    length = A.size(1)
+    k = A.size(-1)
+    identity = torch.eye(k, device=A.device, dtype=A.dtype).view(1, 1, k, k)
+    step = 1
+    while step < length:
+        shifted = torch.cat([identity.expand(prod.shape[0], step, k, k), prod[:, :-step]], dim=1)
+        prod = torch.matmul(prod, shifted)
+        step <<= 1
+    return prod
+
+
 def _flare_autoregressive_experimental_chunkwise_recurrence(
     W_write: torch.Tensor,
     V: torch.Tensor,
@@ -229,7 +300,7 @@ def flare_autoregressive_experimental_pytorch(
     return Y_out
 
 
-def flare_autoregressive_experimental_aux_pytorch(
+def flare_autoregressive_experimental_pytorch_mode_1(
     W_write_s,
     V_s,
     W_read,
@@ -256,20 +327,16 @@ def flare_autoregressive_experimental_aux_pytorch(
     1) building chunk-local dense kernels (Ls, Lz, Ksz) with shape [C, C],
     2) evaluating in-chunk contributions with dense contractions,
     3) propagating chunk boundary states with chunk-level affine scans.
-
-    There is still a loop over chunks in the sequence dimension in older versions;
-    this current version computes all chunks in parallel and only scans across
-    chunk summaries (no loop over tokens, no loop over chunks).
     """
     del eps
     if profile:
-        raise NotImplementedError("flare_autoregressive_experimental_aux_pytorch does not support profile=True")
+        raise NotImplementedError("flare_autoregressive_experimental_pytorch_mode_1 does not support profile=True")
     if state is not None:
-        raise NotImplementedError("flare_autoregressive_experimental_aux_pytorch does not support recurrent state")
+        raise NotImplementedError("flare_autoregressive_experimental_pytorch_mode_1 does not support recurrent state")
     if attention_mask is not None:
-        raise NotImplementedError("flare_autoregressive_experimental_aux_pytorch does not support attention_mask")
+        raise NotImplementedError("flare_autoregressive_experimental_pytorch_mode_1 does not support attention_mask")
     if return_state:
-        raise NotImplementedError("flare_autoregressive_experimental_aux_pytorch does not support return_state=True")
+        raise NotImplementedError("flare_autoregressive_experimental_pytorch_mode_1 does not support return_state=True")
     for name, tensor in {
         "W_write_s": W_write_s,
         "V_s": V_s,
@@ -310,7 +377,6 @@ def flare_autoregressive_experimental_aux_pytorch(
     if W_retain_s.shape != (B, N, H) or W_retain_z.shape != (B, N, H) or W_gate_s.shape != (B, N, H):
         raise ValueError("Aux retain/gate tensors must have shape [B, N, H].")
 
-    # Keep output in the input dtype; optionally run aux math in fp32 for debugging.
     output_dtype = W_write_s.dtype
     compute_dtype = W_write_s.dtype
     if os.environ.get("FLARE_PYTORCH_AUX_FP32", "") == "1":
@@ -325,13 +391,11 @@ def flare_autoregressive_experimental_aux_pytorch(
     W_retain_z = W_retain_z.to(compute_dtype)
     W_gate_s = W_gate_s.to(compute_dtype)
 
-    # B: batch, N: seq, H: heads, M: slots, D: value dim.
     D = V_s.shape[-1]
     C = _resolve_experimental_chunk_size(N, M, M, chunk_size)
     NC = math.ceil(N / C) if N > 0 else 0
     padded_len = NC * C
     pad = padded_len - N
-    # Right-pad to a multiple of chunk size so every chunk has identical shape.
     if pad > 0:
         z_w = torch.zeros((B, pad, H, M), device=W_write_s.device, dtype=W_write_s.dtype)
         z_v = torch.zeros((B, pad, H, D), device=V_s.device, dtype=V_s.dtype)
@@ -349,10 +413,199 @@ def flare_autoregressive_experimental_aux_pytorch(
     if NC == 0:
         return W_write_s.new_zeros((B, 0, H, D), dtype=output_dtype)
 
-    # Layout used below:
-    # - write/read tensors: [B, H, NC, C, M]
-    # - value tensors:      [B, H, NC, C, D]
-    # - retain/gate:        [B, H, NC, C]
+    write_s = W_write_s.reshape(B, NC, C, H, M).permute(0, 3, 1, 2, 4).contiguous()
+    write_z = W_write_z.reshape(B, NC, C, H, M).permute(0, 3, 1, 2, 4).contiguous()
+    read = W_read.reshape(B, NC, C, H, M).permute(0, 3, 1, 2, 4).contiguous()
+    value_s = V_s.reshape(B, NC, C, H, D).permute(0, 3, 1, 2, 4).contiguous()
+    value_z = V_z.reshape(B, NC, C, H, D).permute(0, 3, 1, 2, 4).contiguous()
+    retain_s = W_retain_s.reshape(B, NC, C, H).permute(0, 3, 1, 2).contiguous()
+    retain_z = W_retain_z.reshape(B, NC, C, H).permute(0, 3, 1, 2).contiguous()
+    gate_s = W_gate_s.reshape(B, NC, C, H).permute(0, 3, 1, 2).contiguous()
+
+    c_idx = torch.arange(C, device=W_write_s.device)
+    tril = (c_idx.view(C, 1) >= c_idx.view(1, C)).view(1, 1, C, C)
+    strictly_lower = (c_idx.view(C, 1) > c_idx.view(1, C)).view(1, 1, C, C)
+
+    ones = torch.ones((B, H, NC, C, C), device=W_write_s.device, dtype=compute_dtype)
+    As = torch.where(strictly_lower, retain_s.unsqueeze(-1).expand(B, H, NC, C, C), ones)
+    Az = torch.where(strictly_lower, retain_z.unsqueeze(-1).expand(B, H, NC, C, C), ones)
+    Ls = torch.cumprod(As, dim=3) * tril
+    Lz = torch.cumprod(Az, dim=3) * tril
+    ps = torch.cumprod(retain_s, dim=3)
+    pz = torch.cumprod(retain_z, dim=3)
+    Ksz = torch.matmul(Ls * gate_s.unsqueeze(-2), Lz)
+    k_pref = torch.matmul(Ls, (gate_s * pz).unsqueeze(-1)).squeeze(-1)
+
+    Rs = torch.einsum("bhnim,bhnjm->bhnij", read, write_s)
+    Rz = torch.einsum("bhnim,bhnjm->bhnij", read, write_z)
+    Y_diag = torch.einsum("bhnij,bhnij,bhnjd->bhnid", Rs, Ls, value_s) + torch.einsum(
+        "bhnij,bhnij,bhnjd->bhnid", Rz, Ksz, value_z
+    )
+
+    Ls_end = Ls[..., -1, :]
+    Lz_end = Lz[..., -1, :]
+    Ksz_end = Ksz[..., -1, :]
+    Bs_end = torch.einsum("bhnj,bhnjm,bhnjd->bhnmd", Ls_end, write_s, value_s) + torch.einsum(
+        "bhnj,bhnjm,bhnjd->bhnmd", Ksz_end, write_z, value_z
+    )
+    Bz_end = torch.einsum("bhnj,bhnjm,bhnjd->bhnmd", Lz_end, write_z, value_z)
+    ps_end = ps[..., -1]
+    pz_end = pz[..., -1]
+    k_end = k_pref[..., -1]
+
+    P = B * H
+    Sdim = M * D
+    z_init = torch.zeros((P, Sdim), device=W_write_s.device, dtype=compute_dtype)
+    z_start_flat, _ = _chunkwise_affine_state_scan(
+        pz_end.reshape(P, NC, 1).expand(P, NC, Sdim),
+        Bz_end.reshape(P, NC, Sdim),
+        initial_state=z_init,
+    )
+    z_start = z_start_flat.reshape(B, H, NC, M, D)
+    s_bias = (k_end.unsqueeze(-1).unsqueeze(-1) * z_start + Bs_end).reshape(P, NC, Sdim)
+    s_start_flat, _ = _chunkwise_affine_state_scan(
+        ps_end.reshape(P, NC, 1).expand(P, NC, Sdim),
+        s_bias,
+        initial_state=z_init,
+    )
+    s_start = s_start_flat.reshape(B, H, NC, M, D)
+    Y_off = (
+        ps.unsqueeze(-1) * torch.einsum("bhncm,bhnmd->bhncd", read, s_start)
+        + k_pref.unsqueeze(-1) * torch.einsum("bhncm,bhnmd->bhncd", read, z_start)
+    )
+    Y = Y_diag + Y_off
+    Y = Y.reshape(B, H, padded_len, D).permute(0, 2, 1, 3).contiguous()
+    Y = Y[:, :N].to(output_dtype)
+    _check_finite("flare_autoregressive_experimental_pytorch_mode_1.Y", Y)
+    return Y
+
+
+def flare_autoregressive_experimental_pytorch_mode_2(
+    W_write_s,
+    V_s,
+    W_read,
+    W_retain_s,
+    W_write_z,
+    V_z,
+    W_retain_z,
+    W_gate_s,
+    W_feedback_lambda,
+    eps=None,
+    profile: bool = False,
+    chunk_size=None,
+    state: dict[str, torch.Tensor] | None = None,
+    attention_mask: torch.Tensor | None = None,
+    return_state: bool = False,
+):
+    """Experimental FLARE scan with an auxiliary recurrent state and closed-loop feedback.
+
+    Recurrence per head (all retains/gates/feedback are scalars per token/head):
+      Z_t = r^z_t * Z_{t-1} + (W^z_t ⊗ V^z_t) - λ_t * S_{t-1}
+      S_t = r^s_t * S_{t-1} + (W^s_t ⊗ V^s_t) + g^s_t * Z_t
+      y_t = c_t^T S_t
+
+    This implementation avoids token-step loops by:
+    1) building chunk-local dense kernels (Ls, Lz, Ksz) with shape [C, C],
+    2) evaluating in-chunk contributions with dense contractions,
+    3) propagating chunk boundary states with chunk-level affine scans.
+    """
+    del eps
+    if profile:
+        raise NotImplementedError("flare_autoregressive_experimental_pytorch_mode_2 does not support profile=True")
+    if state is not None:
+        raise NotImplementedError("flare_autoregressive_experimental_pytorch_mode_2 does not support recurrent state")
+    if attention_mask is not None:
+        raise NotImplementedError("flare_autoregressive_experimental_pytorch_mode_2 does not support attention_mask")
+    if return_state:
+        raise NotImplementedError("flare_autoregressive_experimental_pytorch_mode_2 does not support return_state=True")
+    if W_feedback_lambda is None:
+        raise ValueError("flare_autoregressive_experimental_pytorch_mode_2 requires W_feedback_lambda.")
+    for name, tensor in {
+        "W_write_s": W_write_s,
+        "V_s": V_s,
+        "W_read": W_read,
+        "W_retain_s": W_retain_s,
+        "W_write_z": W_write_z,
+        "V_z": V_z,
+        "W_retain_z": W_retain_z,
+        "W_gate_s": W_gate_s,
+        "W_feedback_lambda": W_feedback_lambda,
+    }.items():
+        if tensor is not None and name in {"V_s", "V_z"} and tensor.dim() != 4:
+            raise ValueError(f"FLARE Experimental Aux PyTorch expected {name} with shape [B, N, H, D], got {tuple(tensor.shape)}")
+        if tensor is not None and name not in {"V_s", "V_z"} and tensor.dim() not in {3, 4}:
+            raise ValueError(f"FLARE Experimental Aux PyTorch expected {name} with rank 3/4, got {tuple(tensor.shape)}")
+
+    if W_write_s.dim() != 4 or W_write_z.dim() != 4 or W_read.dim() != 4:
+        raise ValueError("Aux write/read tensors must be [B, N, H, M].")
+    if W_retain_s.dim() == 4:
+        if W_retain_s.shape[-1] != 1:
+            raise ValueError("Aux retain/gate use per-head scalars. Set num_groups=1 for aux mode.")
+        W_retain_s = W_retain_s.squeeze(-1)
+    if W_retain_z.dim() == 4:
+        if W_retain_z.shape[-1] != 1:
+            raise ValueError("Aux retain/gate use per-head scalars. Set num_groups=1 for aux mode.")
+        W_retain_z = W_retain_z.squeeze(-1)
+    if W_gate_s.dim() == 4:
+        if W_gate_s.shape[-1] != 1:
+            raise ValueError("Aux retain/gate use per-head scalars. Set num_groups=1 for aux mode.")
+        W_gate_s = W_gate_s.squeeze(-1)
+    if W_feedback_lambda.dim() == 4:
+        if W_feedback_lambda.shape[-1] != 1:
+            raise ValueError("Aux retain/gate use per-head scalars. Set num_groups=1 for aux mode.")
+        W_feedback_lambda = W_feedback_lambda.squeeze(-1)
+    if W_retain_s.dim() != 3 or W_retain_z.dim() != 3 or W_gate_s.dim() != 3 or W_feedback_lambda.dim() != 3:
+        raise ValueError("Aux retain/gate/feedback tensors must be [B, N, H] (or [B, N, H, 1]).")
+
+    B, N, H, M = W_write_s.shape
+    if W_write_z.shape != (B, N, H, M) or W_read.shape != (B, N, H, M):
+        raise ValueError("Aux write/read tensors must share shape [B, N, H, M].")
+    if V_s.shape[:3] != (B, N, H) or V_z.shape[:3] != (B, N, H):
+        raise ValueError("Aux value tensors must share leading [B, N, H] dims with write/read tensors.")
+    if W_retain_s.shape != (B, N, H) or W_retain_z.shape != (B, N, H) or W_gate_s.shape != (B, N, H):
+        raise ValueError("Aux retain/gate tensors must have shape [B, N, H].")
+    if W_feedback_lambda.shape != (B, N, H):
+        raise ValueError("Aux feedback lambda tensor must have shape [B, N, H].")
+
+    output_dtype = W_write_s.dtype
+    compute_dtype = W_write_s.dtype
+    if os.environ.get("FLARE_PYTORCH_AUX_FP32", "") == "1":
+        compute_dtype = torch.float32
+
+    W_write_s = W_write_s.to(compute_dtype)
+    V_s = V_s.to(compute_dtype)
+    W_read = W_read.to(compute_dtype)
+    W_retain_s = W_retain_s.to(compute_dtype)
+    W_write_z = W_write_z.to(compute_dtype)
+    V_z = V_z.to(compute_dtype)
+    W_retain_z = W_retain_z.to(compute_dtype)
+    W_gate_s = W_gate_s.to(compute_dtype)
+    W_feedback_lambda = W_feedback_lambda.to(compute_dtype)
+
+    D = V_s.shape[-1]
+    C = _resolve_experimental_chunk_size(N, M, M, chunk_size)
+    NC = math.ceil(N / C) if N > 0 else 0
+    padded_len = NC * C
+    pad = padded_len - N
+    if pad > 0:
+        z_w = torch.zeros((B, pad, H, M), device=W_write_s.device, dtype=W_write_s.dtype)
+        z_v = torch.zeros((B, pad, H, D), device=V_s.device, dtype=V_s.dtype)
+        z_r = torch.ones((B, pad, H), device=W_retain_s.device, dtype=W_retain_s.dtype)
+        z_g = torch.zeros((B, pad, H), device=W_gate_s.device, dtype=W_gate_s.dtype)
+        z_l = torch.zeros((B, pad, H), device=W_feedback_lambda.device, dtype=W_feedback_lambda.dtype)
+        W_write_s = torch.cat([W_write_s, z_w], dim=1)
+        W_write_z = torch.cat([W_write_z, z_w], dim=1)
+        W_read = torch.cat([W_read, z_w], dim=1)
+        V_s = torch.cat([V_s, z_v], dim=1)
+        V_z = torch.cat([V_z, z_v], dim=1)
+        W_retain_s = torch.cat([W_retain_s, z_r], dim=1)
+        W_retain_z = torch.cat([W_retain_z, z_r], dim=1)
+        W_gate_s = torch.cat([W_gate_s, z_g], dim=1)
+        W_feedback_lambda = torch.cat([W_feedback_lambda, z_l], dim=1)
+
+    if NC == 0:
+        return W_write_s.new_zeros((B, 0, H, D), dtype=output_dtype)
+
     write_s = W_write_s.reshape(B, NC, C, H, M).permute(0, 3, 1, 2, 4).contiguous()  # [B,H,NC,C,M]
     write_z = W_write_z.reshape(B, NC, C, H, M).permute(0, 3, 1, 2, 4).contiguous()
     read = W_read.reshape(B, NC, C, H, M).permute(0, 3, 1, 2, 4).contiguous()
@@ -361,82 +614,115 @@ def flare_autoregressive_experimental_aux_pytorch(
     retain_s = W_retain_s.reshape(B, NC, C, H).permute(0, 3, 1, 2).contiguous()  # [B,H,NC,C]
     retain_z = W_retain_z.reshape(B, NC, C, H).permute(0, 3, 1, 2).contiguous()
     gate_s = W_gate_s.reshape(B, NC, C, H).permute(0, 3, 1, 2).contiguous()
+    feedback_lambda = W_feedback_lambda.reshape(B, NC, C, H).permute(0, 3, 1, 2).contiguous()
 
-    # Causal lower-triangular masks used to build per-chunk transport matrices.
     c_idx = torch.arange(C, device=W_write_s.device)
-    tril = (c_idx.view(C, 1) >= c_idx.view(1, C)).view(1, 1, C, C)
-    strictly_lower = (c_idx.view(C, 1) > c_idx.view(1, C)).view(1, 1, C, C)
+    tril = (c_idx.view(C, 1) >= c_idx.view(1, C)).view(1, 1, 1, C, C)
 
-    # Build scalar transport kernels for S and Z inside each chunk:
-    # Ls[i,j] = prod_{u=j+1..i} r^s_u, Lz analogously, with causal masking.
-    ones = torch.ones((B, H, NC, C, C), device=W_write_s.device, dtype=compute_dtype)
-    As = torch.where(strictly_lower, retain_s.unsqueeze(-1).expand(B, H, NC, C, C), ones)
-    Az = torch.where(strictly_lower, retain_z.unsqueeze(-1).expand(B, H, NC, C, C), ones)
-    Ls = torch.cumprod(As, dim=3) * tril
-    Lz = torch.cumprod(Az, dim=3) * tril
-    ps = torch.cumprod(retain_s, dim=3)  # [B,H,NC,C]
-    pz = torch.cumprod(retain_z, dim=3)
-    # Cross-kernel from Z writes into S readout path:
-    # Ksz = Ls * diag(g^s) * Lz (implemented with broadcast + matmul).
-    Ksz = torch.matmul(Ls * gate_s.unsqueeze(-2), Lz)  # [B,H,NC,C,C]
-    # Prefix cross carry from chunk entry Z state to each local token.
-    k_pref = torch.matmul(Ls, (gate_s * pz).unsqueeze(-1)).squeeze(-1)  # [B,H,NC,C]
+    # Closed-loop step matrix per local token:
+    #   A_t = [[r_s - g*lambda, g*r_z], [-lambda, r_z]]
+    a11 = retain_s - gate_s * feedback_lambda
+    a12 = gate_s * retain_z
+    a21 = -feedback_lambda
+    a22 = retain_z
+    A_tokens = torch.stack(
+        [
+            torch.stack([a11, a12], dim=-1),
+            torch.stack([a21, a22], dim=-1),
+        ],
+        dim=-2,
+    )  # [B,H,NC,C,2,2]
 
-    # Slot overlap terms between read coefficients c_t and write coefficients W_t.
+    # Prefix transport P_i = A_i ... A_0 and its inverse Q_i = P_i^{-1}.
+    # Keep this part in fp32 for numerical robustness of 2x2 inversion.
+    P = B * H
+    P_pref_fp32 = _matrix_prefix_products(A_tokens.float().reshape(P * NC, C, 2, 2)).reshape(B, H, NC, C, 2, 2)
+    p11_fp32 = P_pref_fp32[..., 0, 0]
+    p12_fp32 = P_pref_fp32[..., 0, 1]
+    p21_fp32 = P_pref_fp32[..., 1, 0]
+    p22_fp32 = P_pref_fp32[..., 1, 1]
+
+    det = p11_fp32 * p22_fp32 - p12_fp32 * p21_fp32
+    det_sign = torch.where(det >= 0, torch.ones_like(det), -torch.ones_like(det))
+    det_safe = torch.where(det.abs() < 1e-6, det_sign * 1e-6, det)
+    q11_fp32 = p22_fp32 / det_safe
+    q12_fp32 = -p12_fp32 / det_safe
+    q21_fp32 = -p21_fp32 / det_safe
+    q22_fp32 = p11_fp32 / det_safe
+
+    p11 = p11_fp32.to(compute_dtype)
+    p12 = p12_fp32.to(compute_dtype)
+    p21 = p21_fp32.to(compute_dtype)
+    p22 = p22_fp32.to(compute_dtype)
+    q11 = q11_fp32.to(compute_dtype)
+    q12 = q12_fp32.to(compute_dtype)
+    q21 = q21_fp32.to(compute_dtype)
+    q22 = q22_fp32.to(compute_dtype)
+
+    # Semiseparable column factors for the S read kernel:
+    #   K_s[i,j] = Phi11[i,j] = p11_i*q11_j + p12_i*q21_j
+    #   K_z[i,j] = Phi11[i,j]*g_j + Phi12[i,j]
+    alpha = q11
+    beta = q21
+    gamma = q11 * gate_s + q12
+    delta = q21 * gate_s + q22
+
     Rs = torch.einsum("bhnim,bhnjm->bhnij", read, write_s)
     Rz = torch.einsum("bhnim,bhnjm->bhnij", read, write_z)
-    # In-chunk contribution using only local writes/values within this chunk.
-    Y_diag = torch.einsum("bhnij,bhnij,bhnjd->bhnid", Rs, Ls, value_s) + torch.einsum("bhnij,bhnij,bhnjd->bhnid", Rz, Ksz, value_z)
 
-    # Chunk summaries for boundary-state scan.
-    # End-of-chunk summaries define an affine map from chunk-entry states:
-    #   Z_out = pz_end * Z_in + Bz_end
-    #   S_out = ps_end * S_in + k_end * Z_in + Bs_end
-    Ls_end = Ls[..., -1, :]  # [B,H,NC,C]
-    Lz_end = Lz[..., -1, :]
-    Ksz_end = Ksz[..., -1, :]
-    Bs_end = torch.einsum("bhnj,bhnjm,bhnjd->bhnmd", Ls_end, write_s, value_s) + torch.einsum(
-        "bhnj,bhnjm,bhnjd->bhnmd", Ksz_end, write_z, value_z
+    Ms1 = Rs * alpha.unsqueeze(-2) * tril
+    Ms2 = Rs * beta.unsqueeze(-2) * tril
+    Mz1 = Rz * gamma.unsqueeze(-2) * tril
+    Mz2 = Rz * delta.unsqueeze(-2) * tril
+
+    T1 = torch.einsum("bhnij,bhnjd->bhnid", Ms1, value_s) + torch.einsum("bhnij,bhnjd->bhnid", Mz1, value_z)
+    T2 = torch.einsum("bhnij,bhnjd->bhnid", Ms2, value_s) + torch.einsum("bhnij,bhnjd->bhnid", Mz2, value_z)
+    Y_diag = p11.unsqueeze(-1) * T1 + p12.unsqueeze(-1) * T2
+
+    # Chunk summaries: X_end = A_chunk X_in + B_chunk where X=[S;Z].
+    Pend = P_pref_fp32[..., -1, :, :].to(compute_dtype)  # [B,H,NC,2,2]
+    e11 = Pend[..., 0, 0]
+    e12 = Pend[..., 0, 1]
+    e21 = Pend[..., 1, 0]
+    e22 = Pend[..., 1, 1]
+
+    k_send = e11.unsqueeze(-1) * q11 + e12.unsqueeze(-1) * q21
+    k_zend = e11.unsqueeze(-1) * gamma + e12.unsqueeze(-1) * delta
+    l_send = e21.unsqueeze(-1) * q11 + e22.unsqueeze(-1) * q21
+    l_zend = e21.unsqueeze(-1) * gamma + e22.unsqueeze(-1) * delta
+
+    Bs_end = torch.einsum("bhnj,bhnjm,bhnjd->bhnmd", k_send, write_s, value_s) + torch.einsum(
+        "bhnj,bhnjm,bhnjd->bhnmd", k_zend, write_z, value_z
     )
-    Bz_end = torch.einsum("bhnj,bhnjm,bhnjd->bhnmd", Lz_end, write_z, value_z)
-    ps_end = ps[..., -1]  # [B,H,NC]
-    pz_end = pz[..., -1]
-    k_end = k_pref[..., -1]
+    Bz_end = torch.einsum("bhnj,bhnjm,bhnjd->bhnmd", l_send, write_s, value_s) + torch.einsum(
+        "bhnj,bhnjm,bhnjd->bhnmd", l_zend, write_z, value_z
+    )
 
-    # Flatten [B,H] so we can reuse the scalar chunkwise affine scan helper.
-    P = B * H
+    A_chunk = Pend.reshape(P, NC, 2, 2)
     Sdim = M * D
-    z_init = torch.zeros((P, Sdim), device=W_write_s.device, dtype=compute_dtype)
-    # Z chunk-entry state for every chunk.
-    z_start_flat, _ = _chunkwise_affine_state_scan(
-        pz_end.reshape(P, NC, 1).expand(P, NC, Sdim),
-        Bz_end.reshape(P, NC, Sdim),
-        initial_state=z_init,
-    )
-    z_start = z_start_flat.reshape(B, H, NC, M, D)
+    B_chunk = torch.stack([Bs_end.reshape(P, NC, Sdim), Bz_end.reshape(P, NC, Sdim)], dim=2)
+    X_init = torch.zeros((P, 2, Sdim), device=W_write_s.device, dtype=compute_dtype)
+    X_start_flat, _ = _chunkwise_affine_state_scan_matrix(A_chunk, B_chunk, initial_state=X_init)
+    s_start = X_start_flat[:, :, 0, :].reshape(B, H, NC, M, D)
+    z_start = X_start_flat[:, :, 1, :].reshape(B, H, NC, M, D)
 
-    # Given Z chunk-entry states, build S affine bias and scan S chunk-entry states.
-    s_bias = (k_end.unsqueeze(-1).unsqueeze(-1) * z_start + Bs_end).reshape(P, NC, Sdim)
-    s_start_flat, _ = _chunkwise_affine_state_scan(
-        ps_end.reshape(P, NC, 1).expand(P, NC, Sdim),
-        s_bias,
-        initial_state=z_init,
-    )
-    s_start = s_start_flat.reshape(B, H, NC, M, D)
-
-    # Off-chunk contribution from chunk-entry S/Z states into each local token.
     Y_off = (
-        ps.unsqueeze(-1) * torch.einsum("bhncm,bhnmd->bhncd", read, s_start)
-        + k_pref.unsqueeze(-1) * torch.einsum("bhncm,bhnmd->bhncd", read, z_start)
+        p11.unsqueeze(-1) * torch.einsum("bhncm,bhnmd->bhncd", read, s_start)
+        + p12.unsqueeze(-1) * torch.einsum("bhncm,bhnmd->bhncd", read, z_start)
     )
     Y = Y_diag + Y_off
     Y = Y.reshape(B, H, padded_len, D).permute(0, 2, 1, 3).contiguous()
     Y = Y[:, :N].to(output_dtype)
-    _check_finite("flare_autoregressive_experimental_aux_pytorch.Y", Y)
+    _check_finite("flare_autoregressive_experimental_pytorch_mode_2.Y", Y)
     return Y
 
 
+flare_autoregressive_experimental_aux_pytorch = flare_autoregressive_experimental_pytorch_mode_1
+
+
 __all__ = [
-    "flare_autoregressive_experimental_aux_pytorch",
     "flare_autoregressive_experimental_pytorch",
+    "flare_autoregressive_experimental_pytorch_mode_1",
+    "flare_autoregressive_experimental_pytorch_mode_2",
+    "flare_autoregressive_experimental_aux_pytorch",
 ]
