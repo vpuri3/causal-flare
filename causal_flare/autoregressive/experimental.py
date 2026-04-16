@@ -497,17 +497,19 @@ def flare_autoregressive_experimental_pytorch_mode_2(
     attention_mask: torch.Tensor | None = None,
     return_state: bool = False,
 ):
-    """Experimental FLARE scan with an auxiliary recurrent state and closed-loop feedback.
+    """Experimental FLARE scan with auxiliary feedback correction in output space.
 
-    Recurrence per head (all retains/gates/feedback are scalars per token/head):
+    Recurrence intent per head:
       Z_t = r^z_t * Z_{t-1} + (W^z_t ⊗ V^z_t) - λ_t * S_{t-1}
       S_t = r^s_t * S_{t-1} + (W^s_t ⊗ V^s_t) + g^s_t * Z_t
       y_t = c_t^T S_t
 
-    This implementation avoids token-step loops by:
-    1) building chunk-local dense kernels (Ls, Lz, Ksz) with shape [C, C],
-    2) evaluating in-chunk contributions with dense contractions,
-    3) propagating chunk boundary states with chunk-level affine scans.
+    Implementation note:
+      This mode reuses the stable dense-kernel machinery from mode_1 and injects an
+      explicit feedback correction term into y:
+        Δy ~ - C * L_{t,τ} * g_t * λ_t * (S-path contrib)
+      so we avoid fp64/inverse-heavy pairwise transport while preserving a
+      token-loop-free chunkwise path.
     """
     del eps
     if profile:
@@ -617,100 +619,73 @@ def flare_autoregressive_experimental_pytorch_mode_2(
     feedback_lambda = W_feedback_lambda.reshape(B, NC, C, H).permute(0, 3, 1, 2).contiguous()
 
     c_idx = torch.arange(C, device=W_write_s.device)
-    tril = (c_idx.view(C, 1) >= c_idx.view(1, C)).view(1, 1, 1, C, C)
+    tril = (c_idx.view(C, 1) >= c_idx.view(1, C)).view(1, 1, C, C)
+    strictly_lower = (c_idx.view(C, 1) > c_idx.view(1, C)).view(1, 1, C, C)
 
-    # Closed-loop step matrix per local token:
-    #   A_t = [[r_s - g*lambda, g*r_z], [-lambda, r_z]]
-    a11 = retain_s - gate_s * feedback_lambda
-    a12 = gate_s * retain_z
-    a21 = -feedback_lambda
-    a22 = retain_z
-    A_tokens = torch.stack(
-        [
-            torch.stack([a11, a12], dim=-1),
-            torch.stack([a21, a22], dim=-1),
-        ],
-        dim=-2,
-    )  # [B,H,NC,C,2,2]
+    ones = torch.ones((B, H, NC, C, C), device=W_write_s.device, dtype=compute_dtype)
+    As = torch.where(strictly_lower, retain_s.unsqueeze(-1).expand(B, H, NC, C, C), ones)
+    Az = torch.where(strictly_lower, retain_z.unsqueeze(-1).expand(B, H, NC, C, C), ones)
+    Ls = torch.cumprod(As, dim=3) * tril
+    Lz = torch.cumprod(Az, dim=3) * tril
+    ps = torch.cumprod(retain_s, dim=3)
+    pz = torch.cumprod(retain_z, dim=3)
 
-    # Prefix transport P_i = A_i ... A_0 and its inverse Q_i = P_i^{-1}.
-    # Keep this part in fp32 for numerical robustness of 2x2 inversion.
-    P = B * H
-    P_pref_fp32 = _matrix_prefix_products(A_tokens.float().reshape(P * NC, C, 2, 2)).reshape(B, H, NC, C, 2, 2)
-    p11_fp32 = P_pref_fp32[..., 0, 0]
-    p12_fp32 = P_pref_fp32[..., 0, 1]
-    p21_fp32 = P_pref_fp32[..., 1, 0]
-    p22_fp32 = P_pref_fp32[..., 1, 1]
-
-    det = p11_fp32 * p22_fp32 - p12_fp32 * p21_fp32
-    det_sign = torch.where(det >= 0, torch.ones_like(det), -torch.ones_like(det))
-    det_safe = torch.where(det.abs() < 1e-6, det_sign * 1e-6, det)
-    q11_fp32 = p22_fp32 / det_safe
-    q12_fp32 = -p12_fp32 / det_safe
-    q21_fp32 = -p21_fp32 / det_safe
-    q22_fp32 = p11_fp32 / det_safe
-
-    p11 = p11_fp32.to(compute_dtype)
-    p12 = p12_fp32.to(compute_dtype)
-    p21 = p21_fp32.to(compute_dtype)
-    p22 = p22_fp32.to(compute_dtype)
-    q11 = q11_fp32.to(compute_dtype)
-    q12 = q12_fp32.to(compute_dtype)
-    q21 = q21_fp32.to(compute_dtype)
-    q22 = q22_fp32.to(compute_dtype)
-
-    # Semiseparable column factors for the S read kernel:
-    #   K_s[i,j] = Phi11[i,j] = p11_i*q11_j + p12_i*q21_j
-    #   K_z[i,j] = Phi11[i,j]*g_j + Phi12[i,j]
-    alpha = q11
-    beta = q21
-    gamma = q11 * gate_s + q12
-    delta = q21 * gate_s + q22
+    # Baseline aux coupling (same dense structure as mode_1):
+    #   Ksz[t,τ] = sum_k Ls[t,k] * g[k] * Lz[k,τ]
+    Ksz = torch.matmul(Ls * gate_s.unsqueeze(-2), Lz)
+    k_pref = torch.matmul(Ls, (gate_s * pz).unsqueeze(-1)).squeeze(-1)
 
     Rs = torch.einsum("bhnim,bhnjm->bhnij", read, write_s)
     Rz = torch.einsum("bhnim,bhnjm->bhnij", read, write_z)
 
-    Ms1 = Rs * alpha.unsqueeze(-2) * tril
-    Ms2 = Rs * beta.unsqueeze(-2) * tril
-    Mz1 = Rz * gamma.unsqueeze(-2) * tril
-    Mz2 = Rz * delta.unsqueeze(-2) * tril
+    # S-path and Z-path in-chunk contributions.
+    Ys_diag = torch.einsum("bhnij,bhnij,bhnjd->bhnid", Rs, Ls, value_s)
+    Yz_diag = torch.einsum("bhnij,bhnij,bhnjd->bhnid", Rz, Ksz, value_z)
 
-    T1 = torch.einsum("bhnij,bhnjd->bhnid", Ms1, value_s) + torch.einsum("bhnij,bhnjd->bhnid", Mz1, value_z)
-    T2 = torch.einsum("bhnij,bhnjd->bhnid", Ms2, value_s) + torch.einsum("bhnij,bhnjd->bhnid", Mz2, value_z)
-    Y_diag = p11.unsqueeze(-1) * T1 + p12.unsqueeze(-1) * T2
-
-    # Chunk summaries: X_end = A_chunk X_in + B_chunk where X=[S;Z].
-    Pend = P_pref_fp32[..., -1, :, :].to(compute_dtype)  # [B,H,NC,2,2]
-    e11 = Pend[..., 0, 0]
-    e12 = Pend[..., 0, 1]
-    e21 = Pend[..., 1, 0]
-    e22 = Pend[..., 1, 1]
-
-    k_send = e11.unsqueeze(-1) * q11 + e12.unsqueeze(-1) * q21
-    k_zend = e11.unsqueeze(-1) * gamma + e12.unsqueeze(-1) * delta
-    l_send = e21.unsqueeze(-1) * q11 + e22.unsqueeze(-1) * q21
-    l_zend = e21.unsqueeze(-1) * gamma + e22.unsqueeze(-1) * delta
-
-    Bs_end = torch.einsum("bhnj,bhnjm,bhnjd->bhnmd", k_send, write_s, value_s) + torch.einsum(
-        "bhnj,bhnjm,bhnjd->bhnmd", k_zend, write_z, value_z
-    )
-    Bz_end = torch.einsum("bhnj,bhnjm,bhnjd->bhnmd", l_send, write_s, value_s) + torch.einsum(
-        "bhnj,bhnjm,bhnjd->bhnmd", l_zend, write_z, value_z
+    # Requested closed-loop correction in y:
+    #   Δy[t] = - sum_τ C[t,τ] * L[t,τ] * g[t] * lambda[t] * (S-write contribution at τ)
+    feedback_gl = gate_s * feedback_lambda  # [B,H,NC,C]
+    Ys_corr_diag = -torch.einsum(
+        "bhnij,bhnij,bhnjd->bhnid",
+        Rs,
+        Ls * feedback_gl.unsqueeze(-1),
+        value_s,
     )
 
-    A_chunk = Pend.reshape(P, NC, 2, 2)
+    Ls_end = Ls[..., -1, :]
+    Lz_end = Lz[..., -1, :]
+    Ksz_end = Ksz[..., -1, :]
+    Bs_end = torch.einsum("bhnj,bhnjm,bhnjd->bhnmd", Ls_end, write_s, value_s) + torch.einsum(
+        "bhnj,bhnjm,bhnjd->bhnmd", Ksz_end, write_z, value_z
+    )
+    Bz_end = torch.einsum("bhnj,bhnjm,bhnjd->bhnmd", Lz_end, write_z, value_z)
+    ps_end = ps[..., -1]
+    pz_end = pz[..., -1]
+    k_end = k_pref[..., -1]
+
+    P = B * H
     Sdim = M * D
-    B_chunk = torch.stack([Bs_end.reshape(P, NC, Sdim), Bz_end.reshape(P, NC, Sdim)], dim=2)
-    X_init = torch.zeros((P, 2, Sdim), device=W_write_s.device, dtype=compute_dtype)
-    X_start_flat, _ = _chunkwise_affine_state_scan_matrix(A_chunk, B_chunk, initial_state=X_init)
-    s_start = X_start_flat[:, :, 0, :].reshape(B, H, NC, M, D)
-    z_start = X_start_flat[:, :, 1, :].reshape(B, H, NC, M, D)
-
-    Y_off = (
-        p11.unsqueeze(-1) * torch.einsum("bhncm,bhnmd->bhncd", read, s_start)
-        + p12.unsqueeze(-1) * torch.einsum("bhncm,bhnmd->bhncd", read, z_start)
+    z_init = torch.zeros((P, Sdim), device=W_write_s.device, dtype=compute_dtype)
+    z_start_flat, _ = _chunkwise_affine_state_scan(
+        pz_end.reshape(P, NC, 1).expand(P, NC, Sdim),
+        Bz_end.reshape(P, NC, Sdim),
+        initial_state=z_init,
     )
-    Y = Y_diag + Y_off
+    z_start = z_start_flat.reshape(B, H, NC, M, D)
+    s_bias = (k_end.unsqueeze(-1).unsqueeze(-1) * z_start + Bs_end).reshape(P, NC, Sdim)
+    s_start_flat, _ = _chunkwise_affine_state_scan(
+        ps_end.reshape(P, NC, 1).expand(P, NC, Sdim),
+        s_bias,
+        initial_state=z_init,
+    )
+    s_start = s_start_flat.reshape(B, H, NC, M, D)
+
+    Ys_off = ps.unsqueeze(-1) * torch.einsum("bhncm,bhnmd->bhncd", read, s_start)
+    Yz_off = k_pref.unsqueeze(-1) * torch.einsum("bhncm,bhnmd->bhncd", read, z_start)
+    # Apply the same row-wise g*lambda correction on carried S-path output.
+    Ys_corr_off = -feedback_gl.unsqueeze(-1) * Ys_off
+
+    Y = Ys_diag + Yz_diag + Ys_off + Yz_off + Ys_corr_diag + Ys_corr_off
     Y = Y.reshape(B, H, padded_len, D).permute(0, 2, 1, 3).contiguous()
     Y = Y[:, :N].to(output_dtype)
     _check_finite("flare_autoregressive_experimental_pytorch_mode_2.Y", Y)
