@@ -10,6 +10,7 @@ from causal_flare.autoregressive.experimental_triton import (
     phase1_local_chunk_end_state_reference,
     phase1_local_chunk_end_state_triton_outline,
     phase3_dense_output_backward_kernel_profile,
+    phase3_dense_output_backward_reference,
     phase3_dense_output_reference,
     phase3_dense_output_triton_outline,
 )
@@ -303,28 +304,147 @@ def test_phase3_dense_output_reference_matches_naive(dtype: torch.dtype):
     torch.testing.assert_close(y_ref, y_naive, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase3 backward reference test requires CUDA")
+def test_phase3_dense_output_backward_reference_matches_autograd_targeted():
+    dtype = torch.float32
+    BH, NC, C_CHUNK, M, D = 1, 8, 64, 128, 64
+    C, W, V, log_alpha = _make_phase3_inputs(
+        seed=1302,
+        bh=BH,
+        nc=NC,
+        c=C_CHUNK,
+        m=M,
+        d=D,
+        dtype=dtype,
+    )
+    S0 = torch.randn(BH, NC, M * D, device=C.device, dtype=dtype)
+    grad_Y = torch.randn(BH, NC, C_CHUNK, D, device=C.device, dtype=dtype)
+
+    dC_ref, dW_ref, dV_ref, dlog_alpha_ref, dS0_ref = phase3_dense_output_backward_reference(
+        C,
+        W,
+        V,
+        log_alpha,
+        grad_Y,
+        S0,
+    )
+    assert dS0_ref is not None
+
+    C_ag = C.clone().detach().requires_grad_(True)
+    W_ag = W.clone().detach().requires_grad_(True)
+    V_ag = V.clone().detach().requires_grad_(True)
+    log_alpha_ag = log_alpha.clone().detach().requires_grad_(True)
+    S0_ag = S0.clone().detach().requires_grad_(True)
+    Y_ag = phase3_dense_output_reference(C_ag, W_ag, V_ag, log_alpha_ag, S0_ag)
+    loss_ag = (Y_ag * grad_Y).sum()
+    dC_ag, dW_ag, dV_ag, dlog_alpha_ag, dS0_ag = torch.autograd.grad(
+        loss_ag,
+        [C_ag, W_ag, V_ag, log_alpha_ag, S0_ag],
+    )
+
+    torch.testing.assert_close(dC_ref, dC_ag, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(dW_ref, dW_ag, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(dV_ref, dV_ag, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(dlog_alpha_ref, dlog_alpha_ag, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(dS0_ref.reshape(BH, NC, M * D), dS0_ag, rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.parametrize("dtype", _supported_dtypes())
 def test_phase3_chunk_dense_output_outline_matches_reference_forward(dtype: torch.dtype):
     c_tok, w_tok, v_tok, log_alpha_tok = _make_phase3_inputs(seed=1401, bh=2, nc=2, c=16, m=16, d=32, dtype=dtype)
     y_ref = phase3_dense_output_reference(c_tok, w_tok, v_tok, log_alpha_tok)
-    y_tri = phase3_dense_output_triton_outline(c_tok, w_tok, v_tok, log_alpha_tok)
+    input_precision = "ieee" if dtype == torch.float32 else "tf32"
+    y_tri = phase3_dense_output_triton_outline(
+        c_tok,
+        w_tok,
+        v_tok,
+        log_alpha_tok,
+        INPUT_PRECISION=input_precision,
+    )
     rtol, atol = _phase3_tol(dtype)
     torch.testing.assert_close(y_tri, y_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase3 backward triton test requires CUDA")
 @pytest.mark.parametrize("dtype", _supported_dtypes())
-def test_phase3_chunk_dense_output_outline_backward_is_not_implemented(dtype: torch.dtype):
+def test_phase3_chunk_dense_output_outline_backward_matches_reference(dtype: torch.dtype):
     c_tok, w_tok, v_tok, log_alpha_tok = _make_phase3_inputs(seed=1501, bh=1, nc=2, c=16, m=16, d=32, dtype=dtype)
+    s0 = torch.randn(1, 2, 16 * 32, device=c_tok.device, dtype=dtype)
+
+    c_ref = c_tok.clone().detach().requires_grad_(True)
+    w_ref = w_tok.clone().detach().requires_grad_(True)
+    v_ref = v_tok.clone().detach().requires_grad_(True)
+    log_alpha_ref = log_alpha_tok.clone().detach().requires_grad_(True)
+    s0_ref = s0.clone().detach().requires_grad_(True)
+    y_ref = phase3_dense_output_reference(c_ref, w_ref, v_ref, log_alpha_ref, s0_ref)
+    loss_ref = 0.37 * y_ref.square().mean() + 0.63 * y_ref.abs().mean()
+    loss_ref.backward()
 
     c_tri = c_tok.clone().detach().requires_grad_(True)
     w_tri = w_tok.clone().detach().requires_grad_(True)
     v_tri = v_tok.clone().detach().requires_grad_(True)
     log_alpha_tri = log_alpha_tok.clone().detach().requires_grad_(True)
-    y_tri = phase3_dense_output_triton_outline(c_tri, w_tri, v_tri, log_alpha_tri)
+    s0_tri = s0.clone().detach().requires_grad_(True)
+    input_precision = "ieee" if dtype == torch.float32 else "tf32"
+    y_tri = phase3_dense_output_triton_outline(
+        c_tri,
+        w_tri,
+        v_tri,
+        log_alpha_tri,
+        s0_tri,
+        INPUT_PRECISION=input_precision,
+    )
     loss_tri = 0.37 * y_tri.square().mean() + 0.63 * y_tri.abs().mean()
-    with pytest.raises(NotImplementedError, match="Dense-output Triton backward has been reset"):
-        loss_tri.backward()
+    loss_tri.backward()
+
+    rtol, atol = _phase3_tol(dtype)
+    torch.testing.assert_close(c_tri.grad, c_ref.grad, rtol=rtol, atol=atol)
+    torch.testing.assert_close(w_tri.grad, w_ref.grad, rtol=rtol, atol=atol)
+    torch.testing.assert_close(v_tri.grad, v_ref.grad, rtol=rtol, atol=atol)
+    rtol_r, atol_r = _phase3_r_grad_tol(dtype)
+    torch.testing.assert_close(log_alpha_tri.grad, log_alpha_ref.grad, rtol=rtol_r, atol=atol_r)
+    torch.testing.assert_close(s0_tri.grad, s0_ref.grad, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase3 backward targeted test requires CUDA")
+def test_phase3_chunk_dense_output_outline_backward_matches_reference_targeted_c64():
+    dtype = torch.float32
+    bh, nc, c, m, d = 1, 8, 64, 128, 64
+    c_tok, w_tok, v_tok, log_alpha_tok = _make_phase3_inputs(seed=1511, bh=bh, nc=nc, c=c, m=m, d=d, dtype=dtype)
+    s0 = torch.randn(bh, nc, m * d, device=c_tok.device, dtype=dtype)
+    grad_y = torch.randn(bh, nc, c, d, device=c_tok.device, dtype=dtype)
+
+    dC_ref, dW_ref, dV_ref, dlog_alpha_ref, dS0_ref = phase3_dense_output_backward_reference(
+        c_tok,
+        w_tok,
+        v_tok,
+        log_alpha_tok,
+        grad_y,
+        s0,
+    )
+    assert dS0_ref is not None
+
+    c_tri = c_tok.clone().detach().requires_grad_(True)
+    w_tri = w_tok.clone().detach().requires_grad_(True)
+    v_tri = v_tok.clone().detach().requires_grad_(True)
+    log_alpha_tri = log_alpha_tok.clone().detach().requires_grad_(True)
+    s0_tri = s0.clone().detach().requires_grad_(True)
+    y_tri = phase3_dense_output_triton_outline(
+        c_tri,
+        w_tri,
+        v_tri,
+        log_alpha_tri,
+        s0_tri,
+        INPUT_PRECISION="ieee",
+    )
+    loss_tri = (y_tri * grad_y).sum()
+    loss_tri.backward()
+
+    torch.testing.assert_close(c_tri.grad, dC_ref, rtol=1e-4, atol=5e-4)
+    torch.testing.assert_close(w_tri.grad, dW_ref, rtol=1e-4, atol=5e-4)
+    torch.testing.assert_close(v_tri.grad, dV_ref, rtol=1e-4, atol=5e-4)
+    torch.testing.assert_close(log_alpha_tri.grad, dlog_alpha_ref, rtol=1e-4, atol=5e-4)
+    torch.testing.assert_close(s0_tri.grad, dS0_ref.reshape(bh, nc, m * d), rtol=1e-4, atol=5e-4)
 
 
 @pytest.mark.skip(reason="Phase3 finite-difference test removed: unsupported M/D grid for current kernel contract.")
@@ -333,13 +453,14 @@ def test_phase3_chunk_dense_output_finite_difference_is_not_implemented():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase3 backward profile smoke requires CUDA")
-def test_phase3_chunk_dense_output_backward_profile_is_not_implemented_cuda():
+def test_phase3_chunk_dense_output_backward_profile_smoke_cuda():
     dtype = torch.float32
     c_tok, w_tok, v_tok, log_alpha_tok = _make_phase3_inputs(seed=1651, bh=1, nc=1, c=16, m=16, d=32, dtype=dtype)
     grad_y = torch.randn_like(v_tok)
-
-    with pytest.raises(NotImplementedError, match="backward profiling is unavailable"):
-        phase3_dense_output_backward_kernel_profile(c_tok, w_tok, v_tok, log_alpha_tok, grad_y)
+    s0 = torch.randn(1, 1, 16 * 32, device=c_tok.device, dtype=dtype)
+    profile = phase3_dense_output_backward_kernel_profile(c_tok, w_tok, v_tok, log_alpha_tok, grad_y, s0)
+    assert "total_ms" in profile
+    assert profile["total_ms"] > 0.0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase0 invalid-C contract requires CUDA")
@@ -497,7 +618,13 @@ def test_phase123_full_parallel_scan_triton_outline_matches_reference_forward():
         c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone(), CHUNK_SIZE=64
     )
     y_tri, final_tri = phase123_full_parallel_scan_triton_outline(
-        c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone(), CHUNK_SIZE=64
+        c.clone(),
+        w.clone(),
+        v.clone(),
+        log_alpha.clone(),
+        initial_state=init.clone(),
+        CHUNK_SIZE=64,
+        INPUT_PRECISION="ieee",
     )
 
     rtol_y, atol_y = 1e-4, 1e-4
