@@ -171,12 +171,14 @@ def test_phase1_local_chunk_end_state_reference_matches_token_loop(dtype: torch.
 
     bh, nc, c, m = w.shape
     d = v.shape[-1]
-    alpha = torch.exp(log_alpha)
-    s_ref_md = torch.zeros((bh, nc, m, d), device=w.device, dtype=w.dtype)
+    alpha = torch.exp(log_alpha.float())
+    s_ref_md = torch.zeros((bh, nc, m, d), device=w.device, dtype=torch.float32)
+    w_f = w.float()
+    v_f = v.float()
     for t in range(c):
         s_ref_md = (
             alpha[:, :, t].unsqueeze(-1).unsqueeze(-1) * s_ref_md
-            + w[:, :, t, :].unsqueeze(-1) * v[:, :, t, :].unsqueeze(-2)
+            + w_f[:, :, t, :].unsqueeze(-1) * v_f[:, :, t, :].unsqueeze(-2)
         )
     s_ref = s_ref_md.reshape(bh, nc, m * d)
     r_ref = torch.exp(torch.sum(log_alpha, dim=2))
@@ -491,8 +493,12 @@ def test_phase123_full_parallel_scan_triton_outline_matches_reference_forward():
     c, w, v, log_alpha = _make_phase123_inputs(seed=2026, b=b, n=111, h=h, m=m, d=d, dtype=dtype)
     init = torch.randn(b, h, m * d, device=c.device, dtype=dtype)
 
-    y_ref, final_ref = phase123_full_parallel_scan_reference(c, w, v, log_alpha, initial_state=init, CHUNK_SIZE=64)
-    y_tri, final_tri = phase123_full_parallel_scan_triton_outline(c, w, v, log_alpha, initial_state=init, CHUNK_SIZE=64)
+    y_ref, final_ref = phase123_full_parallel_scan_reference(
+        c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone(), CHUNK_SIZE=64
+    )
+    y_tri, final_tri = phase123_full_parallel_scan_triton_outline(
+        c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone(), CHUNK_SIZE=64
+    )
 
     rtol_y, atol_y = 1e-4, 1e-4
     rtol_s, atol_s = _tol(dtype)
@@ -506,8 +512,12 @@ def test_phase123_full_parallel_scan_reference_matches_token_loop_oracle():
     c, w, v, log_alpha = _make_phase123_inputs(seed=3026, b=b, n=97, h=h, m=m, d=d, dtype=dtype)
     init = torch.randn(b, h, m * d, device=c.device, dtype=dtype)
 
-    y_ref, final_ref = phase123_full_parallel_scan_reference(c, w, v, log_alpha, initial_state=init, CHUNK_SIZE=64)
-    y_oracle, final_oracle = phase123_full_token_loop_oracle(c, w, v, log_alpha, initial_state=init)
+    y_ref, final_ref = phase123_full_parallel_scan_reference(
+        c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone(), CHUNK_SIZE=64
+    )
+    y_oracle, final_oracle = phase123_full_token_loop_oracle(
+        c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone()
+    )
 
     rtol_y, atol_y = 1e-4, 1e-4
     rtol_s, atol_s = _tol(dtype)
