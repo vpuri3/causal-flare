@@ -15,6 +15,7 @@ _SUPPORTED_M_VALUES = {16, 32, 64, 128}
 _SUPPORTED_D_VALUES = {32, 64, 128}
 _SUPPORTED_PHASE1_BLOCK_T_VALUES = {16, 32, 64}
 _EXPERIMENTAL_TRITON_ALLOCATOR_SET = False
+_INV_LN2 = 1.4426950408889634
 
 # Phase-3 backward tuning knobs (C is compile-time; tune M/D tiles and launch).
 _PHASE3_BWD_BLOCK_M = 64
@@ -76,6 +77,11 @@ def _require_chunk_size_multiple_of_16(c_size: int, *, where: str) -> None:
 def _require_nc_descriptor_width(nc_size: int, *, where: str) -> None:
     if nc_size < 8:
         raise NotImplementedError(f"{where} requires NC >= 8 for descriptor vector width; got NC={nc_size}.")
+
+
+def _require_nc_multiple_of_16(nc_size: int, *, where: str) -> None:
+    if nc_size % 16 != 0:
+        raise NotImplementedError(f"{where} requires NC to be a multiple of 16; got NC={nc_size}.")
 
 
 def _require_nonpositive_log_alpha(log_alpha: torch.Tensor, *, where: str) -> None:
@@ -152,7 +158,7 @@ def phase1_local_chunk_end_state_reference(
     _require_supported_md(M, D, where="phase1_local_chunk_end_state_reference")
     _require_nonpositive_log_alpha(log_alpha, where="phase1_local_chunk_end_state_reference")
     log_alpha_f = log_alpha.float()
-    alpha = torch.exp(log_alpha_f)
+    alpha = torch.exp2(log_alpha_f * _INV_LN2)
     W_f = W.float()
     V_f = V.float()
 
@@ -331,11 +337,11 @@ def phase3_dense_output_reference(
     log_p = torch.cumsum(log_alpha_f, dim=-1)
     L = torch.where(
         tril,
-        torch.exp(log_p[..., :, None] - log_p[..., None, :]),
+        torch.exp2((log_p[..., :, None] - log_p[..., None, :]) * _INV_LN2),
         torch.zeros((BH, NC, C_CHUNK, C_CHUNK), device=C.device, dtype=torch.float32),
     )
 
-    p = torch.exp(log_p).to(torch.float32).unsqueeze(-1)
+    p = torch.exp2(log_p * _INV_LN2).to(torch.float32).unsqueeze(-1)
     Y_off = p * torch.matmul(C_f, S0_md)
 
     K = (L * (C_f @ W_f.mT)).to(torch.float32)
@@ -437,10 +443,10 @@ def phase3_dense_output_backward_reference(
     tril = (c_idx.view(C_CHUNK, 1) >= c_idx.view(1, C_CHUNK)).view(1, 1, C_CHUNK, C_CHUNK)
 
     log_p = torch.cumsum(log_alpha_f, dim=-1)
-    p = torch.exp(log_p)
+    p = torch.exp2(log_p * _INV_LN2)
     L = torch.where(
         tril,
-        torch.exp(log_p[..., :, None] - log_p[..., None, :]),
+        torch.exp2((log_p[..., :, None] - log_p[..., None, :]) * _INV_LN2),
         torch.zeros((BH, NC, C_CHUNK, C_CHUNK), device=C.device, dtype=torch.float32),
     )
     R = C_f @ W_f.mT
@@ -561,7 +567,8 @@ def _phase123_prepare_unchunked_inputs(
         .reshape(B * H, NC_data, CHUNK_SIZE)
     )
 
-    NC_exec = max(NC_data, 8)
+    NC_exec = max(NC_data, 16)
+    NC_exec = triton.cdiv(NC_exec, 16) * 16
     if NC_exec > NC_data:
         pad_chunks = NC_exec - NC_data
         z_c = torch.zeros((B * H, pad_chunks, CHUNK_SIZE, M), device=C.device, dtype=C.dtype)
@@ -664,7 +671,7 @@ def phase123_full_parallel_scan_reference(
     # PHASE 1 local chunk end-state
     # =========================================
     S_local_end = phase1_local_chunk_end_state_reference(W_chunk, V_chunk, log_alpha_chunk)
-    alpha_chunk = torch.exp(torch.sum(log_alpha_chunk, dim=-1))
+    alpha_chunk = torch.exp2(torch.sum(log_alpha_chunk, dim=-1) * _INV_LN2)
 
     # =========================================
     # PHASE 2 prefix scan over chunks
@@ -746,7 +753,7 @@ def phase123_full_token_loop_oracle(
     if S.dtype != C.dtype:
         raise ValueError("initial_state must share dtype with C/W/V/log_alpha.")
 
-    alpha = torch.exp(log_alpha)
+    alpha = torch.exp2(log_alpha * _INV_LN2)
     ys = []
     for t in range(N):
         S = (
@@ -875,8 +882,9 @@ def phase1_local_chunk_end_state_fwd_kernel(
         block_shape=[1, 1, BLOCK_M, BLOCK_D],
     )
     log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
+    INV_LN2 = 1.4426950408889634
     log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
-    r_factors = tl.exp(log_suffix_incl - log_alpha_vals)
+    r_factors = tl.exp2((log_suffix_incl - log_alpha_vals) * INV_LN2)
 
     S = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
     offs_t_full = tl.arange(0, BLOCK_C)
@@ -979,8 +987,9 @@ def phase1_local_chunk_end_state_bwd_dw_chunk_kernel(
     )
 
     log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
+    INV_LN2 = 1.4426950408889634
     log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
-    factors = tl.exp(log_suffix_incl - log_alpha_vals)
+    factors = tl.exp2((log_suffix_incl - log_alpha_vals) * INV_LN2)
 
     m_start = pid_m_tile * BLOCK_M
     acc = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
@@ -1095,8 +1104,9 @@ def phase1_local_chunk_end_state_bwd_dv_b_chunk_kernel(
     )
 
     log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
+    INV_LN2 = 1.4426950408889634
     log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
-    factors = tl.exp(log_suffix_incl - log_alpha_vals)
+    factors = tl.exp2((log_suffix_incl - log_alpha_vals) * INV_LN2)
 
     d_start = pid_d_tile * BLOCK_D
     acc = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
@@ -1177,9 +1187,10 @@ def phase1_local_chunk_end_state_bwd_dr_kernel(
     log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,))
     b_vals_in = tl.reshape(b_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,))
     log_alpha_f = log_alpha_vals.to(tl.float32)
+    INV_LN2 = 1.4426950408889634
     b_vals = b_vals_in.to(tl.float32)
     log_suffix_incl = tl.cumsum(log_alpha_f, axis=0, reverse=True)
-    factors = tl.exp(log_suffix_incl - log_alpha_f)
+    factors = tl.exp2((log_suffix_incl - log_alpha_f) * INV_LN2)
     g_vals = b_vals * factors
     prefix_incl = tl.cumsum(g_vals, axis=0)
     grad_vec = prefix_incl - g_vals
@@ -1549,7 +1560,8 @@ def phase3_dense_output_fwd_kernel(
     row_idx = offs_c[:, None]
     col_idx = offs_c[None, :]
     valid = col_idx <= row_idx
-    L = tl.where(valid, tl.exp(log_p_incl[:, None] - log_p_incl[None, :]), 0.0)
+    INV_LN2 = 1.4426950408889634
+    L = tl.where(valid, tl.exp2((log_p_incl[:, None] - log_p_incl[None, :]) * INV_LN2), 0.0)
 
     # Step 2: build dense score matrix R = C @ W^T.
     R = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
@@ -1575,7 +1587,7 @@ def phase3_dense_output_fwd_kernel(
         C_blk = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
         S0_blk = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
         Y_off_base += tl.dot(C_blk, S0_blk, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    p = tl.exp(log_p_incl)
+    p = tl.exp2(log_p_incl * INV_LN2)
     Y_off = p[:, None] * Y_off_base
     Y = Y_diag + Y_off
 
@@ -1708,7 +1720,8 @@ def phase3_dense_output_bwd_a1_kernel(
     row_idx = offs_c[:, None]
     col_idx = offs_c[None, :]
     valid = col_idx <= row_idx
-    L = tl.where(valid, tl.exp(log_p_incl[:, None] - log_p_incl[None, :]), 0.0)
+    INV_LN2 = 1.4426950408889634
+    L = tl.where(valid, tl.exp2((log_p_incl[:, None] - log_p_incl[None, :]) * INV_LN2), 0.0)
 
     R = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
@@ -1850,7 +1863,8 @@ def phase3_dense_output_bwd_a2_kernel(
     row_idx = offs_c[:, None]
     col_idx = offs_c[None, :]
     valid = col_idx <= row_idx
-    L = tl.where(valid, tl.exp(log_p_incl[:, None] - log_p_incl[None, :]), 0.0)
+    INV_LN2 = 1.4426950408889634
+    L = tl.where(valid, tl.exp2((log_p_incl[:, None] - log_p_incl[None, :]) * INV_LN2), 0.0)
 
     dK = tl.reshape(dk_desc.load([BH_IDX, NC_IDX, 0, 0]), (BLOCK_C, BLOCK_C)).to(tl.float32)
     dR = dK * L
@@ -1950,7 +1964,8 @@ def phase3_dense_output_bwd_off_dc_kernel(
 
     log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
     log_p = tl.cumsum(log_alpha_vals, axis=0)
-    p = tl.exp(log_p)
+    INV_LN2 = 1.4426950408889634
+    p = tl.exp2(log_p * INV_LN2)
 
     dC_off = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
     for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
@@ -2034,7 +2049,8 @@ def phase3_dense_output_bwd_off_ds0_kernel(
 
     log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
     log_p = tl.cumsum(log_alpha_vals, axis=0)
-    p = tl.exp(log_p)
+    INV_LN2 = 1.4426950408889634
+    p = tl.exp2(log_p * INV_LN2)
 
     C_tile = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
     G_tile = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
@@ -2225,7 +2241,7 @@ def phase3_dense_output_backward_kernel_profile(
             raise ValueError("S0 shape mismatch.")
         has_s0 = True
         log_p = torch.cumsum(log_alpha.float(), dim=-1)
-        y_off_saved = (torch.exp(log_p).unsqueeze(-1) * torch.matmul(C.float(), S0_md.float())).to(C.dtype).contiguous()
+        y_off_saved = (torch.exp2(log_p * _INV_LN2).unsqueeze(-1) * torch.matmul(C.float(), S0_md.float())).to(C.dtype).contiguous()
 
     BLOCK_M = min(_PHASE3_BWD_BLOCK_M, M) if BLOCK_M is None else BLOCK_M
     BLOCK_D = min(_PHASE3_BWD_BLOCK_D, D) if BLOCK_D is None else BLOCK_D
@@ -2898,7 +2914,7 @@ _PHASE2_PREFIX_SCAN_FWD_CONFIGS = [
 @triton.jit
 def phase2_prefix_scan_fwd_kernel(
     s_local_ptr,
-    r_chunk_ptr,
+    log_alpha_chunk_ptr,
     init_ptr,
     out_prefix_ptr,
     out_final_ptr,
@@ -2908,8 +2924,8 @@ def phase2_prefix_scan_fwd_kernel(
     stride_s_local_bh,
     stride_s_local_nc,
     stride_s_local_md,
-    stride_r_chunk_bh,
-    stride_r_chunk_nc,
+    stride_log_alpha_chunk_bh,
+    stride_log_alpha_chunk_nc,
     stride_init_bh,
     stride_init_md,
     stride_out_prefix_bh,
@@ -2917,42 +2933,41 @@ def phase2_prefix_scan_fwd_kernel(
     stride_out_prefix_md,
     stride_out_final_bh,
     stride_out_final_md,
-    BLOCK_MD: tl.constexpr,
     BLOCK_NC: tl.constexpr,
+    BLOCK_MD: tl.constexpr,
     NC_STATIC: tl.constexpr,
+    USE_FP32_COMPUTE: tl.constexpr,
+    USE_BF16_COMPUTE: tl.constexpr,
 ):
-    """Mode-0 forward prefix scan in one kernel.
+    """Single-kernel dense blocked phase-2 forward.
 
-    Per `(BH, MD)` lane:
-      S_scan <- init[BH, MD]
+    One program owns one `BH` lane and loops over chunk blocks then MD tiles:
+      1) Form local block prefixes in log space.
+      2) Build direct strict-lower carry matrix for this block:
+           L0[i,j] = 1_{j<i} * exp(log_p_excl[i] - log_p_incl[j]).
+      3) Compute block chunk-start states:
+           S0_block = L0 @ S_loc + p[:, None] * S_in[None, :].
+      3) Store `S0_block`, update carry:
+           S_in <- alpha_last * S0_block_last + S_local_block_last
+      4) Repeat for next block.
 
-      for c in [0, NC):
-        out_prefix[BH, c, MD] <- S_scan                    # exclusive prefix
-        S_scan <- alpha_chunk[BH, c] * S_scan + s_local[BH, c, MD]
-
-      out_final[BH, MD] <- S_scan
-
-    This avoids materializing `[BH, NC, MD]` broadcasted retain tensors and uses
-    scalar `alpha_chunk[BH, c]` directly.
+    After loop:
+      out_final = S_in
     """
     pid_bh = tl.program_id(0)
-    pid_md_tile = tl.program_id(1)
     if pid_bh >= bh_size:
         return
-
-    offs_md = pid_md_tile * BLOCK_MD + tl.arange(0, BLOCK_MD)
-    mask_md = offs_md < md_size
 
     s_local_desc = tl.make_tensor_descriptor(
         s_local_ptr,
         shape=[bh_size, nc_size, md_size],
         strides=[stride_s_local_bh, stride_s_local_nc, stride_s_local_md],
-        block_shape=[1, 1, BLOCK_MD],
+        block_shape=[1, BLOCK_NC, BLOCK_MD],
     )
-    r_chunk_desc = tl.make_tensor_descriptor(
-        r_chunk_ptr,
+    log_alpha_chunk_desc = tl.make_tensor_descriptor(
+        log_alpha_chunk_ptr,
         shape=[bh_size, nc_size],
-        strides=[stride_r_chunk_bh, stride_r_chunk_nc],
+        strides=[stride_log_alpha_chunk_bh, stride_log_alpha_chunk_nc],
         block_shape=[1, BLOCK_NC],
     )
     init_desc = tl.make_tensor_descriptor(
@@ -2965,7 +2980,7 @@ def phase2_prefix_scan_fwd_kernel(
         out_prefix_ptr,
         shape=[bh_size, nc_size, md_size],
         strides=[stride_out_prefix_bh, stride_out_prefix_nc, stride_out_prefix_md],
-        block_shape=[1, 1, BLOCK_MD],
+        block_shape=[1, BLOCK_NC, BLOCK_MD],
     )
     out_final_desc = tl.make_tensor_descriptor(
         out_final_ptr,
@@ -2974,18 +2989,57 @@ def phase2_prefix_scan_fwd_kernel(
         block_shape=[1, BLOCK_MD],
     )
 
-    init_vec = tl.reshape(init_desc.load([pid_bh, pid_md_tile * BLOCK_MD]), (BLOCK_MD,))
-    S_scan = init_vec.to(tl.float32)
-    r_vals = tl.reshape(r_chunk_desc.load([pid_bh, 0]), (BLOCK_NC,)).to(tl.float32)
-    offs_nc = tl.arange(0, BLOCK_NC)
+    INV_LN2 = 1.4426950408889634
+    offs_blk = tl.arange(0, BLOCK_NC)
+    row_ids = tl.expand_dims(offs_blk, axis=1)
+    col_ids = tl.expand_dims(offs_blk, axis=0)
+    l0_mask = row_ids > col_ids
+    last_mask = offs_blk == (BLOCK_NC - 1)
 
-    for c in tl.static_range(0, NC_STATIC):
-        out_prefix_desc.store([pid_bh, c, pid_md_tile * BLOCK_MD], tl.reshape(S_scan, (1, 1, BLOCK_MD)))
-        r = tl.sum(tl.where(offs_nc == c, r_vals, 0.0), axis=0)
-        s_local = tl.reshape(s_local_desc.load([pid_bh, c, pid_md_tile * BLOCK_MD]), (BLOCK_MD,)).to(tl.float32)
-        S_scan = r * S_scan + s_local
+    for c0 in tl.static_range(0, NC_STATIC, BLOCK_NC):
+        # L-related block math (prefixes and scaling vectors) computed once per NC block.
+        log_alpha_blk = tl.reshape(log_alpha_chunk_desc.load([pid_bh, c0]), (BLOCK_NC,)).to(tl.float32)
+        log_alpha_blk_l2 = log_alpha_blk * INV_LN2
+        log_p_incl_l2 = tl.cumsum(log_alpha_blk_l2, axis=0)
+        log_p_excl_l2 = log_p_incl_l2 - log_alpha_blk_l2
+        p = tl.exp2(log_p_excl_l2)
+        alpha_last = tl.exp2(tl.sum(tl.where(last_mask, log_alpha_blk_l2, 0.0), axis=0))
+        l0_log2 = tl.expand_dims(log_p_excl_l2, axis=1) - tl.expand_dims(log_p_incl_l2, axis=0)
+        l0_f32 = tl.where(l0_mask, tl.exp2(l0_log2), 0.0)
+        if USE_FP32_COMPUTE:
+            l0_tc = l0_f32
+        else:
+            if USE_BF16_COMPUTE:
+                l0_tc = l0_f32.to(tl.bfloat16)
+            else:
+                l0_tc = l0_f32.to(tl.float16)
 
-    out_final_desc.store([pid_bh, pid_md_tile * BLOCK_MD], tl.reshape(S_scan, (1, BLOCK_MD)))
+        md0 = 0
+        while md0 < md_size:
+            if c0 == 0:
+                S_in = tl.reshape(init_desc.load([pid_bh, md0]), (BLOCK_MD,)).to(tl.float32)
+            else:
+                S_in = tl.reshape(out_final_desc.load([pid_bh, md0]), (BLOCK_MD,)).to(tl.float32)
+
+            s_tile_f32 = tl.reshape(s_local_desc.load([pid_bh, c0, md0]), (BLOCK_NC, BLOCK_MD)).to(tl.float32)
+            if USE_FP32_COMPUTE:
+                y0 = tl.dot(l0_tc, s_tile_f32, out_dtype=tl.float32, input_precision="ieee")
+            else:
+                if USE_BF16_COMPUTE:
+                    s_tile_tc = s_tile_f32.to(tl.bfloat16)
+                else:
+                    s_tile_tc = s_tile_f32.to(tl.float16)
+                y0 = tl.dot(l0_tc, s_tile_tc, out_dtype=tl.float32, input_precision="tf32")
+
+            acc = y0 + tl.expand_dims(p, axis=1) * tl.expand_dims(S_in, axis=0)
+
+            out_prefix_desc.store([pid_bh, c0, md0], tl.reshape(acc, (1, BLOCK_NC, BLOCK_MD)))
+
+            s0_last = tl.sum(tl.where(tl.expand_dims(last_mask, axis=1), acc, 0.0), axis=0)
+            s_local_last = tl.sum(tl.where(tl.expand_dims(last_mask, axis=1), s_tile_f32, 0.0), axis=0)
+            S_next = alpha_last * s0_last + s_local_last
+            out_final_desc.store([pid_bh, md0], tl.reshape(S_next, (1, BLOCK_MD)))
+            md0 += BLOCK_MD
 
 
 _PHASE2_PREFIX_SCAN_BWD_CONFIGS = [
@@ -2998,18 +3052,17 @@ _PHASE2_PREFIX_SCAN_BWD_CONFIGS = [
 
 @triton.autotune(configs=_PHASE2_PREFIX_SCAN_BWD_CONFIGS, key=["md_size", "nc_size"])
 @triton.jit
-def phase2_prefix_scan_bwd_kernel(
+def phase2_prefix_scan_bwd_dense_kernel(
     grad_prefix_ptr,
     grad_final_ptr,
     chunk_start_ptr,
-    r_chunk_ptr,
+    log_alpha_chunk_ptr,
     d_s_local_ptr,
-    d_r_partials_ptr,
+    d_log_alpha_ptr,
     d_init_ptr,
     bh_size,
     nc_size,
     md_size,
-    n_tiles_size,
     stride_grad_prefix_bh,
     stride_grad_prefix_nc,
     stride_grad_prefix_md,
@@ -3018,52 +3071,51 @@ def phase2_prefix_scan_bwd_kernel(
     stride_chunk_start_bh,
     stride_chunk_start_nc,
     stride_chunk_start_md,
-    stride_r_chunk_bh,
-    stride_r_chunk_nc,
+    stride_log_alpha_chunk_bh,
+    stride_log_alpha_chunk_nc,
     stride_d_s_local_bh,
     stride_d_s_local_nc,
     stride_d_s_local_md,
-    stride_d_r_partials_bh,
-    stride_d_r_partials_nc,
-    stride_d_r_partials_tile,
-    stride_d_r_partials_vec,
+    stride_d_log_alpha_bh,
+    stride_d_log_alpha_nc,
     stride_d_init_bh,
     stride_d_init_md,
     BLOCK_MD: tl.constexpr,
     BLOCK_NC: tl.constexpr,
+    NC_STATIC: tl.constexpr,
+    USE_FP32_COMPUTE: tl.constexpr,
+    USE_BF16_COMPUTE: tl.constexpr,
 ):
-    """Reverse-mode for mode-0 prefix scan.
+    """Dense blocked reverse pass for phase-2 prefix scan.
 
-    Forward per `(BH, MD)` lane:
-      S_{c+1} = alpha_chunk[c] * S_c + S_local_end[c]
-      y_c = S_c
+    Recurrence in chunk index c:
+      S_{c+1} = alpha[c] * S_c + S_local[c]
+      y_start[c] = S_c
       y_final = S_NC
 
-    Backward:
-      Let g_c = dL/dy_c and g_final = dL/dy_final.
-      Start g_next = g_final, then for c from NC-1 downto 0:
+    Reverse recurrence:
+      lambda_NC = g_final
+      lambda_c  = g_start[c] + alpha[c] * lambda_{c+1}
+      dS_local[c] = lambda_{c+1}
+      dalpha[c]   = sum_md(lambda_{c+1} * S_c)
+      dlog_alpha[c] = dalpha[c] * alpha[c]
 
-        dS_local_end[c] += g_next
-        dr_chunk[c]     += sum_md(g_next * S_c)
-        g_prev           = g_c + alpha_chunk[c] * g_next
-        g_next           = g_prev
-
-      dinit = g_next at loop end.
-
-    This kernel computes MD-tile partials for `dr_chunk`; host-side code reduces
-    partials across MD tiles after kernel launch.
+    Kernel structure mirrors forward:
+      - one program per BH lane
+      - static loop over NC blocks in reverse order
+      - inner loop over MD tiles
+      - per block uses dense strict-lower carry matrix in reversed chunk order:
+          lambda_next_rev = L0_rev @ g_rev + p_rev * lambda_in
     """
     pid_bh = tl.program_id(0)
-    pid_md_tile = tl.program_id(1)
     if pid_bh >= bh_size:
         return
 
-    offs_md = pid_md_tile * BLOCK_MD + tl.arange(0, BLOCK_MD)
     grad_prefix_desc = tl.make_tensor_descriptor(
         grad_prefix_ptr,
         shape=[bh_size, nc_size, md_size],
         strides=[stride_grad_prefix_bh, stride_grad_prefix_nc, stride_grad_prefix_md],
-        block_shape=[1, 1, BLOCK_MD],
+        block_shape=[1, BLOCK_NC, BLOCK_MD],
     )
     grad_final_desc = tl.make_tensor_descriptor(
         grad_final_ptr,
@@ -3075,25 +3127,25 @@ def phase2_prefix_scan_bwd_kernel(
         chunk_start_ptr,
         shape=[bh_size, nc_size, md_size],
         strides=[stride_chunk_start_bh, stride_chunk_start_nc, stride_chunk_start_md],
-        block_shape=[1, 1, BLOCK_MD],
+        block_shape=[1, BLOCK_NC, BLOCK_MD],
     )
-    r_chunk_desc = tl.make_tensor_descriptor(
-        r_chunk_ptr,
+    log_alpha_chunk_desc = tl.make_tensor_descriptor(
+        log_alpha_chunk_ptr,
         shape=[bh_size, nc_size],
-        strides=[stride_r_chunk_bh, stride_r_chunk_nc],
+        strides=[stride_log_alpha_chunk_bh, stride_log_alpha_chunk_nc],
         block_shape=[1, BLOCK_NC],
     )
     d_s_local_desc = tl.make_tensor_descriptor(
         d_s_local_ptr,
         shape=[bh_size, nc_size, md_size],
         strides=[stride_d_s_local_bh, stride_d_s_local_nc, stride_d_s_local_md],
-        block_shape=[1, 1, BLOCK_MD],
+        block_shape=[1, BLOCK_NC, BLOCK_MD],
     )
-    d_r_partials_desc = tl.make_tensor_descriptor(
-        d_r_partials_ptr,
-        shape=[bh_size, nc_size, n_tiles_size, 4],
-        strides=[stride_d_r_partials_bh, stride_d_r_partials_nc, stride_d_r_partials_tile, stride_d_r_partials_vec],
-        block_shape=[1, BLOCK_NC, 1, 4],
+    d_log_alpha_desc = tl.make_tensor_descriptor(
+        d_log_alpha_ptr,
+        shape=[bh_size, nc_size],
+        strides=[stride_d_log_alpha_bh, stride_d_log_alpha_nc],
+        block_shape=[1, BLOCK_NC],
     )
     d_init_desc = tl.make_tensor_descriptor(
         d_init_ptr,
@@ -3102,55 +3154,93 @@ def phase2_prefix_scan_bwd_kernel(
         block_shape=[1, BLOCK_MD],
     )
 
-    grad_final_vec = tl.reshape(grad_final_desc.load([pid_bh, pid_md_tile * BLOCK_MD]), (BLOCK_MD,))
-    g_next = grad_final_vec.to(tl.float32)
-    r_vals = tl.reshape(r_chunk_desc.load([pid_bh, 0]), (BLOCK_NC,)).to(tl.float32)
+    INV_LN2 = 1.4426950408889634
     offs_nc = tl.arange(0, BLOCK_NC)
-    dr_partials = tl.zeros((BLOCK_NC,), dtype=tl.float32)
+    row_ids = tl.expand_dims(offs_nc, axis=1)
+    col_ids = tl.expand_dims(offs_nc, axis=0)
+    l0_mask = row_ids > col_ids
+    last_mask = offs_nc == (BLOCK_NC - 1)
 
-    c = nc_size
-    while c > 0:
-        c = c - 1
+    for blk in tl.static_range(0, NC_STATIC // BLOCK_NC):
+        c0 = NC_STATIC - (blk + 1) * BLOCK_NC
 
-        # dS_local_end[c, md] = g_next[md]
-        d_s_local_desc.store([pid_bh, c, pid_md_tile * BLOCK_MD], tl.reshape(g_next.to(grad_final_vec.dtype), (1, 1, BLOCK_MD)))
+        log_alpha_blk = tl.reshape(log_alpha_chunk_desc.load([pid_bh, c0]), (BLOCK_NC,)).to(tl.float32)
+        log_alpha_blk_l2 = log_alpha_blk * INV_LN2
+        log_alpha_rev_l2 = tl.flip(log_alpha_blk_l2, 0)
+        log_p_incl_rev_l2 = tl.cumsum(log_alpha_rev_l2, axis=0)
+        log_p_excl_rev_l2 = log_p_incl_rev_l2 - log_alpha_rev_l2
+        p_rev = tl.exp2(log_p_excl_rev_l2)
+        alpha_last_rev = tl.exp2(tl.sum(tl.where(last_mask, log_alpha_rev_l2, 0.0), axis=0))
 
-        # dr_chunk[c] partial reduction over MD tile.
-        S_c = tl.reshape(chunk_start_desc.load([pid_bh, c, pid_md_tile * BLOCK_MD]), (BLOCK_MD,)).to(tl.float32)
-        dr_partial = tl.sum(g_next * S_c, axis=0)
-        c_mask = offs_nc == c
-        dr_partials += tl.where(c_mask, dr_partial, 0.0)
+        l0_log2 = tl.expand_dims(log_p_excl_rev_l2, axis=1) - tl.expand_dims(log_p_incl_rev_l2, axis=0)
+        l0_f32 = tl.where(l0_mask, tl.exp2(l0_log2), 0.0)
+        if USE_FP32_COMPUTE:
+            l0_tc = l0_f32
+        else:
+            if USE_BF16_COMPUTE:
+                l0_tc = l0_f32.to(tl.bfloat16)
+            else:
+                l0_tc = l0_f32.to(tl.float16)
 
-        # g_prev = g_c + r_c * g_next
-        g_c = tl.reshape(grad_prefix_desc.load([pid_bh, c, pid_md_tile * BLOCK_MD]), (BLOCK_MD,)).to(tl.float32)
-        r_c = tl.sum(tl.where(c_mask, r_vals, 0.0), axis=0)
-        g_next = g_c + r_c * g_next
+        dlog_block = tl.zeros((BLOCK_NC,), dtype=tl.float32)
+        md0 = 0
+        while md0 < md_size:
+            if blk == 0:
+                lambda_in = tl.reshape(grad_final_desc.load([pid_bh, md0]), (BLOCK_MD,)).to(tl.float32)
+            else:
+                lambda_in = tl.reshape(d_init_desc.load([pid_bh, md0]), (BLOCK_MD,)).to(tl.float32)
 
-    dr_block = tl.expand_dims(dr_partials, axis=1) + tl.zeros((BLOCK_NC, 4), dtype=tl.float32)
-    d_r_partials_desc.store([pid_bh, 0, pid_md_tile, 0], tl.reshape(dr_block, (1, BLOCK_NC, 1, 4)))
-    d_init_desc.store([pid_bh, pid_md_tile * BLOCK_MD], tl.reshape(g_next.to(grad_final_vec.dtype), (1, BLOCK_MD)))
+            g_block = tl.reshape(grad_prefix_desc.load([pid_bh, c0, md0]), (BLOCK_NC, BLOCK_MD)).to(tl.float32)
+            g_rev = tl.flip(g_block, 0)
+
+            if USE_FP32_COMPUTE:
+                y0 = tl.dot(l0_tc, g_rev, out_dtype=tl.float32, input_precision="ieee")
+            else:
+                if USE_BF16_COMPUTE:
+                    g_rev_tc = g_rev.to(tl.bfloat16)
+                else:
+                    g_rev_tc = g_rev.to(tl.float16)
+                y0 = tl.dot(l0_tc, g_rev_tc, out_dtype=tl.float32, input_precision="tf32")
+
+            lambda_next_rev = y0 + tl.expand_dims(p_rev, axis=1) * tl.expand_dims(lambda_in, axis=0)
+            lambda_next = tl.flip(lambda_next_rev, 0)
+            d_s_local_desc.store([pid_bh, c0, md0], tl.reshape(lambda_next, (1, BLOCK_NC, BLOCK_MD)))
+
+            s_block = tl.reshape(chunk_start_desc.load([pid_bh, c0, md0]), (BLOCK_NC, BLOCK_MD)).to(tl.float32)
+            dlog_block += tl.sum(lambda_next * s_block, axis=1)
+
+            lambda_start_last = tl.sum(tl.where(tl.expand_dims(last_mask, axis=1), lambda_next_rev, 0.0), axis=0)
+            g_last_rev = tl.sum(tl.where(tl.expand_dims(last_mask, axis=1), g_rev, 0.0), axis=0)
+            lambda_out = alpha_last_rev * lambda_start_last + g_last_rev
+            d_init_desc.store([pid_bh, md0], tl.reshape(lambda_out, (1, BLOCK_MD)))
+            md0 += BLOCK_MD
+
+        alpha_blk = tl.exp2(log_alpha_blk_l2)
+        dlog_out = dlog_block * alpha_blk
+        d_log_alpha_desc.store([pid_bh, c0], tl.reshape(dlog_out, (1, BLOCK_NC)))
 
 
 # ==================================================================================================
 # PHASE 2 AUTOGRAD
 # ==================================================================================================
 class Phase2PrefixScanTrition(torch.autograd.Function):
-    """Autograd contour for mode-0 chunk-prefix scan (scalar chunk retain).
+    """Autograd contour for mode-0 chunk-prefix scan (log-domain chunk retain).
 
     Forward:
       Inputs:
         S_local_end : [BH, NC, MD] (or [BHG, NC, MD])
-        alpha_chunk     : [BH, NC] (or [BHG, NC])
+        log_alpha_chunk : [BH, NC] (or [BHG, NC])
         init   : [BH, MD] (or [BHG, MD])
       Outputs:
         chunk_start : [BH, NC, MD] (or [BHG, NC, MD])
         final_state : [BH, MD] (or [BHG, MD])
 
-      Equations per `(BH, MD)` lane:
-        S_end[c] = alpha_chunk[c] * S_start[c] + S_local_end[c]
-        S_start[0] = init
-        chunk_start[c] = S_start[c]
-        final_state = S_end[NC-1]
+      Dense blocked formulation:
+        log_prefix_excl[c] = sum_{u=0..c-1} log_alpha_chunk[u]
+        log_prefix_incl[c] = log_prefix_excl[c] + log_alpha_chunk[c]
+        L0[i,j]            = 1_{j<i} * exp(log_prefix_excl[i] - log_prefix_incl[j])
+        chunk_start        = L0 @ S_local_end + exp(log_prefix_excl)[:, None] * init
+        final_state        = exp(log_alpha_chunk[last]) * chunk_start[last] + S_local_end[last]
 
     Backward (high level):
       Let upstream grads be:
@@ -3173,78 +3263,102 @@ class Phase2PrefixScanTrition(torch.autograd.Function):
 
     Kernel plan:
       - FWD:
-        one kernel over `(BH, MD-tile)` that loops over chunks and emits
-        exclusive chunk-prefix states plus final state.
+        one kernel over `(BH, MD-tile)` with static loop over chunk blocks;
+        forms strict-lower `L` on-the-fly, emits `chunk_start`, carries `S_in`,
+        and writes `final_state` at loop end.
       - BWD:
-        a) reverse scan kernel for adjoint S accumulation over chunk axis;
-        b) local grad kernel for `dr_chunk`, `dS_local_end`, and `dinit`.
+        one dense blocked reverse kernel over `BH`:
+        a) rebuild reversed-block carry `L0_rev` in log space;
+        b) compute `lambda_next_rev = L0_rev @ g_rev + p_rev * lambda_in`;
+        c) emit `dS_local_end`, accumulate `dlog_alpha`, and update `dinit`.
     """
 
     @staticmethod
     def forward(
         ctx,
         S_local_end: torch.Tensor,
-        alpha_chunk: torch.Tensor,
+        log_alpha_chunk: torch.Tensor,
         initial_state: torch.Tensor,
+        compute_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Shape / contract checks.
-        if S_local_end.ndim != 3 or alpha_chunk.ndim != 2 or initial_state.ndim != 2:
+        if S_local_end.ndim != 3 or log_alpha_chunk.ndim != 2 or initial_state.ndim != 2:
             raise ValueError(
                 "Phase2PrefixScanTrition.forward expects "
-                "S_local_end=[BH,NC,MD], alpha_chunk=[BH,NC], initial_state=[BH,MD]. "
-                f"Got S_local_end={tuple(S_local_end.shape)}, alpha_chunk={tuple(alpha_chunk.shape)}, "
+                "S_local_end=[BH,NC,MD], log_alpha_chunk=[BH,NC], initial_state=[BH,MD]. "
+                f"Got S_local_end={tuple(S_local_end.shape)}, log_alpha_chunk={tuple(log_alpha_chunk.shape)}, "
                 f"initial_state={tuple(initial_state.shape)}."
             )
         BH, NC, MD = S_local_end.shape
-        if alpha_chunk.shape != (BH, NC):
-            raise ValueError(f"alpha_chunk must be [BH,NC]. Got {tuple(alpha_chunk.shape)} vs ({BH}, {NC}).")
+        if log_alpha_chunk.shape != (BH, NC):
+            raise ValueError(f"log_alpha_chunk must be [BH,NC]. Got {tuple(log_alpha_chunk.shape)} vs ({BH}, {NC}).")
         if initial_state.shape != (BH, MD):
             raise ValueError(f"initial_state must be [BH,MD]. Got {tuple(initial_state.shape)} vs ({BH}, {MD}).")
-        if S_local_end.device != alpha_chunk.device or S_local_end.device != initial_state.device:
-            raise ValueError("S_local_end, alpha_chunk, and initial_state must be on the same device.")
+        if S_local_end.device != log_alpha_chunk.device or S_local_end.device != initial_state.device:
+            raise ValueError("S_local_end, log_alpha_chunk, and initial_state must be on the same device.")
         if NC == 0:
             raise NotImplementedError("Phase2PrefixScanTrition.forward does not support NC==0.")
         _require_nc_descriptor_width(NC, where="Phase2PrefixScanTrition.forward")
+        _require_nc_multiple_of_16(NC, where="Phase2PrefixScanTrition.forward")
         if not S_local_end.is_cuda:
             raise NotImplementedError("Phase2PrefixScanTrition.forward requires CUDA tensors.")
         _ensure_triton_allocator()
 
-        S_local_end_f = S_local_end.float().contiguous()
-        alpha_chunk_f = alpha_chunk.float().contiguous()
-        initial_state_f = initial_state.float().contiguous()
+        if compute_dtype is None:
+            compute_dtype = torch.float32
+        if compute_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise NotImplementedError(
+                "Phase2PrefixScanTrition.forward supports compute_dtype in "
+                "{torch.float16, torch.bfloat16, torch.float32}. "
+                f"Got compute_dtype={compute_dtype}."
+            )
+
+        S_local_end_in = S_local_end if S_local_end.is_contiguous() else S_local_end.contiguous()
+        if log_alpha_chunk.dtype == torch.float32 and log_alpha_chunk.is_contiguous():
+            log_alpha_chunk_f = log_alpha_chunk
+        else:
+            log_alpha_chunk_f = log_alpha_chunk.float().contiguous()
+        if initial_state.dtype == torch.float32 and initial_state.is_contiguous():
+            initial_state_f = initial_state
+        else:
+            initial_state_f = initial_state.float().contiguous()
 
         chunk_start = torch.empty((BH, NC, MD), device=S_local_end.device, dtype=torch.float32)
         final_state = torch.empty((BH, MD), device=S_local_end.device, dtype=torch.float32)
-        block_nc = NC
 
-        grid = lambda META: (BH, triton.cdiv(MD, META["BLOCK_MD"]))
-        phase2_prefix_scan_fwd_kernel[grid](
-            S_local_end_f,
-            alpha_chunk_f,
+        block_nc = 32 if (NC >= 32 and NC % 32 == 0) else 16
+        grid_fwd = lambda META: (BH,)
+        phase2_prefix_scan_fwd_kernel[grid_fwd](
+            S_local_end_in,
+            log_alpha_chunk_f,
             initial_state_f,
             chunk_start,
             final_state,
             BH,
             NC,
             MD,
-            *S_local_end_f.stride(),
-            *alpha_chunk_f.stride(),
+            *S_local_end_in.stride(),
+            *log_alpha_chunk_f.stride(),
             *initial_state_f.stride(),
             *chunk_start.stride(),
             *final_state.stride(),
-            BLOCK_NC=block_nc,
             NC_STATIC=NC,
+            BLOCK_NC=block_nc,
+            USE_FP32_COMPUTE=(compute_dtype == torch.float32),
+            USE_BF16_COMPUTE=(compute_dtype == torch.bfloat16),
         )
-        ctx.save_for_backward(S_local_end_f, alpha_chunk_f, initial_state_f, chunk_start, final_state)
+
+        ctx.save_for_backward(log_alpha_chunk_f, chunk_start)
         ctx.s_local_dtype = S_local_end.dtype
-        ctx.alpha_dtype = alpha_chunk.dtype
+        ctx.log_alpha_dtype = log_alpha_chunk.dtype
         ctx.init_dtype = initial_state.dtype
+        ctx.phase2_use_fp32_compute = compute_dtype == torch.float32
+        ctx.phase2_use_bf16_compute = compute_dtype == torch.bfloat16
         return chunk_start, final_state
 
     @staticmethod
     def backward(ctx, grad_chunk_start: torch.Tensor, grad_final_state: torch.Tensor):
-        S_local_end, alpha_chunk, initial_state, chunk_start, _ = ctx.saved_tensors
-        del initial_state
+        log_alpha_chunk, chunk_start = ctx.saved_tensors
 
         if grad_chunk_start.shape != chunk_start.shape:
             raise ValueError(
@@ -3260,61 +3374,53 @@ class Phase2PrefixScanTrition(torch.autograd.Function):
         if NC == 0:
             raise NotImplementedError("Phase2PrefixScanTrition.backward does not support NC==0.")
         _require_nc_descriptor_width(NC, where="Phase2PrefixScanTrition.backward")
+        _require_nc_multiple_of_16(NC, where="Phase2PrefixScanTrition.backward")
         if not chunk_start.is_cuda:
             raise NotImplementedError("Phase2PrefixScanTrition.backward requires CUDA tensors.")
         _ensure_triton_allocator()
 
         grad_chunk_start_f = grad_chunk_start.float().contiguous()
         grad_final_state_f = grad_final_state.float().contiguous()
+        d_s_local_f32 = torch.empty((BH, NC, MD), device=chunk_start.device, dtype=torch.float32)
+        d_log_alpha_f32 = torch.empty((BH, NC), device=chunk_start.device, dtype=torch.float32)
+        d_init_f32 = torch.empty((BH, MD), device=chunk_start.device, dtype=torch.float32)
+        block_nc = 32 if (NC >= 32 and NC % 32 == 0) else 16
 
-        d_s_local = torch.empty_like(S_local_end)
-        n_tiles_max = triton.cdiv(MD, 64)
-        d_alpha_partials = torch.zeros((BH, NC, n_tiles_max, 4), device=chunk_start.device, dtype=torch.float32)
-        d_init = torch.empty((BH, MD), device=chunk_start.device, dtype=torch.float32)
-        block_nc = NC
-
-        grid = lambda META: (BH, triton.cdiv(MD, META["BLOCK_MD"]))
-        phase2_prefix_scan_bwd_kernel[grid](
+        grid_bwd = lambda META: (BH,)
+        phase2_prefix_scan_bwd_dense_kernel[grid_bwd](
             grad_chunk_start_f,
             grad_final_state_f,
             chunk_start,
-            alpha_chunk,
-            d_s_local,
-            d_alpha_partials,
-            d_init,
+            log_alpha_chunk,
+            d_s_local_f32,
+            d_log_alpha_f32,
+            d_init_f32,
             BH,
             NC,
             MD,
-            n_tiles_max,
             *grad_chunk_start_f.stride(),
             *grad_final_state_f.stride(),
             *chunk_start.stride(),
-            *alpha_chunk.stride(),
-            *d_s_local.stride(),
-            *d_alpha_partials.stride(),
-            *d_init.stride(),
+            *log_alpha_chunk.stride(),
+            *d_s_local_f32.stride(),
+            *d_log_alpha_f32.stride(),
+            *d_init_f32.stride(),
             BLOCK_NC=block_nc,
+            NC_STATIC=NC,
+            USE_FP32_COMPUTE=ctx.phase2_use_fp32_compute,
+            USE_BF16_COMPUTE=ctx.phase2_use_bf16_compute,
         )
-
-        best_cfg = getattr(phase2_prefix_scan_bwd_kernel, "best_config", None)
-        d_alpha_partials_reduced = d_alpha_partials[..., 0]
-        if best_cfg is not None and "BLOCK_MD" in best_cfg.kwargs:
-            n_tiles_active = triton.cdiv(MD, int(best_cfg.kwargs["BLOCK_MD"]))
-            d_alpha_accum = d_alpha_partials_reduced[:, :, :n_tiles_active].sum(dim=-1)
-        else:
-            # Fallback path should be rare; keep correctness if best_config is unavailable.
-            d_alpha_accum = d_alpha_partials_reduced.sum(dim=-1)
-        d_alpha = d_alpha_accum.to(ctx.alpha_dtype)
-        return d_s_local.to(ctx.s_local_dtype), d_alpha, d_init.to(ctx.init_dtype)
+        return d_s_local_f32.to(ctx.s_local_dtype), d_log_alpha_f32.to(ctx.log_alpha_dtype), d_init_f32.to(ctx.init_dtype), None
 
 
 def phase2_prefix_scan_triton_outline(
     S_local_end: torch.Tensor,
-    alpha_chunk: torch.Tensor,
+    log_alpha_chunk: torch.Tensor,
     initial_state: torch.Tensor,
+    compute_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """High-level entry point for the chunk-prefix state scan path."""
-    return Phase2PrefixScanTrition.apply(S_local_end, alpha_chunk, initial_state)
+    return Phase2PrefixScanTrition.apply(S_local_end, log_alpha_chunk, initial_state, compute_dtype)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -3362,12 +3468,17 @@ def phase123_full_parallel_scan_trition(
         log_alpha_chunk,
         BLOCK_T=PHASE1_BLOCK_T,
     )
-    alpha_chunk = torch.exp(torch.sum(log_alpha_chunk, dim=-1))
 
     # =========================================
     # PHASE 2 prefix scan over chunks
     # =========================================
-    S0_chunk, S1_chunk = phase2_prefix_scan_triton_outline(S_local_end, alpha_chunk, init_flat)
+    log_alpha_per_chunk = torch.sum(log_alpha_chunk.float(), dim=-1)
+    S0_chunk, S1_chunk = phase2_prefix_scan_triton_outline(
+        S_local_end,
+        log_alpha_per_chunk,
+        init_flat,
+        compute_dtype=V_chunk.dtype,
+    )
 
     # =========================================
     # PHASE 3 dense chunk-local output

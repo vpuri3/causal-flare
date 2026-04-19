@@ -156,9 +156,10 @@ def _make_phase123_inputs(
     ],
 )
 def test_phase1_chunkwise_affine_state_scan_outline_forward_matches_reference(m: int, d: int, dtype: torch.dtype):
-    S_local_end, r_chunk, init = _make_inputs(seed=11 + m + d, bh=2, nc=8, m=m, d=d, dtype=dtype)
+    S_local_end, r_chunk, init = _make_inputs(seed=11 + m + d, bh=2, nc=16, m=m, d=d, dtype=dtype)
     start_ref, final_ref = phase2_prefix_scan_reference(S_local_end, r_chunk, init)
-    start, final = phase2_prefix_scan_triton_outline(S_local_end, r_chunk, init)
+    log_alpha_chunk = torch.log(r_chunk.float()).to(r_chunk.dtype)
+    start, final = phase2_prefix_scan_triton_outline(S_local_end, log_alpha_chunk, init)
     rtol, atol = _tol(dtype)
     torch.testing.assert_close(start, start_ref, rtol=rtol, atol=atol)
     torch.testing.assert_close(final, final_ref, rtol=rtol, atol=atol)
@@ -493,19 +494,19 @@ def test_phase0_chunk_end_state_kernel_matches_reference_static_c(dtype: torch.d
 @pytest.mark.parametrize("dtype", _supported_dtypes())
 @pytest.mark.parametrize(("m", "d"), [(16, 32), (32, 64), (128, 32)])
 def test_phase1_chunkwise_affine_state_scan_outline_backward_matches_reference(m: int, d: int, dtype: torch.dtype):
-    S_local_end, r_chunk, init = _make_inputs(seed=17 + m + d, bh=2, nc=8, m=m, d=d, dtype=dtype)
+    S_local_end, r_chunk, init = _make_inputs(seed=17 + m + d, bh=2, nc=16, m=m, d=d, dtype=dtype)
 
     S_local_end_ref = S_local_end.clone().detach().requires_grad_(True)
-    r_chunk_ref = r_chunk.clone().detach().requires_grad_(True)
+    log_alpha_chunk_ref = torch.log(r_chunk.float()).to(r_chunk.dtype).clone().detach().requires_grad_(True)
     init_ref = init.clone().detach().requires_grad_(True)
-    start_ref, final_ref = phase2_prefix_scan_reference(S_local_end_ref, r_chunk_ref, init_ref)
+    start_ref, final_ref = phase2_prefix_scan_reference(S_local_end_ref, torch.exp(log_alpha_chunk_ref), init_ref)
     loss_ref = 0.37 * start_ref.square().mean() + 0.63 * final_ref.abs().mean()
     loss_ref.backward()
 
     S_local_end_tri = S_local_end.clone().detach().requires_grad_(True)
-    r_chunk_tri = r_chunk.clone().detach().requires_grad_(True)
+    log_alpha_chunk_tri = torch.log(r_chunk.float()).to(r_chunk.dtype).clone().detach().requires_grad_(True)
     init_tri = init.clone().detach().requires_grad_(True)
-    start_tri, final_tri = phase2_prefix_scan_triton_outline(S_local_end_tri, r_chunk_tri, init_tri)
+    start_tri, final_tri = phase2_prefix_scan_triton_outline(S_local_end_tri, log_alpha_chunk_tri, init_tri)
     loss_tri = 0.37 * start_tri.square().mean() + 0.63 * final_tri.abs().mean()
     loss_tri.backward()
 
@@ -513,7 +514,7 @@ def test_phase1_chunkwise_affine_state_scan_outline_backward_matches_reference(m
     torch.testing.assert_close(S_local_end_tri.grad, S_local_end_ref.grad, rtol=rtol, atol=atol)
     torch.testing.assert_close(init_tri.grad, init_ref.grad, rtol=rtol, atol=atol)
     r_rtol, r_atol = _r_grad_tol(dtype)
-    torch.testing.assert_close(r_chunk_tri.grad, r_chunk_ref.grad, rtol=r_rtol, atol=r_atol)
+    torch.testing.assert_close(log_alpha_chunk_tri.grad, log_alpha_chunk_ref.grad, rtol=r_rtol, atol=r_atol)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase1 finite-difference test requires CUDA")
@@ -532,22 +533,26 @@ def test_phase1_chunkwise_affine_state_scan_finite_difference_gradients():
     g_final = torch.randn(bh, md, device=device, dtype=dtype)
 
     s = s_local.clone().detach().requires_grad_(True)
-    r = r_chunk.clone().detach().requires_grad_(True)
+    log_alpha = torch.log(r_chunk.float()).to(r_chunk.dtype).clone().detach().requires_grad_(True)
     i = init.clone().detach().requires_grad_(True)
-    start, final = phase2_prefix_scan_triton_outline(s, r, i)
+    start, final = phase2_prefix_scan_triton_outline(s, log_alpha, i)
     loss = (start * g_start).sum() + (final * g_final).sum()
     loss.backward()
 
     def f_s(x):
-        start_, final_ = phase2_prefix_scan_triton_outline(x, r_chunk, init)
+        start_, final_ = phase2_prefix_scan_triton_outline(x, torch.log(r_chunk.float()).to(r_chunk.dtype), init)
         return (start_ * g_start).sum() + (final_ * g_final).sum()
 
     def f_r(x):
-        start_, final_ = phase2_prefix_scan_triton_outline(s_local, x, init)
+        start_, final_ = phase2_prefix_scan_triton_outline(s_local, torch.log(x.float()).to(x.dtype), init)
         return (start_ * g_start).sum() + (final_ * g_final).sum()
 
     def f_i(x):
-        start_, final_ = phase2_prefix_scan_triton_outline(s_local, r_chunk, x)
+        start_, final_ = phase2_prefix_scan_triton_outline(
+            s_local,
+            torch.log(r_chunk.float()).to(r_chunk.dtype),
+            x,
+        )
         return (start_ * g_start).sum() + (final_ * g_final).sum()
 
     d_s_fd = _finite_difference_grad(f_s, s_local, eps=1e-3)
@@ -555,7 +560,7 @@ def test_phase1_chunkwise_affine_state_scan_finite_difference_gradients():
     d_i_fd = _finite_difference_grad(f_i, init, eps=1e-3)
 
     torch.testing.assert_close(s.grad, d_s_fd, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(r.grad, d_r_fd, rtol=3e-2, atol=3e-2)
+    torch.testing.assert_close(log_alpha.grad, d_r_fd * r_chunk, rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(i.grad, d_i_fd, rtol=2e-2, atol=2e-2)
 
 
@@ -563,7 +568,8 @@ def test_phase1_chunkwise_affine_state_scan_finite_difference_gradients():
 def test_phase1_chunkwise_affine_state_scan_small_benchmark_cuda():
     # Small benchmark smoke to ensure timing path remains functional.
     dtype = torch.float16
-    S_local_end, r_chunk, init = _make_inputs(seed=123, bh=16, nc=8, m=16, d=32, dtype=dtype)
+    S_local_end, r_chunk, init = _make_inputs(seed=123, bh=16, nc=16, m=16, d=32, dtype=dtype)
+    log_alpha_chunk = torch.log(r_chunk.float()).to(r_chunk.dtype)
 
     def _time_forward(fn, iters: int = 10):
         for _ in range(3):
@@ -599,9 +605,9 @@ def test_phase1_chunkwise_affine_state_scan_small_benchmark_cuda():
         torch.cuda.synchronize()
         return t0.elapsed_time(t1) / iters
 
-    tri_fwd = _time_forward(lambda: phase2_prefix_scan_triton_outline(S_local_end, r_chunk, init))
+    tri_fwd = _time_forward(lambda: phase2_prefix_scan_triton_outline(S_local_end, log_alpha_chunk, init))
     ref_fwd = _time_forward(lambda: phase2_prefix_scan_reference(S_local_end, r_chunk, init))
-    tri_bwd = _time_backward(lambda s, r, i: phase2_prefix_scan_triton_outline(s, r, i))
+    tri_bwd = _time_backward(lambda s, r, i: phase2_prefix_scan_triton_outline(s, torch.log(r.float()).to(r.dtype), i))
     ref_bwd = _time_backward(lambda s, r, i: phase2_prefix_scan_reference(s, r, i))
 
     assert tri_fwd > 0 and ref_fwd > 0 and tri_bwd > 0 and ref_bwd > 0
