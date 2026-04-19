@@ -13,7 +13,7 @@ import triton.language as tl
 
 _SUPPORTED_M_VALUES = {16, 32, 64, 128}
 _SUPPORTED_D_VALUES = {32, 64, 128}
-_SUPPORTED_PHASE1_BLOCK_T_VALUES = {4, 8, 16, 32}
+_SUPPORTED_PHASE1_BLOCK_T_VALUES = {16, 32, 64}
 _EXPERIMENTAL_TRITON_ALLOCATOR_SET = False
 
 # Phase-3 backward tuning knobs (C is compile-time; tune M/D tiles and launch).
@@ -89,6 +89,8 @@ def _require_phase1_block_t(block_t: int, c_size: int, *, where: str) -> None:
         raise NotImplementedError(
             f"{where} requires BLOCK_T in {sorted(_SUPPORTED_PHASE1_BLOCK_T_VALUES)}; got BLOCK_T={block_t}."
         )
+    if block_t < 16:
+        raise NotImplementedError(f"{where} requires BLOCK_T >= 16 for tensor-core Phase-1 path; got BLOCK_T={block_t}.")
     if block_t > c_size:
         raise NotImplementedError(f"{where} requires BLOCK_T <= C; got BLOCK_T={block_t}, C={c_size}.")
     if c_size % block_t != 0:
@@ -823,9 +825,10 @@ def phase1_local_chunk_end_state_fwd_kernel(
        then compute suffix products for `factor[t]`.
     2. For each token block of size `BLOCK_T`, accumulate:
          S += sum_t (factor_t * W_t[:, None] * V_t[None, :])
-       implemented as:
-         W_scaled = factor[:, None] * W_block   # [BLOCK_T, BLOCK_M]
-         S += W_scaled^T @ V_block              # [BLOCK_M, BLOCK_D]
+       using a GEMM-like reduction to hit tensor cores:
+         A = sqrt(factor)[:, None] * W_block    # [BLOCK_T, BLOCK_M]
+         B = sqrt(factor)[:, None] * V_block    # [BLOCK_T, BLOCK_D]
+         S += A^T @ B                           # [BLOCK_M, BLOCK_D]
     3. Store `state_tile` into `S_local_end[BH, NC, M, D]`.
 
     Notes:
@@ -883,9 +886,13 @@ def phase1_local_chunk_end_state_fwd_kernel(
             tl.where(offs_t_full[None, :] == offs_tb[:, None], r_factors[None, :], 0.0),
             axis=1,
         )
-        W_blk = tl.reshape(w_desc.load([BH_IDX, NC_IDX, t_start, m_start]), (BLOCK_T, BLOCK_M)).to(tl.float32)
-        V_blk = tl.reshape(v_desc.load([BH_IDX, NC_IDX, t_start, d_start]), (BLOCK_T, BLOCK_D)).to(tl.float32)
-        S += tl.sum((factors[:, None, None] * W_blk[:, :, None] * V_blk[:, None, :]), axis=0)
+        W_blk = tl.reshape(w_desc.load([BH_IDX, NC_IDX, t_start, m_start]), (BLOCK_T, BLOCK_M))
+        V_blk = tl.reshape(v_desc.load([BH_IDX, NC_IDX, t_start, d_start]), (BLOCK_T, BLOCK_D))
+        sqrt_factors = tl.sqrt(factors)[:, None]
+        # A^T @ B reproduces sum_t factor[t] * outer(W_t, V_t).
+        A = (sqrt_factors * W_blk.to(tl.float32)).to(W_blk.dtype)
+        B = (sqrt_factors * V_blk.to(tl.float32)).to(V_blk.dtype)
+        S += tl.dot(tl.trans(A), B, out_dtype=tl.float32, input_precision="tf32")
 
     out_s_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(S, (1, 1, BLOCK_M, BLOCK_D)))
 
@@ -1112,7 +1119,6 @@ def phase1_local_chunk_end_state_bwd_dv_b_chunk_kernel(
 def phase1_local_chunk_end_state_bwd_dr_kernel(
     b_vals_ptr,
     log_alpha_ptr,
-    grad_r_chunk_ptr,
     out_dlog_alpha_ptr,
     bh_size,
     nc_size,
@@ -1123,12 +1129,9 @@ def phase1_local_chunk_end_state_bwd_dr_kernel(
     stride_r_bh,
     stride_r_nc,
     stride_r_c,
-    stride_grad_r_chunk_bh,
-    stride_grad_r_chunk_nc,
     stride_out_dlog_alpha_bh,
     stride_out_dlog_alpha_nc,
     stride_out_dlog_alpha_c,
-    BLOCK_NC: tl.constexpr,
     BLOCK_C: tl.constexpr,
     C_STATIC: tl.constexpr,
 ):
@@ -1137,20 +1140,13 @@ def phase1_local_chunk_end_state_bwd_dr_kernel(
     Inputs:
     - `b_vals`: scalar `b_t` per token
     - `log_alpha`
-    - `grad_r_chunk`: upstream gradient for `alpha_chunk`
-
-    Needed scalar recurrences for one `(BH, NC)`:
+    Dense vector form for one `(BH, NC)`:
 
       factor[t] = prod_{u=t+1..C-1} alpha_u
-      left[t]   = sum_{j=0..t-1} (prod_{u=j+1..t-1} alpha_u) * b_j
-      prefix[t] = prod_{u=0..t-1} alpha_u
+      g[t]      = b_t * factor[t]
+      d(log_alpha_t) = sum_{j=0..t-1} g[j]
 
-      d(alpha_t) = factor[t] * left[t] + grad_r_chunk * (prefix[t] * factor[t])
-      d(log_alpha_t) = d(alpha_t) * alpha_t
-
-    Interpretation:
-    - First term is contribution via `S_local_end`.
-    - Second term is contribution via `alpha_chunk = prod_u alpha_u = exp(sum_u log_alpha_u)`.
+    i.e. `dlog_alpha` is an exclusive prefix-sum of `g` along token axis.
     """
     pid_bhnc = tl.program_id(0)
     if pid_bhnc >= bh_size * nc_size:
@@ -1171,12 +1167,6 @@ def phase1_local_chunk_end_state_bwd_dr_kernel(
         strides=[stride_b_bh, stride_b_nc, stride_b_c],
         block_shape=[1, 1, BLOCK_C],
     )
-    grad_r_chunk_desc = tl.make_tensor_descriptor(
-        grad_r_chunk_ptr,
-        shape=[bh_size, nc_size],
-        strides=[stride_grad_r_chunk_bh, stride_grad_r_chunk_nc],
-        block_shape=[1, BLOCK_NC],
-    )
     out_dr_desc = tl.make_tensor_descriptor(
         out_dlog_alpha_ptr,
         shape=[bh_size, nc_size, c_size],
@@ -1184,33 +1174,15 @@ def phase1_local_chunk_end_state_bwd_dr_kernel(
         block_shape=[1, 1, BLOCK_C],
     )
 
-    offs_t = tl.arange(0, BLOCK_C)
     log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,))
     b_vals_in = tl.reshape(b_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,))
     log_alpha_f = log_alpha_vals.to(tl.float32)
-    alpha_vals = tl.exp(log_alpha_f)
     b_vals = b_vals_in.to(tl.float32)
     log_suffix_incl = tl.cumsum(log_alpha_f, axis=0, reverse=True)
     factors = tl.exp(log_suffix_incl - log_alpha_f)
-
-    nc_start = (NC_IDX // BLOCK_NC) * BLOCK_NC
-    offs_nc = nc_start + tl.arange(0, BLOCK_NC)
-    grad_r_chunk_vec = tl.reshape(grad_r_chunk_desc.load([BH_IDX, nc_start]), (BLOCK_NC,)).to(tl.float32)
-    grad_r_chunk = tl.sum(tl.where(offs_nc == NC_IDX, grad_r_chunk_vec, 0.0), axis=0)
-
-    left = 0.0
-    prefix = 1.0
-    grad_vec = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    for t in tl.static_range(0, C_STATIC):
-        t_mask = offs_t == t
-        factor_t = tl.sum(tl.where(t_mask, factors, 0.0), axis=0)
-        b_t = tl.sum(tl.where(t_mask, b_vals, 0.0), axis=0)
-        d_alpha_t = factor_t * left + grad_r_chunk * (prefix * factor_t)
-        alpha_t = tl.sum(tl.where(t_mask, alpha_vals, 0.0), axis=0)
-        d_log_alpha_t = d_alpha_t * alpha_t
-        grad_vec += tl.where(t_mask, d_log_alpha_t, 0.0)
-        left = alpha_t * left + b_t
-        prefix = prefix * alpha_t
+    g_vals = b_vals * factors
+    prefix_incl = tl.cumsum(g_vals, axis=0)
+    grad_vec = prefix_incl - g_vals
     out_dr_desc.store([BH_IDX, NC_IDX, 0], tl.reshape(grad_vec.to(log_alpha_vals.dtype), (1, 1, BLOCK_C)))
 
 
@@ -1241,7 +1213,7 @@ class Phase1LocalChunkEndStateTrition(torch.autograd.Function):
         W: torch.Tensor,
         V: torch.Tensor,
         log_alpha: torch.Tensor,
-        BLOCK_T: int = 8,
+        BLOCK_T: int = 32,
     ) -> torch.Tensor:
         if W.ndim != 4 or V.ndim != 4 or log_alpha.ndim != 3:
             raise ValueError(
@@ -1380,7 +1352,7 @@ class Phase1LocalChunkEndStateTrition(torch.autograd.Function):
             BLOCK_C=C,
             C_STATIC=C,
             D_STATIC=D,
-            INPUT_PRECISION="ieee",
+            INPUT_PRECISION="tf32",
             num_warps=2,
             num_stages=2,
         )
@@ -1412,7 +1384,7 @@ class Phase1LocalChunkEndStateTrition(torch.autograd.Function):
             BLOCK_C=C,
             C_STATIC=C,
             M_STATIC=M,
-            INPUT_PRECISION="ieee",
+            INPUT_PRECISION="tf32",
             num_warps=2,
             num_stages=2,
         )
@@ -1420,21 +1392,16 @@ class Phase1LocalChunkEndStateTrition(torch.autograd.Function):
 
         # dlog_alpha from b-values and alpha_chunk upstream grad.
         grid_dr = (BH * NC,)
-        block_nc = NC
-        grad_alpha_chunk = torch.zeros((BH, NC), device=log_alpha.device, dtype=log_alpha.dtype)
         phase1_local_chunk_end_state_bwd_dr_kernel[grid_dr](
             b_vals,
             log_alpha,
-            grad_alpha_chunk,
             d_log_alpha,
             BH,
             NC,
             C,
             *b_vals.stride(),
             *log_alpha.stride(),
-            *grad_alpha_chunk.stride(),
             *d_log_alpha.stride(),
-            BLOCK_NC=block_nc,
             BLOCK_C=C,
             C_STATIC=C,
             num_warps=2,
@@ -1447,7 +1414,7 @@ def phase1_local_chunk_end_state_triton_outline(
     W: torch.Tensor,
     V: torch.Tensor,
     log_alpha: torch.Tensor,
-    BLOCK_T: int = 8,
+    BLOCK_T: int = 32,
 ) -> torch.Tensor:
     """Phase-1 autograd entrypoint (Triton kernel forward)."""
     return Phase1LocalChunkEndStateTrition.apply(W, V, log_alpha, BLOCK_T)
@@ -3366,7 +3333,7 @@ def phase123_full_parallel_scan_trition(
     initial_state: torch.Tensor | None = None,
     CHUNK_SIZE: int | None = None,
     INPUT_PRECISION: str = "tf32",
-    PHASE1_BLOCK_T: int = 8,
+    PHASE1_BLOCK_T: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Full mode-0 parallel scan from unchunked inputs via Triton phase wrappers.
 
@@ -3425,7 +3392,7 @@ def phase123_full_parallel_scan_triton_outline(
     initial_state: torch.Tensor | None = None,
     CHUNK_SIZE: int | None = None,
     INPUT_PRECISION: str = "tf32",
-    PHASE1_BLOCK_T: int = 8,
+    PHASE1_BLOCK_T: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compatibility alias; prefer `phase123_full_parallel_scan_trition`."""
     return phase123_full_parallel_scan_trition(
