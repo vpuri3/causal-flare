@@ -20,7 +20,7 @@ Public wrappers:
 
 Experimental implementations live under:
 
-- [`causal_flare.autoregressive.experimental`](./autoregressive/experimental.py)
+- [`fla.models.experimental_flare.experimental`](../../fla/models/experimental_flare/experimental.py)
 
 See [`causal_flare/autoregressive/docs.md`](./autoregressive/docs.md).
 
