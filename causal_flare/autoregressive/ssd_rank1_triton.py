@@ -6,6 +6,8 @@ keeps backward as an explicit TODO.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 import triton
@@ -34,6 +36,29 @@ _PHASE3_BWD_NUM_STAGES = 3
 
 # Reusable buffers for Phase-3 backward intermediates to reduce allocation overhead.
 _PHASE3_BWD_WORKSPACE: dict[tuple, torch.Tensor] = {}
+
+
+@dataclass(frozen=True)
+class _Phase3ForwardLaunchConfig:
+    block_m: int
+    block_d: int
+    num_warps: int
+    num_stages: int
+
+
+@dataclass(frozen=True)
+class _Phase3BackwardLaunchConfig:
+    block_m: int
+    block_d: int
+    fused_a1a2_num_warps: int
+    fused_off_num_warps: int
+    num_stages: int
+
+
+@dataclass(frozen=True)
+class _Phase1BackwardLaunchConfig:
+    num_warps: int
+    num_stages: int
 
 
 def _ensure_triton_allocator() -> None:
@@ -118,6 +143,87 @@ def _select_largest_block_size(size: int, candidates: tuple[int, ...], *, where:
     raise NotImplementedError(
         f"{where} requires {label} to be divisible by one of {list(candidates)}; got {label}={size}."
     )
+
+
+def _select_chunk_size_heuristic(*, N: int, M: int, D: int, BH: int) -> int:
+    """Heuristic CHUNK_SIZE picker for the supported contract."""
+    if max(M, D) >= 128:
+        return 32
+    if max(M, D) <= 32 and N >= 4096 and BH <= 2048:
+        return 128
+    return 64
+
+
+def _select_phase2_block_nc(*, NC: int) -> int:
+    """Heuristic BLOCK_NC for phase-2 kernels."""
+    if NC >= 32 and NC % 32 == 0:
+        return 32
+    return 16
+
+
+def _select_phase3_forward_launch_config(
+    *,
+    BH: int,
+    NC: int,
+    C_CHUNK: int,
+    M: int,
+    D: int,
+    where: str,
+) -> _Phase3ForwardLaunchConfig:
+    block_m = _select_largest_block_size(M, _SUPPORTED_BLOCK_X_VALUES, where=where, label="M")
+    block_d = _select_largest_block_size(D, _SUPPORTED_BLOCK_X_VALUES, where=where, label="D")
+
+    work_items = BH * NC
+    # On high-parallel BF16 workloads with C=64, lower warps with deeper pipelining
+    # consistently improved phase-3 forward in benchmarking.
+    if C_CHUNK == 64 and block_m == 64 and block_d == 64 and work_items >= 4096:
+        return _Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=2, num_stages=3)
+    if block_m >= 64 and block_d >= 64:
+        return _Phase3ForwardLaunchConfig(block_m=block_m, block_d=block_d, num_warps=4, num_stages=2)
+    return _Phase3ForwardLaunchConfig(block_m=block_m, block_d=block_d, num_warps=2, num_stages=2)
+
+
+def _select_phase3_backward_launch_config(
+    *,
+    BH: int,
+    NC: int,
+    C_CHUNK: int,
+    M: int,
+    D: int,
+) -> _Phase3BackwardLaunchConfig:
+    block_m = 64 if M % 64 == 0 else _select_largest_block_size(M, (32, 16), where="phase3_bwd", label="M")
+    block_d = 64 if D % 64 == 0 else _select_largest_block_size(D, (32, 16), where="phase3_bwd", label="D")
+
+    # Best-known setting for the common BF16 trainer shape (M=D=C=64).
+    if C_CHUNK == 64 and block_m == 64 and block_d == 64 and BH * NC >= 4096:
+        return _Phase3BackwardLaunchConfig(
+            block_m=64,
+            block_d=64,
+            fused_a1a2_num_warps=4,
+            fused_off_num_warps=4,
+            num_stages=2,
+        )
+    if block_m >= 32 and block_d >= 32:
+        return _Phase3BackwardLaunchConfig(
+            block_m=block_m,
+            block_d=block_d,
+            fused_a1a2_num_warps=4,
+            fused_off_num_warps=4,
+            num_stages=3,
+        )
+    return _Phase3BackwardLaunchConfig(
+        block_m=block_m,
+        block_d=block_d,
+        fused_a1a2_num_warps=2,
+        fused_off_num_warps=2,
+        num_stages=3,
+    )
+
+
+def _select_phase1_backward_launch_config(*, M: int, D: int) -> _Phase1BackwardLaunchConfig:
+    if M >= 128 or D >= 128:
+        return _Phase1BackwardLaunchConfig(num_warps=4, num_stages=2)
+    return _Phase1BackwardLaunchConfig(num_warps=2, num_stages=2)
 
 
 def _require_phase1_block_t(block_t: int, c_size: int, *, where: str) -> None:
@@ -272,7 +378,9 @@ def ssd_rank1_pytorch(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """SSD rank-1 PyTorch oracle entrypoint."""
     if CHUNK_SIZE is None:
-        CHUNK_SIZE = 64
+        B, N, H, M = C.shape
+        D = V.shape[-1]
+        CHUNK_SIZE = _select_chunk_size_heuristic(N=N, M=M, D=D, BH=B * H)
 
     C_chunk, W_chunk, V_chunk, log_alpha_chunk, init_flat, B, N, H, M, D, _ = _ssd_rank1_prepare_unchunked_inputs(
         C,
@@ -1441,12 +1549,7 @@ def _ssd_rank1_prefix_scan_forward_impl(
     chunk_start = torch.empty((BH, NC, MD), device=S_local_end.device, dtype=torch.float32)
     final_state = torch.empty((BH, MD), device=S_local_end.device, dtype=torch.float32)
 
-    block_nc = _select_largest_block_size(
-        NC,
-        (128, 64, 32, 16),
-        where="_ssd_rank1_prefix_scan_forward_impl",
-        label="NC",
-    )
+    block_nc = _select_phase2_block_nc(NC=NC)
     grid_fwd = lambda META: (BH,)
     ssd_rank1_prefix_scan_fwd_kernel[grid_fwd](
         S_local_end_in,
@@ -2872,19 +2975,15 @@ def _ssd_rank1_dense_output_forward_impl(
 
     out = torch.empty((BH, NC, C_CHUNK, D), device=C.device, dtype=C.dtype)
     y_off_saved = torch.empty((BH, NC, C_CHUNK, D), device=C.device, dtype=C.dtype)
-    BLOCK_M = _select_largest_block_size(
-        M,
-        _SUPPORTED_BLOCK_X_VALUES,
+    phase3_fwd_cfg = _select_phase3_forward_launch_config(
+        BH=BH,
+        NC=NC,
+        C_CHUNK=C_CHUNK,
+        M=M,
+        D=D,
         where="_ssd_rank1_dense_output_forward_impl",
-        label="M",
     )
-    BLOCK_D = _select_largest_block_size(
-        D,
-        _SUPPORTED_BLOCK_X_VALUES,
-        where="_ssd_rank1_dense_output_forward_impl",
-        label="D",
-    )
-    grid = (BH * NC, D // BLOCK_D)
+    grid = (BH * NC, D // phase3_fwd_cfg.block_d)
     ssd_rank1_dense_output_fwd_kernel[grid](
         C,
         W,
@@ -2905,14 +3004,14 @@ def _ssd_rank1_dense_output_forward_impl(
         *S0_md.stride(),
         *out.stride(),
         *y_off_saved.stride(),
-        BLOCK_M=BLOCK_M,
-        BLOCK_D=BLOCK_D,
+        BLOCK_M=phase3_fwd_cfg.block_m,
+        BLOCK_D=phase3_fwd_cfg.block_d,
         BLOCK_C=C_CHUNK,
         C_STATIC=C_CHUNK,
         M_STATIC=M,
         INPUT_PRECISION=INPUT_PRECISION,
-        num_warps=4,
-        num_stages=2,
+        num_warps=phase3_fwd_cfg.num_warps,
+        num_stages=phase3_fwd_cfg.num_stages,
     )
     if RETURN_Y_OFF:
         return out, y_off_saved
@@ -2978,8 +3077,15 @@ def _ssd_rank1_dense_output_backward_impl(
             f"got {tuple(S0_saved.shape)}."
         )
 
-    BLOCK_M = min(_PHASE3_BWD_BLOCK_M, M)
-    BLOCK_D = min(_PHASE3_BWD_BLOCK_D, D)
+    phase3_bwd_cfg = _select_phase3_backward_launch_config(
+        BH=BH,
+        NC=NC,
+        C_CHUNK=C_CHUNK,
+        M=M,
+        D=D,
+    )
+    BLOCK_M = phase3_bwd_cfg.block_m
+    BLOCK_D = phase3_bwd_cfg.block_d
     if M % BLOCK_M != 0 or D % BLOCK_D != 0:
         raise NotImplementedError(
             f"_ssd_rank1_dense_output_backward_impl requires M%BLOCK_M==0 and D%BLOCK_D==0; "
@@ -3033,8 +3139,8 @@ def _ssd_rank1_dense_output_backward_impl(
         M_STATIC=M,
         D_STATIC=D,
         INPUT_PRECISION=input_precision,
-        num_warps=_PHASE3_BWD_FUSED_A1A2_NUM_WARPS,
-        num_stages=_PHASE3_BWD_NUM_STAGES,
+        num_warps=phase3_bwd_cfg.fused_a1a2_num_warps,
+        num_stages=phase3_bwd_cfg.num_stages,
     )
 
     has_s0 = S0_md.numel() > 0
@@ -3073,8 +3179,8 @@ def _ssd_rank1_dense_output_backward_impl(
             M_STATIC=M,
             D_STATIC=D,
             INPUT_PRECISION=input_precision,
-            num_warps=_PHASE3_BWD_FUSED_OFF_NUM_WARPS,
-            num_stages=_PHASE3_BWD_NUM_STAGES,
+            num_warps=phase3_bwd_cfg.fused_off_num_warps,
+            num_stages=phase3_bwd_cfg.num_stages,
         )
 
         dC = dC_diag
@@ -3147,11 +3253,20 @@ def ssd_rank1_dense_output_backward_kernel_profile(
         log_p = torch.cumsum(log_alpha.float(), dim=-1)
         y_off_saved = (torch.exp2(log_p * _INV_LN2).unsqueeze(-1) * torch.matmul(C.float(), S0_md.float())).to(C.dtype).contiguous()
 
-    BLOCK_M = min(_PHASE3_BWD_BLOCK_M, M) if BLOCK_M is None else BLOCK_M
-    BLOCK_D = min(_PHASE3_BWD_BLOCK_D, D) if BLOCK_D is None else BLOCK_D
-    FUSED_A1A2_NUM_WARPS = _PHASE3_BWD_FUSED_A1A2_NUM_WARPS if FUSED_A1A2_NUM_WARPS is None else FUSED_A1A2_NUM_WARPS
-    OFF_NUM_WARPS = _PHASE3_BWD_OFF_NUM_WARPS if OFF_NUM_WARPS is None else OFF_NUM_WARPS
-    NUM_STAGES = _PHASE3_BWD_NUM_STAGES if NUM_STAGES is None else NUM_STAGES
+    default_cfg = _select_phase3_backward_launch_config(
+        BH=BH,
+        NC=NC,
+        C_CHUNK=C_CHUNK,
+        M=M,
+        D=D,
+    )
+    BLOCK_M = default_cfg.block_m if BLOCK_M is None else BLOCK_M
+    BLOCK_D = default_cfg.block_d if BLOCK_D is None else BLOCK_D
+    FUSED_A1A2_NUM_WARPS = (
+        default_cfg.fused_a1a2_num_warps if FUSED_A1A2_NUM_WARPS is None else FUSED_A1A2_NUM_WARPS
+    )
+    OFF_NUM_WARPS = default_cfg.fused_off_num_warps if OFF_NUM_WARPS is None else OFF_NUM_WARPS
+    NUM_STAGES = default_cfg.num_stages if NUM_STAGES is None else NUM_STAGES
     if M % BLOCK_M != 0 or D % BLOCK_D != 0:
         raise NotImplementedError(
             f"Profile currently requires M%BLOCK_M==0 and D%BLOCK_D==0; got M={M}, D={D}, BLOCK_M={BLOCK_M}, BLOCK_D={BLOCK_D}."
@@ -3526,7 +3641,7 @@ class SsdRank1Triton(torch.autograd.Function):
         # Keep phase-2 backward on the autotuned launch path (remote baseline).
         # Forcing large fixed BLOCK_MD/BLOCK_NC here regressed runtime badly on
         # larger BH/NC shapes.
-        block_nc = 32 if (NC >= 32 and NC % 32 == 0) else 16
+        block_nc = _select_phase2_block_nc(NC=NC)
         grid_bwd = lambda META: (BH,)
         # Phase-2 reverse scan:
         #   inputs  : dS0_chunk and dS1
@@ -3585,6 +3700,7 @@ class SsdRank1Triton(torch.autograd.Function):
         )
         n_m_tiles = M // BLOCK_M
         n_d_tiles = D // BLOCK_D
+        phase1_bwd_cfg = _select_phase1_backward_launch_config(M=M, D=D)
 
         grid_dw = (BH * NC, n_m_tiles)
         # From dS_local_end, compute phase-1 contribution to dW.
@@ -3595,7 +3711,7 @@ class SsdRank1Triton(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_C=CHUNK_SIZE,
             C_STATIC=CHUNK_SIZE, D_STATIC=D,
             INPUT_PRECISION="ieee" if C_chunk.dtype == torch.float32 else "tf32",
-            num_warps=2, num_stages=2,
+            num_warps=phase1_bwd_cfg.num_warps, num_stages=phase1_bwd_cfg.num_stages,
         )
 
         b_partials = _ssd_rank1_bwd_workspace_tensor(
@@ -3614,7 +3730,7 @@ class SsdRank1Triton(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_C=CHUNK_SIZE,
             C_STATIC=CHUNK_SIZE, M_STATIC=M,
             INPUT_PRECISION="ieee" if C_chunk.dtype == torch.float32 else "tf32",
-            num_warps=2, num_stages=2,
+            num_warps=phase1_bwd_cfg.num_warps, num_stages=phase1_bwd_cfg.num_stages,
         )
         b_vals = torch.sum(b_partials, dim=2)
 
@@ -3625,7 +3741,7 @@ class SsdRank1Triton(torch.autograd.Function):
             BH, NC, CHUNK_SIZE,
             *b_vals.stride(), *log_alpha_chunk.stride(), *d_log_alpha_p1.stride(),
             BLOCK_C=CHUNK_SIZE, C_STATIC=CHUNK_SIZE,
-            num_warps=2, num_stages=2,
+            num_warps=phase1_bwd_cfg.num_warps, num_stages=phase1_bwd_cfg.num_stages,
         )
 
         # keep d_init_f32 alive for initial_state grad
@@ -3697,7 +3813,9 @@ def ssd_rank1_triton(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """SSD rank-1 Triton entrypoint using unified autograd with recomputation."""
     if CHUNK_SIZE is None:
-        CHUNK_SIZE = 64
+        B0, N0, H0, M0 = C.shape
+        D0 = V.shape[-1]
+        CHUNK_SIZE = _select_chunk_size_heuristic(N=N0, M=M0, D=D0, BH=B0 * H0)
 
     y_chunk, S1_chunk = SsdRank1Triton.apply(
         C, W, V, log_alpha, initial_state, CHUNK_SIZE, INPUT_PRECISION,
