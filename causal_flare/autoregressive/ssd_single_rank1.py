@@ -277,6 +277,54 @@ def _prepare_triton_inputs(
     return V_chunk, log_alpha_chunk, init_flat, B, N, H, D, NC_exec
 
 
+def _prepare_unchunked_inputs(
+    V: torch.Tensor,
+    log_alpha: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    *,
+    where: str,
+    CHUNK_SIZE: int,
+) -> tuple[torch.Tensor, int, int, int, int, int]:
+    if V.ndim != 4 or log_alpha.ndim != 3:
+        raise ValueError(
+            f"{where} expects V=[B,N,H,D], log_alpha=[B,N,H]. "
+            f"Got V={tuple(V.shape)}, log_alpha={tuple(log_alpha.shape)}."
+        )
+    B, N, H, D = V.shape
+    if log_alpha.shape != (B, N, H):
+        raise ValueError(f"{where}: log_alpha must be [B,N,H]={B, N, H}; got {tuple(log_alpha.shape)}.")
+    if V.device != log_alpha.device:
+        raise ValueError(f"{where}: V and log_alpha must be on the same device.")
+    if V.dtype != log_alpha.dtype:
+        raise ValueError(f"{where}: V and log_alpha must share dtype.")
+    if D not in _SUPPORTED_D_VALUES:
+        raise NotImplementedError(f"{where} requires D in {sorted(_SUPPORTED_D_VALUES)}; got D={D}.")
+    _require_supported_forward_contract(B * H, N, CHUNK_SIZE=CHUNK_SIZE, where=where)
+    _require_nonpositive_log_alpha(log_alpha, where=where)
+
+    BH = B * H
+    if initial_state is None:
+        init_flat = torch.zeros((BH, D), device=V.device, dtype=V.dtype)
+    elif initial_state.ndim == 2 and initial_state.shape == (BH, D):
+        init_flat = initial_state
+    elif initial_state.ndim == 3 and initial_state.shape == (B, H, D):
+        init_flat = initial_state.reshape(BH, D)
+    else:
+        raise ValueError(
+            f"{where}: initial_state must be [BH,D] or [B,H,D]. "
+            f"Got {tuple(initial_state.shape)} with BH={BH}, D={D}."
+        )
+    if init_flat.device != V.device:
+        raise ValueError(f"{where}: initial_state must be on the same device as V/log_alpha.")
+    if init_flat.dtype != V.dtype:
+        raise ValueError(f"{where}: initial_state must share dtype with V/log_alpha.")
+
+    NC_data = triton.cdiv(N, CHUNK_SIZE)
+    NC_exec = max(NC_data, 16)
+    NC_exec = triton.cdiv(NC_exec, 16) * 16
+    return init_flat, B, N, H, D, NC_exec
+
+
 def _restore_output_layout(
     y_chunk: torch.Tensor,
     final_state_flat: torch.Tensor,
@@ -941,6 +989,179 @@ def _phase3_forward_impl(
         *V.stride(),
         *log_alpha.stride(),
         *S0_vec.stride(),
+        *out.stride(),
+        *out_off.stride(),
+        BLOCK_D=BLOCK_D,
+        BLOCK_C=C,
+        D_STATIC=D,
+        INPUT_PRECISION=input_precision,
+        STORE_Y_OFF=RETURN_Y_OFF,
+        num_warps=cfg.num_warps,
+        num_stages=cfg.num_stages,
+    )
+    if RETURN_Y_OFF:
+        assert y_off is not None
+        return out, y_off
+    return out
+
+
+@triton.jit
+def ssd_single_rank1_phase3_fwd_un_kernel(
+    V_ptr,
+    log_alpha_ptr,
+    S0_ptr,
+    out_y_ptr,
+    out_y_off_ptr,
+    b_size,
+    h_size,
+    n_size,
+    nc_size,
+    c_size,
+    d_size,
+    stride_v_b,
+    stride_v_n,
+    stride_v_h,
+    stride_v_d,
+    stride_r_b,
+    stride_r_n,
+    stride_r_h,
+    stride_s0_bh,
+    stride_s0_nc,
+    stride_s0_d,
+    stride_out_y_bh,
+    stride_out_y_nc,
+    stride_out_y_c,
+    stride_out_y_d,
+    stride_out_y_off_bh,
+    stride_out_y_off_nc,
+    stride_out_y_off_c,
+    stride_out_y_off_d,
+    BLOCK_D: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    D_STATIC: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+    STORE_Y_OFF: tl.constexpr,
+):
+    pid_bhnc = tl.program_id(0)
+    pid_d_tile = tl.program_id(1)
+    bh_size = b_size * h_size
+    if pid_bhnc >= bh_size * nc_size:
+        return
+
+    BH_IDX = pid_bhnc // nc_size
+    NC_IDX = pid_bhnc % nc_size
+    B_IDX = BH_IDX // h_size
+    H_IDX = BH_IDX % h_size
+    d_start = pid_d_tile * BLOCK_D
+
+    offs_c = tl.arange(0, BLOCK_C)
+    offs_d = d_start + tl.arange(0, BLOCK_D)
+    n_idx = NC_IDX * BLOCK_C + offs_c
+    mask_c = n_idx < n_size
+    mask_d = offs_d < d_size
+    mask_cd = mask_c[:, None] & mask_d[None, :]
+
+    log_ptrs = log_alpha_ptr + B_IDX * stride_r_b + n_idx * stride_r_n + H_IDX * stride_r_h
+    log_alpha_vals = tl.load(log_ptrs, mask=mask_c, other=0.0).to(tl.float32)
+    valid = offs_c[None, :] <= offs_c[:, None]
+    log_p = tl.cumsum(log_alpha_vals, axis=0)
+    log_delta = (log_p[:, None] - log_p[None, :]) * 1.4426950408889634
+    log_delta = tl.where(valid, log_delta, 0.0)
+    L = tl.where(valid, tl.exp2(log_delta), 0.0)
+    p = tl.exp2(log_p * 1.4426950408889634)
+
+    v_ptrs = (
+        V_ptr
+        + B_IDX * stride_v_b
+        + n_idx[:, None] * stride_v_n
+        + H_IDX * stride_v_h
+        + offs_d[None, :] * stride_v_d
+    )
+    V_in = tl.load(v_ptrs, mask=mask_cd, other=0.0)
+    V_f = V_in.to(tl.float32)
+    Y_diag = tl.dot(L, V_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+
+    s0_ptrs = S0_ptr + BH_IDX * stride_s0_bh + NC_IDX * stride_s0_nc + offs_d * stride_s0_d
+    S0_tile = tl.load(s0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+    Y_off = p[:, None] * S0_tile[None, :]
+    Y = Y_diag + Y_off
+
+    out_ptrs = (
+        out_y_ptr
+        + BH_IDX * stride_out_y_bh
+        + NC_IDX * stride_out_y_nc
+        + offs_c[:, None] * stride_out_y_c
+        + offs_d[None, :] * stride_out_y_d
+    )
+    tl.store(out_ptrs, Y.to(V_in.dtype), mask=mask_cd)
+
+    if STORE_Y_OFF:
+        out_off_ptrs = (
+            out_y_off_ptr
+            + BH_IDX * stride_out_y_off_bh
+            + NC_IDX * stride_out_y_off_nc
+            + offs_c[:, None] * stride_out_y_off_c
+            + offs_d[None, :] * stride_out_y_off_d
+        )
+        tl.store(out_off_ptrs, Y_off.to(V_in.dtype), mask=mask_cd)
+
+
+def _phase3_forward_from_unchunked(
+    V_un: torch.Tensor,
+    log_alpha_un: torch.Tensor,
+    S0: torch.Tensor,
+    *,
+    H: int,
+    NC: int,
+    CHUNK_SIZE: int,
+    input_precision: str,
+    RETURN_Y_OFF: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if V_un.ndim != 4 or log_alpha_un.ndim != 3:
+        raise ValueError("_phase3_forward_from_unchunked expects V=[B,N,H,D], log_alpha=[B,N,H].")
+    B, N, H_in, D = V_un.shape
+    if H_in != H:
+        raise ValueError(f"H mismatch: expected {H}, got {H_in}.")
+    if log_alpha_un.shape != (B, N, H):
+        raise ValueError(f"log_alpha must be [B,N,H]={B, N, H}; got {tuple(log_alpha_un.shape)}.")
+    BH = B * H
+    C = CHUNK_SIZE
+    if S0.shape != (BH, NC, D):
+        raise ValueError(f"S0 must be [BH,NC,D]={BH, NC, D}; got {tuple(S0.shape)}.")
+    _require_chunk_size_multiple_of_16(C, where="_phase3_forward_from_unchunked")
+    if D not in _SUPPORTED_D_VALUES:
+        raise NotImplementedError(
+            f"_phase3_forward_from_unchunked requires D in {sorted(_SUPPORTED_D_VALUES)}; got D={D}."
+        )
+    if not V_un.is_cuda:
+        raise NotImplementedError("_phase3_forward_from_unchunked requires CUDA tensors.")
+    _ensure_triton_allocator()
+
+    cfg = _select_phase3_forward_launch_config(BH=BH, NC=NC, C_CHUNK=C, D=D)
+    BLOCK_D = cfg.block_d
+    out = torch.empty((BH, NC, C, D), device=V_un.device, dtype=V_un.dtype)
+    if RETURN_Y_OFF:
+        y_off: torch.Tensor | None = torch.empty_like(out)
+        out_off = y_off
+    else:
+        y_off = None
+        out_off = out
+    grid = (BH * NC, D // BLOCK_D)
+    ssd_single_rank1_phase3_fwd_un_kernel[grid](
+        V_un,
+        log_alpha_un,
+        S0,
+        out,
+        out_off,
+        B,
+        H,
+        N,
+        NC,
+        C,
+        D,
+        *V_un.stride(),
+        *log_alpha_un.stride(),
+        *S0.stride(),
         *out.stride(),
         *out_off.stride(),
         BLOCK_D=BLOCK_D,
@@ -1809,19 +2030,33 @@ class SsdSingleRank1Triton(torch.autograd.Function):
         CHUNK_SIZE: int,
         INPUT_PRECISION: str,
     ):
-        V_chunk, log_alpha_chunk, init_flat, B, N, H, D, NC_exec = _prepare_triton_inputs(
+        init_flat, B, N, H, D, NC_exec = _prepare_unchunked_inputs(
             V, log_alpha, initial_state, where="SsdSingleRank1Triton.forward", CHUNK_SIZE=CHUNK_SIZE
         )
 
-        S_local_end = _phase1_forward_impl(V_chunk, log_alpha_chunk)
-        log_alpha_per_chunk = torch.sum(log_alpha_chunk.float(), dim=-1)
+        S_local_end, log_alpha_per_chunk = _phase1_forward_replay_from_unchunked(
+            V,
+            log_alpha,
+            H=H,
+            NC=NC_exec,
+            CHUNK_SIZE=CHUNK_SIZE,
+        )
 
         # Keep phase-2 in fp32 for final-state stability; output tensors are small.
         S0_chunk, S1_chunk = _ssd_single_rank1_phase2_prefix_scan_forward_impl(
             S_local_end, log_alpha_per_chunk, init_flat, torch.float32
         )
 
-        y_chunk = _phase3_forward_impl(V_chunk, log_alpha_chunk, S0_chunk, INPUT_PRECISION, RETURN_Y_OFF=False)
+        y_chunk = _phase3_forward_from_unchunked(
+            V,
+            log_alpha,
+            S0_chunk,
+            H=H,
+            NC=NC_exec,
+            CHUNK_SIZE=CHUNK_SIZE,
+            input_precision=INPUT_PRECISION,
+            RETURN_Y_OFF=False,
+        )
 
         # Save unchunked inputs; replay chunking in backward to reduce forward
         # activation residency from chunked copies.
