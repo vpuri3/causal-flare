@@ -28,8 +28,9 @@ _PHASE3_BWD_A1_NUM_WARPS = 8
 _PHASE3_BWD_A2_NUM_WARPS = 8
 _PHASE3_BWD_OFF_NUM_WARPS = 8
 _PHASE3_BWD_DIAG_NUM_WARPS = 2
-_PHASE3_BWD_FUSED_A1A2_NUM_WARPS = 8
-_PHASE3_BWD_NUM_STAGES = 2
+_PHASE3_BWD_FUSED_A1A2_NUM_WARPS = 4
+_PHASE3_BWD_FUSED_OFF_NUM_WARPS = 4
+_PHASE3_BWD_NUM_STAGES = 3
 
 # Reusable buffers for Phase-3 backward intermediates to reduce allocation overhead.
 _PHASE3_BWD_WORKSPACE: dict[tuple, torch.Tensor] = {}
@@ -2489,7 +2490,6 @@ def ssd_rank1_dense_output_bwd_fused_off_kernel(
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
         dC_off = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
-        dS0_tile = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
         C_tile = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
         for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
             d_start = d_blk * BLOCK_D
@@ -2497,15 +2497,13 @@ def ssd_rank1_dense_output_bwd_fused_off_kernel(
             dB_tile = p[:, None] * G_tile
             S0_tile = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
             dC_off += tl.dot(dB_tile, tl.trans(S0_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            dS0_tile += tl.dot(tl.trans(C_tile), dB_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dS0_tile = tl.dot(tl.trans(C_tile), dB_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            ds0_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(dS0_tile, (1, 1, BLOCK_M, BLOCK_D)))
 
         # Accumulate dC_off into dC_diag (read-modify-write)
         c_probe = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M))
         dc_prev = tl.reshape(dc_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
         dc_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape((dc_prev + dC_off).to(c_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
-
-        # Store dS0 tile at correct M-offset
-        ds0_desc.store([BH_IDX, NC_IDX, m_start, 0], tl.reshape(dS0_tile, (1, 1, BLOCK_M, BLOCK_D)))
 
     # ---- dlog_off: src[i] = sum_d grad_y[i,d] * Y_off[i,d], then reverse cumsum ----
     src = tl.zeros((BLOCK_C,), dtype=tl.float32)
@@ -3042,14 +3040,20 @@ def _ssd_rank1_dense_output_backward_impl(
     has_s0 = S0_md.numel() > 0
     if has_s0:
         dS0 = torch.empty((BH, NC, M, D), device=C.device, dtype=torch.float32)
-        grid_off_dc = (BH * NC, n_m_tiles)
-        # Off-path `Y_off = p * (C @ S0)` contribution to dC.
-        ssd_rank1_dense_output_bwd_off_dc_kernel[grid_off_dc](
+        grid_off = (BH * NC,)
+        # Fused off-path kernel computes:
+        #   - dC_off (accumulated into dC_diag)
+        #   - dS0
+        #   - dlog_off (accumulated into dlog_diag)
+        ssd_rank1_dense_output_bwd_fused_off_kernel[grid_off](
             C,
             grad_out_c,
             log_alpha,
             S0_md,
+            y_off_saved,
             dC_diag,
+            dS0,
+            dlog_diag,
             BH,
             NC,
             C_CHUNK,
@@ -3059,63 +3063,17 @@ def _ssd_rank1_dense_output_backward_impl(
             *grad_out_c.stride(),
             *log_alpha.stride(),
             *S0_md.stride(),
-            *dC_diag.stride(),
-            BLOCK_M=BLOCK_M,
-            BLOCK_D=BLOCK_D,
-            BLOCK_C=C_CHUNK,
-            C_STATIC=C_CHUNK,
-            D_STATIC=D,
-            INPUT_PRECISION=input_precision,
-            num_warps=_PHASE3_BWD_OFF_NUM_WARPS,
-            num_stages=_PHASE3_BWD_NUM_STAGES,
-        )
-
-        grid_off_ds0 = (BH * NC, n_m_tiles, n_d_tiles)
-        # Off-path contribution to dS0.
-        ssd_rank1_dense_output_bwd_off_ds0_kernel[grid_off_ds0](
-            C,
-            grad_out_c,
-            log_alpha,
-            dS0,
-            BH,
-            NC,
-            C_CHUNK,
-            M,
-            D,
-            *C.stride(),
-            *grad_out_c.stride(),
-            *log_alpha.stride(),
-            *dS0.stride(),
-            BLOCK_M=BLOCK_M,
-            BLOCK_D=BLOCK_D,
-            BLOCK_C=C_CHUNK,
-            INPUT_PRECISION=input_precision,
-            num_warps=_PHASE3_BWD_OFF_NUM_WARPS,
-            num_stages=_PHASE3_BWD_NUM_STAGES,
-        )
-
-        grid_off_log = (BH * NC,)
-        if y_off_saved.numel() == 0:
-            log_p = torch.cumsum(log_alpha.float(), dim=-1)
-            y_off_saved = (
-                torch.exp2(log_p * _INV_LN2).unsqueeze(-1) * torch.matmul(C.float(), S0_md.float())
-            ).to(C.dtype).contiguous()
-        # Off-path contribution to dlog_alpha via prefix factors `p`.
-        ssd_rank1_dense_output_bwd_logalpha_off_kernel[grid_off_log](
-            y_off_saved,
-            grad_out_c,
-            dlog_diag,
-            BH,
-            NC,
-            C_CHUNK,
-            D,
             *y_off_saved.stride(),
-            *grad_out_c.stride(),
+            *dC_diag.stride(),
+            *dS0.stride(),
             *dlog_diag.stride(),
+            BLOCK_M=BLOCK_M,
             BLOCK_D=BLOCK_D,
             BLOCK_C=C_CHUNK,
+            M_STATIC=M,
             D_STATIC=D,
-            num_warps=_PHASE3_BWD_OFF_NUM_WARPS,
+            INPUT_PRECISION=input_precision,
+            num_warps=_PHASE3_BWD_FUSED_OFF_NUM_WARPS,
             num_stages=_PHASE3_BWD_NUM_STAGES,
         )
 
@@ -3267,14 +3225,17 @@ def ssd_rank1_dense_output_backward_kernel_profile(
 
     if has_s0:
         dS0 = torch.empty((BH, NC, M, D), device=C.device, dtype=torch.float32)
-        def _run_off_dc():
-            grid_off_dc = (BH * NC, n_m_tiles)
-            ssd_rank1_dense_output_bwd_off_dc_kernel[grid_off_dc](
+        def _run_fused_off():
+            grid_off = (BH * NC,)
+            ssd_rank1_dense_output_bwd_fused_off_kernel[grid_off](
                 C,
                 grad_out_c,
                 log_alpha,
                 S0_md,
+                y_off_saved,
                 dC_diag,
+                dS0,
+                dlog_diag,
                 BH,
                 NC,
                 C_CHUNK,
@@ -3284,78 +3245,31 @@ def ssd_rank1_dense_output_backward_kernel_profile(
                 *grad_out_c.stride(),
                 *log_alpha.stride(),
                 *S0_md.stride(),
-                *dC_diag.stride(),
-                BLOCK_M=BLOCK_M,
-                BLOCK_D=BLOCK_D,
-                BLOCK_C=C_CHUNK,
-                C_STATIC=C_CHUNK,
-                D_STATIC=D,
-                INPUT_PRECISION=INPUT_PRECISION,
-                num_warps=OFF_NUM_WARPS,
-                num_stages=NUM_STAGES,
-            )
-
-        if WARMUP:
-            _run_off_dc()
-            torch.cuda.synchronize()
-        _time("off_dc_ms", _run_off_dc)
-
-        def _run_off_ds0():
-            grid_off_ds0 = (BH * NC, n_m_tiles, n_d_tiles)
-            ssd_rank1_dense_output_bwd_off_ds0_kernel[grid_off_ds0](
-                C,
-                grad_out_c,
-                log_alpha,
-                dS0,
-                BH,
-                NC,
-                C_CHUNK,
-                M,
-                D,
-                *C.stride(),
-                *grad_out_c.stride(),
-                *log_alpha.stride(),
-                *dS0.stride(),
-                BLOCK_M=BLOCK_M,
-                BLOCK_D=BLOCK_D,
-                BLOCK_C=C_CHUNK,
-                INPUT_PRECISION=INPUT_PRECISION,
-                num_warps=OFF_NUM_WARPS,
-                num_stages=NUM_STAGES,
-            )
-
-        if WARMUP:
-            _run_off_ds0()
-            torch.cuda.synchronize()
-        _time("off_ds0_ms", _run_off_ds0)
-
-        def _run_off_log():
-            grid_off_log = (BH * NC,)
-            ssd_rank1_dense_output_bwd_logalpha_off_kernel[grid_off_log](
-                y_off_saved,
-                grad_out_c,
-                dlog_diag,
-                BH,
-                NC,
-                C_CHUNK,
-                D,
                 *y_off_saved.stride(),
-                *grad_out_c.stride(),
+                *dC_diag.stride(),
+                *dS0.stride(),
                 *dlog_diag.stride(),
+                BLOCK_M=BLOCK_M,
                 BLOCK_D=BLOCK_D,
                 BLOCK_C=C_CHUNK,
+                M_STATIC=M,
                 D_STATIC=D,
+                INPUT_PRECISION=INPUT_PRECISION,
                 num_warps=OFF_NUM_WARPS,
                 num_stages=NUM_STAGES,
             )
 
         if WARMUP:
-            _run_off_log()
+            _run_fused_off()
             torch.cuda.synchronize()
-        _time("log_off_ms", _run_off_log)
+        _time("fused_off_ms", _run_fused_off)
+        times["off_dc_ms"] = 0.0
+        times["off_ds0_ms"] = 0.0
+        times["log_off_ms"] = 0.0
 
         times["combine_ms"] = 0.0
     else:
+        times["fused_off_ms"] = 0.0
         times["off_dc_ms"] = 0.0
         times["off_ds0_ms"] = 0.0
         times["log_off_ms"] = 0.0
@@ -3364,6 +3278,7 @@ def ssd_rank1_dense_output_backward_kernel_profile(
     times["total_ms"] = (
         times.get("fused_a1a2_ms", times["a1_ms"] + times["dk_reduce_ms"] + times["a2_ms"])
         + times["log_diag_ms"]
+        + times.get("fused_off_ms", 0.0)
         + times["off_dc_ms"]
         + times["off_ds0_ms"]
         + times["log_off_ms"]
@@ -3569,8 +3484,24 @@ class SsdRank1Triton(torch.autograd.Function):
             else torch.zeros((BH, MD), device=C_chunk.device, dtype=compute_dtype)
         )
         dS_local_end = torch.empty((BH, NC, MD), device=C_chunk.device, dtype=torch.float32)
-        d_log_alpha_per_chunk = torch.empty((BH, NC), device=C_chunk.device, dtype=torch.float32)
-        d_init_f32 = torch.empty((BH, MD), device=C_chunk.device, dtype=torch.float32)
+        dS_local_end = _ssd_rank1_bwd_workspace_tensor(
+            "phase2_dS_local_end",
+            (BH, NC, MD),
+            device=C_chunk.device,
+            dtype=torch.float32,
+        )
+        d_log_alpha_per_chunk = _ssd_rank1_bwd_workspace_tensor(
+            "phase2_dlog_per_chunk",
+            (BH, NC),
+            device=C_chunk.device,
+            dtype=torch.float32,
+        )
+        d_init_f32 = _ssd_rank1_bwd_workspace_tensor(
+            "phase2_dinit",
+            (BH, MD),
+            device=C_chunk.device,
+            dtype=torch.float32,
+        )
 
         # Normalize dtype/layout for kernel launch without redundant copies:
         # if already fp32 contiguous, pass through directly.
@@ -3634,7 +3565,7 @@ class SsdRank1Triton(torch.autograd.Function):
         # We now have dL/dS_local_end from Phase 2 backward and can run
         # the three Phase 1 backward kernels to obtain:
         #   d_W_p1, d_V_p1, d_log_alpha_p1.
-        grad_s_md = dS_local_end.contiguous().view(BH, NC, M, D)
+        grad_s_md = dS_local_end.view(BH, NC, M, D)
 
         d_W_p1 = torch.empty_like(W_chunk)
         d_V_p1 = torch.empty_like(V_chunk)
@@ -3667,7 +3598,12 @@ class SsdRank1Triton(torch.autograd.Function):
             num_warps=2, num_stages=2,
         )
 
-        b_partials = torch.empty((BH, NC, n_d_tiles, CHUNK_SIZE), device=C_chunk.device, dtype=torch.float32)
+        b_partials = _ssd_rank1_bwd_workspace_tensor(
+            "phase1_b_partials",
+            (BH, NC, n_d_tiles, CHUNK_SIZE),
+            device=C_chunk.device,
+            dtype=torch.float32,
+        )
         grid_dv = (BH * NC, n_d_tiles)
         # Compute phase-1 contribution to dV and the intermediate `b` terms used for dlog_alpha_p1.
         ssd_rank1_chunk_end_state_bwd_dv_b_chunk_kernel[grid_dv](
@@ -3680,7 +3616,7 @@ class SsdRank1Triton(torch.autograd.Function):
             INPUT_PRECISION="ieee" if C_chunk.dtype == torch.float32 else "tf32",
             num_warps=2, num_stages=2,
         )
-        b_vals = torch.sum(b_partials, dim=2).contiguous()
+        b_vals = torch.sum(b_partials, dim=2)
 
         grid_dr = (BH * NC,)
         # Convert reduced `b` terms into phase-1 dlog_alpha contribution.
@@ -3703,11 +3639,13 @@ class SsdRank1Triton(torch.autograd.Function):
         #   - Phase 3 path
         #   - Phase 1 path (through S_local_end)
         # plus for log_alpha an additional Phase 2 chunk-scale contribution.
-        dW_chunk = dW_chunk + d_W_p1
-        dV_chunk = dV_chunk + d_V_p1
+        dW_chunk.add_(d_W_p1)
+        dV_chunk.add_(d_V_p1)
         # d_log_alpha_per_chunk is one scalar per chunk; broadcast over token index
         # so each token in the chunk receives the same phase-2 contribution.
-        dlog_alpha_chunk = dlog_alpha_chunk_p3 + d_log_alpha_p1 + d_log_alpha_per_chunk.unsqueeze(-1).to(log_alpha_chunk.dtype)
+        dlog_alpha_chunk_p3.add_(d_log_alpha_p1)
+        dlog_alpha_chunk_p3.add_(d_log_alpha_per_chunk.unsqueeze(-1).to(log_alpha_chunk.dtype))
+        dlog_alpha_chunk = dlog_alpha_chunk_p3
 
         # ---- Restore outer layout ----
         # Convert chunked [BH,NC,C,*] grads back to user-facing [B,N,H,*].
