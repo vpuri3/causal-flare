@@ -179,7 +179,8 @@ def _select_phase3_backward_launch_config(*, BH: int, NC: int, C_CHUNK: int, D: 
     if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 64:
         return _Phase3BackwardLaunchConfig(block_d=64, num_warps=2, num_stages=3)
     if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 128:
-        return _Phase3BackwardLaunchConfig(block_d=64, num_warps=4, num_stages=3)
+        # Retuned after enabling bf16 tensor-core dot path in phase-3 backward.
+        return _Phase3BackwardLaunchConfig(block_d=32, num_warps=2, num_stages=3)
 
     block_d = 64 if D % 64 == 0 else _select_largest_block_size(D, (32, 16), where="phase3_bwd", label="D")
     if C_CHUNK == 64 and block_d == 64 and BH * NC >= 4096:
@@ -343,6 +344,25 @@ def _restore_output_layout(
     )[:, :N]
     final_state = final_state_flat.reshape(B, H, D)
     return y, final_state
+
+
+def _reshape_log_alpha_per_chunk_to_bnh(
+    log_alpha_per_chunk: torch.Tensor,
+    *,
+    B: int,
+    H: int,
+    NC: int,
+    where: str,
+) -> torch.Tensor:
+    BH = B * H
+    if log_alpha_per_chunk.ndim == 2 and log_alpha_per_chunk.shape == (BH, NC):
+        return log_alpha_per_chunk.reshape(B, H, NC).permute(0, 2, 1).contiguous()
+    if log_alpha_per_chunk.ndim == 3 and log_alpha_per_chunk.shape == (B, NC, H):
+        return log_alpha_per_chunk if log_alpha_per_chunk.is_contiguous() else log_alpha_per_chunk.contiguous()
+    raise ValueError(
+        f"{where}: log_alpha_per_chunk must be [BH,NC] or [B,NC,H]. "
+        f"Got {tuple(log_alpha_per_chunk.shape)} with B={B}, H={H}, NC={NC}."
+    )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -971,6 +991,9 @@ def ssd_single_rank1_phase3_bwd_un_kernel(
     log_delta = (log_p[:, None] - log_p[None, :]) * 1.4426950408889634
     log_delta = tl.where(valid_tri, log_delta, 0.0)
     L = tl.where(valid_tri, tl.exp2(log_delta), 0.0)
+    if USE_BF16_DOT:
+        # Reuse the static CxC conversion across all D tiles in this program.
+        L_t_tc = tl.trans(L).to(tl.bfloat16)
 
     dL = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     src = tl.zeros((BLOCK_C,), dtype=tl.float32)
@@ -999,7 +1022,6 @@ def ssd_single_rank1_phase3_bwd_un_kernel(
         G = tl.load(gy_ptrs, mask=mask_cd, other=0.0).to(tl.float32)
 
         if USE_BF16_DOT:
-            L_t_tc = tl.trans(L).to(tl.bfloat16)
             G_tc = G.to(tl.bfloat16)
             V_t_tc = tl.trans(V_f).to(tl.bfloat16)
             dV_tile = tl.dot(L_t_tc, G_tc, out_dtype=tl.float32)
@@ -1295,9 +1317,13 @@ def _phase2_backward_impl(
     S0_chunk: torch.Tensor,
     log_alpha_per_chunk: torch.Tensor,
     *,
+    B: int,
+    H: int,
     compute_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     BH, NC, D = grad_chunk_start.shape
+    if B * H != BH:
+        raise ValueError(f"_phase2_backward_impl expected B*H == BH; got B={B}, H={H}, BH={BH}.")
     grad_chunk_start_f = (
         grad_chunk_start if grad_chunk_start.dtype == torch.float32 and grad_chunk_start.is_contiguous()
         else grad_chunk_start.float().contiguous()
@@ -1307,10 +1333,13 @@ def _phase2_backward_impl(
         else grad_final_state.float().contiguous()
     )
     S0_chunk_f = S0_chunk if S0_chunk.dtype == torch.float32 and S0_chunk.is_contiguous() else S0_chunk.float().contiguous()
+    log_alpha_per_chunk_bnh = _reshape_log_alpha_per_chunk_to_bnh(
+        log_alpha_per_chunk, B=B, H=H, NC=NC, where="_phase2_backward_impl"
+    )
     log_alpha_per_chunk_f = (
-        log_alpha_per_chunk
-        if log_alpha_per_chunk.dtype == torch.float32 and log_alpha_per_chunk.is_contiguous()
-        else log_alpha_per_chunk.float().contiguous()
+        log_alpha_per_chunk_bnh
+        if log_alpha_per_chunk_bnh.dtype == torch.float32 and log_alpha_per_chunk_bnh.is_contiguous()
+        else log_alpha_per_chunk_bnh.float().contiguous()
     )
 
     dS_local_end = _workspace_tensor(
@@ -1342,6 +1371,8 @@ def _phase2_backward_impl(
         dS_local_end,
         d_log_alpha_per_chunk,
         d_init,
+        B,
+        H,
         BH,
         NC,
         D,
@@ -1356,6 +1387,8 @@ def _phase2_backward_impl(
         NC_STATIC=NC,
         USE_FP32_COMPUTE=(compute_dtype == torch.float32),
         USE_BF16_COMPUTE=(compute_dtype == torch.bfloat16),
+        HAS_GRAD_FINAL=True,
+        WRITE_D_INIT=True,
     )
     return dS_local_end, d_log_alpha_per_chunk, d_init
 
@@ -1472,6 +1505,8 @@ class SsdSingleRank1Triton(torch.autograd.Function):
             grad_final,
             S0_chunk,
             log_alpha_per_chunk,
+            B=B,
+            H=H,
             compute_dtype=phase2_compute_dtype,
         )
 

@@ -170,14 +170,15 @@ def _select_phase3_forward_launch_config(
     M: int,
     D: int,
     where: str,
+    use_bf16_dot_inputs: bool = False,
 ) -> _Phase3ForwardLaunchConfig:
     block_m = _select_largest_block_size(M, _SUPPORTED_BLOCK_X_VALUES, where=where, label="M")
     block_d = _select_largest_block_size(D, _SUPPORTED_BLOCK_X_VALUES, where=where, label="D")
 
     work_items = BH * NC
-    # On high-parallel BF16 workloads with C=64, lower warps with deeper pipelining
-    # consistently improved phase-3 forward in benchmarking.
     if C_CHUNK == 64 and block_m == 64 and block_d == 64 and work_items >= 4096:
+        if use_bf16_dot_inputs:
+            return _Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=4, num_stages=4)
         return _Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=2, num_stages=3)
     if block_m >= 64 and block_d >= 64:
         return _Phase3ForwardLaunchConfig(block_m=block_m, block_d=block_d, num_warps=4, num_stages=2)
@@ -791,300 +792,6 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
     out_s_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(S, (1, 1, BLOCK_M, BLOCK_D)))
 
     # alpha_chunk belongs to phase-1 scope but is computed outside this kernel.
-
-
-@triton.jit
-def ssd_rank1_chunk_end_state_bwd_dw_chunk_kernel(
-    grad_s_local_end_ptr,
-    V_ptr,
-    log_alpha_ptr,
-    out_dw_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    d_size,
-    stride_grad_s_bh,
-    stride_grad_s_nc,
-    stride_grad_s_m,
-    stride_grad_s_d,
-    stride_v_bh,
-    stride_v_nc,
-    stride_v_c,
-    stride_v_d,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_out_dw_bh,
-    stride_out_dw_nc,
-    stride_out_dw_c,
-    stride_out_dw_m,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    C_STATIC: tl.constexpr,
-    D_STATIC: tl.constexpr,
-    INPUT_PRECISION: tl.constexpr,
-    ACCUMULATE: tl.constexpr,
-):
-    """Phase-1 backward kernel for `dW` with chunk-owned programs.
-
-    Program mapping:
-    - `pid0`: flattened `(BH, NC)` chunk index
-    - `pid1`: M tile
-
-    Math:
-      factor[t] = prod_{u=t+1..C-1} alpha_u, alpha_u = exp(log_alpha_u)
-      dW[t, m]  = factor[t] * sum_d G[m, d] * V[t, d]
-
-    This kernel computes a full `[C, BLOCK_M]` tile per program (not per-token),
-    so launch count scales with `M/BLOCK_M` instead of `C * M/BLOCK_M`.
-    """
-    pid_bhnc = tl.program_id(0)
-    pid_m_tile = tl.program_id(1)
-    if pid_bhnc >= bh_size * nc_size:
-        return
-
-    BH_IDX = pid_bhnc // nc_size
-    NC_IDX = pid_bhnc % nc_size
-
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-    grad_s_desc = tl.make_tensor_descriptor(
-        grad_s_local_end_ptr,
-        shape=[bh_size, nc_size, m_size, d_size],
-        strides=[stride_grad_s_bh, stride_grad_s_nc, stride_grad_s_m, stride_grad_s_d],
-        block_shape=[1, 1, BLOCK_M, BLOCK_D],
-    )
-    v_desc = tl.make_tensor_descriptor(
-        V_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_v_bh, stride_v_nc, stride_v_c, stride_v_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    out_dw_desc = tl.make_tensor_descriptor(
-        out_dw_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_out_dw_bh, stride_out_dw_nc, stride_out_dw_c, stride_out_dw_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-
-    log_alpha_in = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,))
-    log_alpha_vals = log_alpha_in.to(tl.float32)
-    INV_LN2 = 1.4426950408889634
-    log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
-    factors = tl.exp2((log_suffix_incl - log_alpha_vals) * INV_LN2)
-
-    m_start = pid_m_tile * BLOCK_M
-    acc = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
-    for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
-        d_start = d_blk * BLOCK_D
-        g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-        v_tile = tl.reshape(v_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-        acc += tl.dot(v_tile, tl.trans(g_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    dW_tile = factors[:, None] * acc
-    w_dtype_probe = tl.reshape(v_desc.load([BH_IDX, NC_IDX, 0, 0]), (BLOCK_C, BLOCK_D))
-    if ACCUMULATE:
-        old_dw = tl.reshape(out_dw_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        dW_tile = dW_tile + old_dw
-    out_dw_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW_tile.to(w_dtype_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
-
-
-@triton.jit
-def ssd_rank1_chunk_end_state_bwd_dv_b_chunk_kernel(
-    grad_s_local_end_ptr,
-    W_ptr,
-    V_ptr,
-    log_alpha_ptr,
-    out_dv_ptr,
-    out_b_vals_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    d_size,
-    n_d_tiles_size,
-    stride_grad_s_bh,
-    stride_grad_s_nc,
-    stride_grad_s_m,
-    stride_grad_s_d,
-    stride_w_bh,
-    stride_w_nc,
-    stride_w_c,
-    stride_w_m,
-    stride_v_bh,
-    stride_v_nc,
-    stride_v_c,
-    stride_v_d,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_out_dv_bh,
-    stride_out_dv_nc,
-    stride_out_dv_c,
-    stride_out_dv_d,
-    stride_out_b_bh,
-    stride_out_b_nc,
-    stride_out_b_c,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    C_STATIC: tl.constexpr,
-    M_STATIC: tl.constexpr,
-    INPUT_PRECISION: tl.constexpr,
-    ACCUMULATE: tl.constexpr,
-):
-    """Phase-1 backward kernel for `dV` + `b_t` with chunk-owned programs.
-
-    Program mapping:
-    - `pid0`: flattened `(BH, NC)` chunk index
-    - `pid1`: D tile
-
-    Computes:
-      dv_base[t, d] = sum_m G[m, d] * W[t, m]
-      dV[t, d]      = factor[t] * dv_base[t, d]
-      b_t[t]       += sum_{d in tile} dv_base[t, d] * V[t, d]
-    """
-    pid_bhnc = tl.program_id(0)
-    pid_d_tile = tl.program_id(1)
-    if pid_bhnc >= bh_size * nc_size or pid_d_tile >= n_d_tiles_size:
-        return
-
-    BH_IDX = pid_bhnc // nc_size
-    NC_IDX = pid_bhnc % nc_size
-
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-    grad_s_desc = tl.make_tensor_descriptor(
-        grad_s_local_end_ptr,
-        shape=[bh_size, nc_size, m_size, d_size],
-        strides=[stride_grad_s_bh, stride_grad_s_nc, stride_grad_s_m, stride_grad_s_d],
-        block_shape=[1, 1, BLOCK_M, BLOCK_D],
-    )
-    w_desc = tl.make_tensor_descriptor(
-        W_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_w_bh, stride_w_nc, stride_w_c, stride_w_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    v_desc = tl.make_tensor_descriptor(
-        V_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_v_bh, stride_v_nc, stride_v_c, stride_v_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    out_dv_desc = tl.make_tensor_descriptor(
-        out_dv_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_out_dv_bh, stride_out_dv_nc, stride_out_dv_c, stride_out_dv_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    log_alpha_in = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,))
-    log_alpha_vals = log_alpha_in.to(tl.float32)
-    INV_LN2 = 1.4426950408889634
-    log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
-    factors = tl.exp2((log_suffix_incl - log_alpha_vals) * INV_LN2)
-
-    d_start = pid_d_tile * BLOCK_D
-    acc = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
-    for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
-        m_start = m_blk * BLOCK_M
-        g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-        w_tile = tl.reshape(w_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        acc += tl.dot(w_tile, g_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
-    dV_tile = factors[:, None] * acc
-    v_dtype_probe = tl.reshape(v_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D))
-    if ACCUMULATE:
-        old_dv = tl.reshape(out_dv_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-        dV_tile = dV_tile + old_dv
-    out_dv_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV_tile.to(v_dtype_probe.dtype), (1, 1, BLOCK_C, BLOCK_D)))
-
-    v_tile = tl.reshape(v_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-    b_partial = tl.sum(acc * v_tile, axis=1)
-    offs_c = tl.arange(0, BLOCK_C)
-    b_ptrs = out_b_vals_ptr + BH_IDX * stride_out_b_bh + NC_IDX * stride_out_b_nc + offs_c * stride_out_b_c
-    tl.atomic_add(b_ptrs, b_partial)
-
-
-@triton.jit
-def ssd_rank1_chunk_end_state_bwd_dr_kernel(
-    b_vals_ptr,
-    log_alpha_ptr,
-    out_dlog_alpha_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    stride_b_bh,
-    stride_b_nc,
-    stride_b_c,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_out_dlog_alpha_bh,
-    stride_out_dlog_alpha_nc,
-    stride_out_dlog_alpha_c,
-    BLOCK_C: tl.constexpr,
-    C_STATIC: tl.constexpr,
-):
-    """Phase-1 backward kernel for `d log_alpha`.
-
-    Inputs:
-    - `b_vals`: scalar `b_t` per token
-    - `log_alpha`
-    Dense vector form for one `(BH, NC)`:
-
-      factor[t] = prod_{u=t+1..C-1} alpha_u
-      g[t]      = b_t * factor[t]
-      d(log_alpha_t) = sum_{j=0..t-1} g[j]
-
-    i.e. `dlog_alpha` is an exclusive prefix-sum of `g` along token axis.
-    """
-    pid_bhnc = tl.program_id(0)
-    if pid_bhnc >= bh_size * nc_size:
-        return
-
-    BH_IDX = pid_bhnc // nc_size
-    NC_IDX = pid_bhnc % nc_size
-
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-    b_desc = tl.make_tensor_descriptor(
-        b_vals_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_b_bh, stride_b_nc, stride_b_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-    out_dr_desc = tl.make_tensor_descriptor(
-        out_dlog_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_out_dlog_alpha_bh, stride_out_dlog_alpha_nc, stride_out_dlog_alpha_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-
-    log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,))
-    b_vals_in = tl.reshape(b_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,))
-    log_alpha_f = log_alpha_vals.to(tl.float32)
-    INV_LN2 = 1.4426950408889634
-    b_vals = b_vals_in.to(tl.float32)
-    log_suffix_incl = tl.cumsum(log_alpha_f, axis=0, reverse=True)
-    factors = tl.exp2((log_suffix_incl - log_alpha_f) * INV_LN2)
-    g_vals = b_vals * factors
-    prefix_incl = tl.cumsum(g_vals, axis=0)
-    grad_vec = prefix_incl - g_vals
-    out_dr_desc.store([BH_IDX, NC_IDX, 0], tl.reshape(grad_vec.to(log_alpha_vals.dtype), (1, 1, BLOCK_C)))
 
 
 @triton.jit
@@ -1729,22 +1436,29 @@ def _ssd_rank1_prefix_scan_forward_impl(
     compute_dtype: torch.dtype | None = None,
     return_final_state: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if S_local_end.ndim != 3 or log_alpha_chunk.ndim != 3:
+    if S_local_end.ndim != 3 or log_alpha_chunk.ndim not in (2, 3):
         raise ValueError(
             "_ssd_rank1_prefix_scan_forward_impl expects "
-            "S_local_end=[BH,NC,MD], log_alpha_chunk=[B,NC,H]. "
+            "S_local_end=[BH,NC,MD], log_alpha_chunk=[B,NC,H] or [BH,NC]. "
             f"Got S_local_end={tuple(S_local_end.shape)}, log_alpha_chunk={tuple(log_alpha_chunk.shape)}."
         )
     BH, NC, MD = S_local_end.shape
-    B_la, NC_la, H_la = log_alpha_chunk.shape
-    if NC_la != NC:
-        raise ValueError(f"log_alpha_chunk NC must match S_local_end NC. Got {NC_la} vs {NC}.")
-    if B_la * H_la != BH:
-        raise ValueError(f"log_alpha_chunk B*H must match BH. Got B={B_la}, H={H_la}, BH={BH}.")
+    if log_alpha_chunk.ndim == 3:
+        B_la, NC_la, H_la = log_alpha_chunk.shape
+        if NC_la != NC:
+            raise ValueError(f"log_alpha_chunk NC must match S_local_end NC. Got {NC_la} vs {NC}.")
+        if B_la * H_la != BH:
+            raise ValueError(f"log_alpha_chunk B*H must match BH. Got B={B_la}, H={H_la}, BH={BH}.")
+        log_alpha_chunk_bnh = log_alpha_chunk
+    else:
+        if log_alpha_chunk.shape != (BH, NC):
+            raise ValueError(f"log_alpha_chunk must be [BH,NC]={BH, NC} for 2D mode; got {tuple(log_alpha_chunk.shape)}.")
+        B_la, H_la = BH, 1
+        log_alpha_chunk_bnh = log_alpha_chunk.unsqueeze(-1)
     has_initial_state = initial_state is not None
     if has_initial_state and initial_state.shape != (BH, MD):
         raise ValueError(f"initial_state must be [BH,MD]. Got {tuple(initial_state.shape)} vs ({BH}, {MD}).")
-    if S_local_end.device != log_alpha_chunk.device:
+    if S_local_end.device != log_alpha_chunk_bnh.device:
         raise ValueError("S_local_end and log_alpha_chunk must be on the same device.")
     if has_initial_state and S_local_end.device != initial_state.device:
         raise ValueError("S_local_end, log_alpha_chunk, and initial_state must be on the same device.")
@@ -1766,10 +1480,10 @@ def _ssd_rank1_prefix_scan_forward_impl(
         )
 
     S_local_end_in = S_local_end if S_local_end.is_contiguous() else S_local_end.contiguous()
-    if log_alpha_chunk.dtype == torch.float32:
-        log_alpha_chunk_f = log_alpha_chunk
+    if log_alpha_chunk_bnh.dtype == torch.float32 and log_alpha_chunk_bnh.is_contiguous():
+        log_alpha_chunk_f = log_alpha_chunk_bnh
     else:
-        log_alpha_chunk_f = log_alpha_chunk.float()
+        log_alpha_chunk_f = log_alpha_chunk_bnh.float().contiguous()
     if has_initial_state:
         if initial_state.dtype == torch.float32:
             initial_state_f = initial_state
@@ -2253,300 +1967,6 @@ def ssd_rank1_dense_output_fwd_kernel(
 
 
 @triton.jit
-def ssd_rank1_dense_output_bwd_a1_kernel(
-    C_ptr,
-    W_ptr,
-    V_ptr,
-    log_alpha_ptr,
-    grad_y_ptr,
-    out_dV_ptr,
-    out_dK_partials_ptr,
-    out_R_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    d_size,
-    n_d_tiles,
-    stride_c_bh,
-    stride_c_nc,
-    stride_c_c,
-    stride_c_m,
-    stride_w_bh,
-    stride_w_nc,
-    stride_w_c,
-    stride_w_m,
-    stride_v_bh,
-    stride_v_nc,
-    stride_v_c,
-    stride_v_d,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_gy_bh,
-    stride_gy_nc,
-    stride_gy_c,
-    stride_gy_d,
-    stride_dv_bh,
-    stride_dv_nc,
-    stride_dv_c,
-    stride_dv_d,
-    stride_dk_flat,
-    stride_dk_c0,
-    stride_dk_c1,
-    stride_rout_bh,
-    stride_rout_nc,
-    stride_rout_c0,
-    stride_rout_c1,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    C_STATIC: tl.constexpr,
-    M_STATIC: tl.constexpr,
-    INPUT_PRECISION: tl.constexpr,
-):
-    """Phase-3 backward A1: per `(BH,NC,D-tile)` compute `dV` tile and `dK` partial.
-
-    For one chunk:
-      R = C @ W^T
-      L from log_alpha
-      K = L * R
-      dV[:, d_tile]      = K^T @ dY[:, d_tile]
-      dK_partial[d_tile] = dY[:, d_tile] @ V[:, d_tile]^T
-    """
-    pid_bhnc = tl.program_id(0)
-    pid_d_tile = tl.program_id(1)
-    if pid_bhnc >= bh_size * nc_size or pid_d_tile >= n_d_tiles:
-        return
-
-    BH_IDX = pid_bhnc // nc_size
-    NC_IDX = pid_bhnc % nc_size
-
-    c_desc = tl.make_tensor_descriptor(
-        C_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_c_bh, stride_c_nc, stride_c_c, stride_c_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    w_desc = tl.make_tensor_descriptor(
-        W_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_w_bh, stride_w_nc, stride_w_c, stride_w_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    v_desc = tl.make_tensor_descriptor(
-        V_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_v_bh, stride_v_nc, stride_v_c, stride_v_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-    gy_desc = tl.make_tensor_descriptor(
-        grad_y_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_gy_bh, stride_gy_nc, stride_gy_c, stride_gy_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    dv_desc = tl.make_tensor_descriptor(
-        out_dV_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_dv_bh, stride_dv_nc, stride_dv_c, stride_dv_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    dk_desc = tl.make_tensor_descriptor(
-        out_dK_partials_ptr,
-        shape=[bh_size * nc_size * n_d_tiles, c_size, c_size],
-        strides=[stride_dk_flat, stride_dk_c0, stride_dk_c1],
-        block_shape=[1, BLOCK_C, BLOCK_C],
-    )
-    r_out_desc = tl.make_tensor_descriptor(
-        out_R_ptr,
-        shape=[bh_size, nc_size, c_size, c_size],
-        strides=[stride_rout_bh, stride_rout_nc, stride_rout_c0, stride_rout_c1],
-        block_shape=[1, 1, BLOCK_C, BLOCK_C],
-    )
-
-    offs_c = tl.arange(0, BLOCK_C)
-    log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
-    log_p_incl = tl.cumsum(log_alpha_vals, axis=0)
-    row_idx = offs_c[:, None]
-    col_idx = offs_c[None, :]
-    valid = col_idx <= row_idx
-    INV_LN2 = 1.4426950408889634
-    log_delta_l2 = (log_p_incl[:, None] - log_p_incl[None, :]) * INV_LN2
-    log_delta_l2 = tl.where(valid, log_delta_l2, 0.0)
-    L = tl.where(valid, tl.exp2(log_delta_l2), 0.0)
-
-    R = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
-    for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
-        m_start = m_blk * BLOCK_M
-        C_blk = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        W_blk = tl.reshape(w_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        R += tl.dot(C_blk, tl.trans(W_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    K = L * R
-
-    d_start = pid_d_tile * BLOCK_D
-    G_in = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D))
-    V_in = tl.reshape(v_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D))
-    G = G_in.to(tl.float32)
-    V_f = V_in.to(tl.float32)
-
-    dV_tile = tl.dot(tl.trans(K), G, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    dv_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV_tile.to(V_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
-
-    dK_partial = tl.dot(G, tl.trans(V_f), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    flat_idx = pid_bhnc * n_d_tiles + pid_d_tile
-    dk_desc.store([flat_idx, 0, 0], tl.reshape(dK_partial, (1, BLOCK_C, BLOCK_C)))
-
-    if pid_d_tile == 0:
-        r_out_desc.store([BH_IDX, NC_IDX, 0, 0], tl.reshape(R, (1, 1, BLOCK_C, BLOCK_C)))
-
-
-@triton.jit
-def ssd_rank1_dense_output_bwd_a2_kernel(
-    C_ptr,
-    W_ptr,
-    log_alpha_ptr,
-    dK_ptr,
-    R_ptr,
-    out_dC_diag_ptr,
-    out_dW_ptr,
-    out_Q_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    stride_c_bh,
-    stride_c_nc,
-    stride_c_c,
-    stride_c_m,
-    stride_w_bh,
-    stride_w_nc,
-    stride_w_c,
-    stride_w_m,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_dk_bh,
-    stride_dk_nc,
-    stride_dk_c0,
-    stride_dk_c1,
-    stride_rbuf_bh,
-    stride_rbuf_nc,
-    stride_rbuf_c0,
-    stride_rbuf_c1,
-    stride_dc_bh,
-    stride_dc_nc,
-    stride_dc_c,
-    stride_dc_m,
-    stride_dw_bh,
-    stride_dw_nc,
-    stride_dw_c,
-    stride_dw_m,
-    stride_q_bh,
-    stride_q_nc,
-    stride_q_c0,
-    stride_q_c1,
-    BLOCK_M: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    C_STATIC: tl.constexpr,
-    INPUT_PRECISION: tl.constexpr,
-):
-    """Phase-3 backward A2: per `(BH,NC,M-tile)` compute `dC_diag`, `dW`; and `Q` once."""
-    pid_bhnc = tl.program_id(0)
-    pid_m_tile = tl.program_id(1)
-    if pid_bhnc >= bh_size * nc_size:
-        return
-
-    BH_IDX = pid_bhnc // nc_size
-    NC_IDX = pid_bhnc % nc_size
-    m_start = pid_m_tile * BLOCK_M
-
-    c_desc = tl.make_tensor_descriptor(
-        C_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_c_bh, stride_c_nc, stride_c_c, stride_c_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    w_desc = tl.make_tensor_descriptor(
-        W_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_w_bh, stride_w_nc, stride_w_c, stride_w_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-    dk_desc = tl.make_tensor_descriptor(
-        dK_ptr,
-        shape=[bh_size, nc_size, c_size, c_size],
-        strides=[stride_dk_bh, stride_dk_nc, stride_dk_c0, stride_dk_c1],
-        block_shape=[1, 1, BLOCK_C, BLOCK_C],
-    )
-    rbuf_desc = tl.make_tensor_descriptor(
-        R_ptr,
-        shape=[bh_size, nc_size, c_size, c_size],
-        strides=[stride_rbuf_bh, stride_rbuf_nc, stride_rbuf_c0, stride_rbuf_c1],
-        block_shape=[1, 1, BLOCK_C, BLOCK_C],
-    )
-    dc_desc = tl.make_tensor_descriptor(
-        out_dC_diag_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_dc_bh, stride_dc_nc, stride_dc_c, stride_dc_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    dw_desc = tl.make_tensor_descriptor(
-        out_dW_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_dw_bh, stride_dw_nc, stride_dw_c, stride_dw_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    q_desc = tl.make_tensor_descriptor(
-        out_Q_ptr,
-        shape=[bh_size, nc_size, c_size, c_size],
-        strides=[stride_q_bh, stride_q_nc, stride_q_c0, stride_q_c1],
-        block_shape=[1, 1, BLOCK_C, BLOCK_C],
-    )
-
-    offs_c = tl.arange(0, BLOCK_C)
-    log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
-    log_p_incl = tl.cumsum(log_alpha_vals, axis=0)
-    row_idx = offs_c[:, None]
-    col_idx = offs_c[None, :]
-    valid = col_idx <= row_idx
-    INV_LN2 = 1.4426950408889634
-    log_delta_l2 = (log_p_incl[:, None] - log_p_incl[None, :]) * INV_LN2
-    log_delta_l2 = tl.where(valid, log_delta_l2, 0.0)
-    L = tl.where(valid, tl.exp2(log_delta_l2), 0.0)
-
-    dK = tl.reshape(dk_desc.load([BH_IDX, NC_IDX, 0, 0]), (BLOCK_C, BLOCK_C)).to(tl.float32)
-    dR = dK * L
-
-    W_in = tl.reshape(w_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M))
-    C_in = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M))
-    W_tile = W_in.to(tl.float32)
-    C_tile = C_in.to(tl.float32)
-    dC_diag_tile = tl.dot(dR, W_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    dW_tile = tl.dot(tl.trans(dR), C_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    dc_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dC_diag_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
-    dw_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
-
-    if pid_m_tile == 0:
-        R = tl.reshape(rbuf_desc.load([BH_IDX, NC_IDX, 0, 0]), (BLOCK_C, BLOCK_C)).to(tl.float32)
-        Q = dR * R
-        q_desc.store([BH_IDX, NC_IDX, 0, 0], tl.reshape(Q, (1, 1, BLOCK_C, BLOCK_C)))
-
-
-
-@triton.jit
 def ssd_rank1_dense_output_bwd_fused_kernel(
     C_ptr,
     W_ptr,
@@ -2882,438 +2302,6 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
 
 
 
-@triton.jit
-def ssd_rank1_dense_output_bwd_fused_off_kernel(
-    C_ptr,
-    grad_y_ptr,
-    log_alpha_ptr,
-    S0_ptr,
-    out_dC_off_ptr,
-    out_dS0_ptr,
-    out_dlog_off_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    d_size,
-    stride_c_bh,
-    stride_c_nc,
-    stride_c_c,
-    stride_c_m,
-    stride_gy_bh,
-    stride_gy_nc,
-    stride_gy_c,
-    stride_gy_d,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_s0_bh,
-    stride_s0_nc,
-    stride_s0_m,
-    stride_s0_d,
-    stride_dc_bh,
-    stride_dc_nc,
-    stride_dc_c,
-    stride_dc_m,
-    stride_ds0_bh,
-    stride_ds0_nc,
-    stride_ds0_m,
-    stride_ds0_d,
-    stride_dlog_bh,
-    stride_dlog_nc,
-    stride_dlog_c,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    M_STATIC: tl.constexpr,
-    D_STATIC: tl.constexpr,
-    INPUT_PRECISION: tl.constexpr,
-):
-    """Fused off-path backward: per (BH,NC) chunk compute dC_off, dS0, dlog_off.
-
-    Builds log_alpha cumsum once, then computes all three off-path gradients.
-    Eliminates two redundant log_alpha cumsum recomputations from split kernels.
-    """
-    pid_bhnc = tl.program_id(0)
-    if pid_bhnc >= bh_size * nc_size:
-        return
-    BH_IDX = pid_bhnc // nc_size
-    NC_IDX = pid_bhnc % nc_size
-
-    c_desc = tl.make_tensor_descriptor(
-        C_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_c_bh, stride_c_nc, stride_c_c, stride_c_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    gy_desc = tl.make_tensor_descriptor(
-        grad_y_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_gy_bh, stride_gy_nc, stride_gy_c, stride_gy_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-    s0_desc = tl.make_tensor_descriptor(
-        S0_ptr,
-        shape=[bh_size, nc_size, m_size, d_size],
-        strides=[stride_s0_bh, stride_s0_nc, stride_s0_m, stride_s0_d],
-        block_shape=[1, 1, BLOCK_M, BLOCK_D],
-    )
-    dc_desc = tl.make_tensor_descriptor(
-        out_dC_off_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_dc_bh, stride_dc_nc, stride_dc_c, stride_dc_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    ds0_desc = tl.make_tensor_descriptor(
-        out_dS0_ptr,
-        shape=[bh_size, nc_size, m_size, d_size],
-        strides=[stride_ds0_bh, stride_ds0_nc, stride_ds0_m, stride_ds0_d],
-        block_shape=[1, 1, BLOCK_M, BLOCK_D],
-    )
-    dlog_desc = tl.make_tensor_descriptor(
-        out_dlog_off_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_dlog_bh, stride_dlog_nc, stride_dlog_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-
-    # ---- Build prefix products p[i] = exp2(cumsum(log_alpha)) once ----
-    log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
-    log_p = tl.cumsum(log_alpha_vals, axis=0)
-    INV_LN2 = 1.4426950408889634
-    p = tl.exp2(log_p * INV_LN2)
-
-    # ---- dC_off, dS0, and src for dlog_off: iterate over (M-tile, D-tile) ----
-    src = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
-        m_start = m_blk * BLOCK_M
-        dC_off = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
-        C_tile = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
-            d_start = d_blk * BLOCK_D
-            G_tile = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-            dB_tile = p[:, None] * G_tile
-            S0_tile = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-            y_off_part = p[:, None] * tl.dot(C_tile, S0_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            src += tl.sum(G_tile * y_off_part, axis=1)
-            dC_off += tl.dot(dB_tile, tl.trans(S0_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            dS0_tile = tl.dot(tl.trans(C_tile), dB_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            ds0_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(dS0_tile, (1, 1, BLOCK_M, BLOCK_D)))
-
-        # Accumulate dC_off into dC_diag (read-modify-write)
-        c_probe = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M))
-        dc_prev = tl.reshape(dc_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        dc_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape((dc_prev + dC_off).to(c_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
-
-    # ---- dlog_off from accumulated src ----
-    dlog_off = tl.cumsum(src, axis=0, reverse=True)
-    out_prev = tl.reshape(dlog_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
-    dlog_desc.store([BH_IDX, NC_IDX, 0], tl.reshape(out_prev + dlog_off, (1, 1, BLOCK_C)))
-
-
-@triton.jit
-def ssd_rank1_dense_output_bwd_off_dc_kernel(
-    C_ptr,
-    grad_y_ptr,
-    log_alpha_ptr,
-    S0_ptr,
-    out_dC_off_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    d_size,
-    stride_c_bh,
-    stride_c_nc,
-    stride_c_c,
-    stride_c_m,
-    stride_gy_bh,
-    stride_gy_nc,
-    stride_gy_c,
-    stride_gy_d,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_s0_bh,
-    stride_s0_nc,
-    stride_s0_m,
-    stride_s0_d,
-    stride_dc_bh,
-    stride_dc_nc,
-    stride_dc_c,
-    stride_dc_m,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    C_STATIC: tl.constexpr,
-    D_STATIC: tl.constexpr,
-    INPUT_PRECISION: tl.constexpr,
-):
-    """Off-path kernel accumulating `dC_off = dB @ S0^T` into `out_dC`."""
-    pid_bhnc = tl.program_id(0)
-    pid_m_tile = tl.program_id(1)
-    if pid_bhnc >= bh_size * nc_size:
-        return
-    BH_IDX = pid_bhnc // nc_size
-    NC_IDX = pid_bhnc % nc_size
-    m_start = pid_m_tile * BLOCK_M
-
-    c_desc = tl.make_tensor_descriptor(
-        C_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_c_bh, stride_c_nc, stride_c_c, stride_c_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    gy_desc = tl.make_tensor_descriptor(
-        grad_y_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_gy_bh, stride_gy_nc, stride_gy_c, stride_gy_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-    s0_desc = tl.make_tensor_descriptor(
-        S0_ptr,
-        shape=[bh_size, nc_size, m_size, d_size],
-        strides=[stride_s0_bh, stride_s0_nc, stride_s0_m, stride_s0_d],
-        block_shape=[1, 1, BLOCK_M, BLOCK_D],
-    )
-    dc_desc = tl.make_tensor_descriptor(
-        out_dC_off_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_dc_bh, stride_dc_nc, stride_dc_c, stride_dc_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-
-    log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
-    log_p = tl.cumsum(log_alpha_vals, axis=0)
-    INV_LN2 = 1.4426950408889634
-    p = tl.exp2(log_p * INV_LN2)
-
-    dC_off = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
-    for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
-        d_start = d_blk * BLOCK_D
-        G_tile = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-        dB_tile = p[:, None] * G_tile
-        S0_tile = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-        dC_off += tl.dot(dB_tile, tl.trans(S0_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
-    c_probe = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M))
-    dc_prev = tl.reshape(dc_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-    dc_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape((dc_prev + dC_off).to(c_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
-
-
-@triton.jit
-def ssd_rank1_dense_output_bwd_off_ds0_kernel(
-    C_ptr,
-    grad_y_ptr,
-    log_alpha_ptr,
-    out_dS0_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    d_size,
-    stride_c_bh,
-    stride_c_nc,
-    stride_c_c,
-    stride_c_m,
-    stride_gy_bh,
-    stride_gy_nc,
-    stride_gy_c,
-    stride_gy_d,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_ds0_bh,
-    stride_ds0_nc,
-    stride_ds0_m,
-    stride_ds0_d,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    INPUT_PRECISION: tl.constexpr,
-):
-    """Off-path kernel for `dS0 = C^T @ dB`, where `dB = dY * p`."""
-    pid_bhnc = tl.program_id(0)
-    pid_m_tile = tl.program_id(1)
-    pid_d_tile = tl.program_id(2)
-    if pid_bhnc >= bh_size * nc_size:
-        return
-    BH_IDX = pid_bhnc // nc_size
-    NC_IDX = pid_bhnc % nc_size
-    m_start = pid_m_tile * BLOCK_M
-    d_start = pid_d_tile * BLOCK_D
-
-    c_desc = tl.make_tensor_descriptor(
-        C_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_c_bh, stride_c_nc, stride_c_c, stride_c_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
-    )
-    gy_desc = tl.make_tensor_descriptor(
-        grad_y_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_gy_bh, stride_gy_nc, stride_gy_c, stride_gy_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-    ds0_desc = tl.make_tensor_descriptor(
-        out_dS0_ptr,
-        shape=[bh_size, nc_size, m_size, d_size],
-        strides=[stride_ds0_bh, stride_ds0_nc, stride_ds0_m, stride_ds0_d],
-        block_shape=[1, 1, BLOCK_M, BLOCK_D],
-    )
-
-    log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
-    log_p = tl.cumsum(log_alpha_vals, axis=0)
-    INV_LN2 = 1.4426950408889634
-    p = tl.exp2(log_p * INV_LN2)
-
-    C_tile = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-    G_tile = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-    dB_tile = p[:, None] * G_tile
-    dS0_tile = tl.dot(tl.trans(C_tile), dB_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    ds0_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(dS0_tile, (1, 1, BLOCK_M, BLOCK_D)))
-
-
-@triton.jit
-def ssd_rank1_dense_output_bwd_logalpha_diag_kernel(
-    Q_ptr,
-    out_dlog_diag_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    stride_q_bh,
-    stride_q_nc,
-    stride_q_c0,
-    stride_q_c1,
-    stride_out_bh,
-    stride_out_nc,
-    stride_out_c,
-    BLOCK_C: tl.constexpr,
-    C_STATIC: tl.constexpr,
-):
-    """Compute `dlog_alpha_diag[k] = sum_{i>=k} sum_{j<k} Q[i,j]` in O(C^2).
-
-    Vectorized form:
-    1) left_prefix[i,k] = sum_{j<=k} Q[i,j]
-    2) left_of[i,k]     = left_prefix[i,k] - Q[i,k] = sum_{j<k} Q[i,j]
-    3) suffix_rows[i,k] = sum_{u>=i} left_of[u,k]
-    4) dlog[k]          = suffix_rows[k,k]
-    """
-    pid_bhnc = tl.program_id(0)
-    if pid_bhnc >= bh_size * nc_size:
-        return
-    BH_IDX = pid_bhnc // nc_size
-    NC_IDX = pid_bhnc % nc_size
-
-    q_desc = tl.make_tensor_descriptor(
-        Q_ptr,
-        shape=[bh_size, nc_size, c_size, c_size],
-        strides=[stride_q_bh, stride_q_nc, stride_q_c0, stride_q_c1],
-        block_shape=[1, 1, BLOCK_C, BLOCK_C],
-    )
-    out_desc = tl.make_tensor_descriptor(
-        out_dlog_diag_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_out_bh, stride_out_nc, stride_out_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-
-    Q = tl.reshape(q_desc.load([BH_IDX, NC_IDX, 0, 0]), (BLOCK_C, BLOCK_C)).to(tl.float32)
-    left_prefix = tl.cumsum(Q, axis=1)
-    left_of = left_prefix - Q
-    suffix_rows = tl.flip(tl.cumsum(tl.flip(left_of, 0), axis=0), 0)
-    offs = tl.arange(0, BLOCK_C)
-    is_diag = offs[:, None] == offs[None, :]
-    dlog = tl.sum(tl.where(is_diag, suffix_rows, 0.0), axis=1)
-
-    out_desc.store([BH_IDX, NC_IDX, 0], tl.reshape(dlog, (1, 1, BLOCK_C)))
-
-
-@triton.jit
-def ssd_rank1_dense_output_bwd_logalpha_off_kernel(
-    y_off_ptr,
-    grad_y_ptr,
-    out_dlog_off_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    d_size,
-    stride_yoff_bh,
-    stride_yoff_nc,
-    stride_yoff_c,
-    stride_yoff_d,
-    stride_gy_bh,
-    stride_gy_nc,
-    stride_gy_c,
-    stride_gy_d,
-    stride_out_bh,
-    stride_out_nc,
-    stride_out_c,
-    BLOCK_D: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    D_STATIC: tl.constexpr,
-):
-    """Compute off-path `dlog_alpha` from cached `Y_off`.
-
-    Since `Y_off[i, d] = p_i * B[i, d]`, the source term is:
-      src[i] = sum_d grad_y[i, d] * Y_off[i, d]
-    and:
-      dlog_alpha[k] = sum_{i>=k} src[i]
-    """
-    pid_bhnc = tl.program_id(0)
-    if pid_bhnc >= bh_size * nc_size:
-        return
-    BH_IDX = pid_bhnc // nc_size
-    NC_IDX = pid_bhnc % nc_size
-
-    y_off_desc = tl.make_tensor_descriptor(
-        y_off_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_yoff_bh, stride_yoff_nc, stride_yoff_c, stride_yoff_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    gy_desc = tl.make_tensor_descriptor(
-        grad_y_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_gy_bh, stride_gy_nc, stride_gy_c, stride_gy_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    out_desc = tl.make_tensor_descriptor(
-        out_dlog_off_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_out_bh, stride_out_nc, stride_out_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
-
-    src = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
-        d_start = d_blk * BLOCK_D
-        Y_off_tile = tl.reshape(y_off_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-        G_tile = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-        src += tl.sum(G_tile * Y_off_tile, axis=1)
-    dlog = tl.cumsum(src, axis=0, reverse=True)
-    out_prev = tl.reshape(out_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
-    out_desc.store([BH_IDX, NC_IDX, 0], tl.reshape(out_prev + dlog, (1, 1, BLOCK_C)))
-
-
 # ==================================================================================================
 # PHASE 3 AUTOGRAD
 # ==================================================================================================
@@ -3389,6 +2377,11 @@ def _ssd_rank1_dense_output_forward_impl(
 
     out = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
     y_off_saved = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype) if RETURN_Y_OFF else out
+    use_bf16_dot_inputs = _prefer_bf16_dot_inputs(
+        device=C_5d.device,
+        input_precision=INPUT_PRECISION,
+        input_dtype=C_5d.dtype,
+    )
     phase3_fwd_cfg = _select_phase3_forward_launch_config(
         BH=BH,
         NC=NC,
@@ -3396,6 +2389,7 @@ def _ssd_rank1_dense_output_forward_impl(
         M=M,
         D=D,
         where="_ssd_rank1_dense_output_forward_impl",
+        use_bf16_dot_inputs=use_bf16_dot_inputs,
     )
     grid = (BH * NC, D // phase3_fwd_cfg.block_d)
     ssd_rank1_dense_output_fwd_kernel[grid](
@@ -3426,11 +2420,7 @@ def _ssd_rank1_dense_output_forward_impl(
         C_STATIC=C_CHUNK,
         M_STATIC=M,
         INPUT_PRECISION=INPUT_PRECISION,
-        USE_BF16_DOT_INPUTS=_prefer_bf16_dot_inputs(
-            device=C_5d.device,
-            input_precision=INPUT_PRECISION,
-            input_dtype=C_5d.dtype,
-        ),
+        USE_BF16_DOT_INPUTS=use_bf16_dot_inputs,
         WRITE_Y_OFF=RETURN_Y_OFF,
         num_warps=phase3_fwd_cfg.num_warps,
         num_stages=phase3_fwd_cfg.num_stages,
@@ -3629,6 +2619,147 @@ def _ssd_rank1_dense_output_backward_impl(
     return dC, dW, dV, dlog.to(log_alpha_4d.dtype), dS0_out
 
 
+def ssd_rank1_dense_output_forward_kernel_profile(
+    C: torch.Tensor,
+    W: torch.Tensor,
+    V: torch.Tensor,
+    log_alpha: torch.Tensor,
+    S0: torch.Tensor | None = None,
+    INPUT_PRECISION: str = "tf32",
+    BLOCK_M: int | None = None,
+    BLOCK_D: int | None = None,
+    NUM_WARPS: int | None = None,
+    NUM_STAGES: int | None = None,
+    RETURN_Y_OFF: bool = False,
+    WARMUP: bool = True,
+) -> dict[str, float]:
+    """Profile fused Phase-3 Triton forward kernel and return timings (ms).
+
+    Expects chunked tensors:
+      C=[BH,NC,C,M], W=[BH,NC,C,M], V=[BH,NC,C,D], log_alpha=[BH,NC,C].
+    """
+    if C.ndim != 4 or W.ndim != 4 or V.ndim != 4 or log_alpha.ndim != 3:
+        raise ValueError(
+            "ssd_rank1_dense_output_forward_kernel_profile expects "
+            "C=[BH,NC,C,M], W=[BH,NC,C,M], V=[BH,NC,C,D], log_alpha=[BH,NC,C]."
+        )
+    BH, NC, C_CHUNK, M = C.shape
+    if W.shape != (BH, NC, C_CHUNK, M):
+        raise ValueError("W shape mismatch.")
+    if V.shape[:3] != (BH, NC, C_CHUNK):
+        raise ValueError("V shape mismatch.")
+    D = V.shape[-1]
+    if log_alpha.shape != (BH, NC, C_CHUNK):
+        raise ValueError("log_alpha shape mismatch.")
+    _require_supported_md(M, D, where="ssd_rank1_dense_output_forward_kernel_profile")
+    _require_chunk_size_multiple_of_16(C_CHUNK, where="ssd_rank1_dense_output_forward_kernel_profile")
+    _require_nonpositive_log_alpha(log_alpha, where="ssd_rank1_dense_output_forward_kernel_profile")
+    if not C.is_cuda:
+        raise NotImplementedError("ssd_rank1_dense_output_forward_kernel_profile requires CUDA tensors.")
+    _ensure_triton_allocator()
+
+    if S0 is None:
+        S0_md = torch.zeros((BH, NC, M, D), device=C.device, dtype=C.dtype)
+    else:
+        if S0.ndim == 3 and S0.shape == (BH, NC, M * D):
+            S0_md = S0.reshape(BH, NC, M, D).to(C.dtype)
+        elif S0.ndim == 4 and S0.shape == (BH, NC, M, D):
+            S0_md = S0.to(C.dtype)
+        else:
+            raise ValueError("S0 shape mismatch.")
+
+    use_bf16_dot_inputs = _prefer_bf16_dot_inputs(
+        device=C.device,
+        input_precision=INPUT_PRECISION,
+        input_dtype=C.dtype,
+    )
+    default_cfg = _select_phase3_forward_launch_config(
+        BH=BH,
+        NC=NC,
+        C_CHUNK=C_CHUNK,
+        M=M,
+        D=D,
+        where="ssd_rank1_dense_output_forward_kernel_profile",
+        use_bf16_dot_inputs=use_bf16_dot_inputs,
+    )
+    BLOCK_M = default_cfg.block_m if BLOCK_M is None else BLOCK_M
+    BLOCK_D = default_cfg.block_d if BLOCK_D is None else BLOCK_D
+    NUM_WARPS = default_cfg.num_warps if NUM_WARPS is None else NUM_WARPS
+    NUM_STAGES = default_cfg.num_stages if NUM_STAGES is None else NUM_STAGES
+    if M % BLOCK_M != 0 or D % BLOCK_D != 0:
+        raise NotImplementedError(
+            "Profile currently requires M%BLOCK_M==0 and D%BLOCK_D==0; "
+            f"got M={M}, D={D}, BLOCK_M={BLOCK_M}, BLOCK_D={BLOCK_D}."
+        )
+
+    out = torch.empty((BH, NC, C_CHUNK, D), device=C.device, dtype=C.dtype)
+    y_off_saved = torch.empty_like(out) if RETURN_Y_OFF else out
+    C_5d = C.unsqueeze(3)
+    W_5d = W.unsqueeze(3)
+    V_5d = V.unsqueeze(3)
+    log_alpha_4d = log_alpha.unsqueeze(3)
+    B = BH
+    H = 1
+    times: dict[str, float] = {}
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    def _time(label: str, fn) -> None:
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        times[label] = float(start.elapsed_time(end))
+
+    def _run_fused() -> None:
+        grid = (BH * NC, D // BLOCK_D)
+        ssd_rank1_dense_output_fwd_kernel[grid](
+            C_5d,
+            W_5d,
+            V_5d,
+            log_alpha_4d,
+            S0_md,
+            out,
+            y_off_saved,
+            B,
+            H,
+            BH,
+            NC,
+            C_CHUNK,
+            M,
+            D,
+            *C_5d.stride(),
+            *W_5d.stride(),
+            *V_5d.stride(),
+            *log_alpha_4d.stride(),
+            *S0_md.stride(),
+            *out.stride(),
+            *y_off_saved.stride(),
+            BLOCK_M=BLOCK_M,
+            BLOCK_D=BLOCK_D,
+            BLOCK_C=C_CHUNK,
+            C_STATIC=C_CHUNK,
+            M_STATIC=M,
+            INPUT_PRECISION=INPUT_PRECISION,
+            USE_BF16_DOT_INPUTS=use_bf16_dot_inputs,
+            WRITE_Y_OFF=RETURN_Y_OFF,
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES,
+        )
+
+    if WARMUP:
+        _run_fused()
+        torch.cuda.synchronize()
+    _time("fused_ms", _run_fused)
+    times["total_ms"] = times["fused_ms"]
+    times["BLOCK_M"] = float(BLOCK_M)
+    times["BLOCK_D"] = float(BLOCK_D)
+    times["NUM_WARPS"] = float(NUM_WARPS)
+    times["NUM_STAGES"] = float(NUM_STAGES)
+    times["USE_BF16_DOT_INPUTS"] = float(1 if use_bf16_dot_inputs else 0)
+    return times
+
+
 def ssd_rank1_dense_output_backward_kernel_profile(
     C: torch.Tensor,
     W: torch.Tensor,
@@ -3783,26 +2914,7 @@ def ssd_rank1_dense_output_backward_kernel_profile(
         _run_fused()
         torch.cuda.synchronize()
     _time("fused_ms", _run_fused)
-    times["fused_a1a2_ms"] = times["fused_ms"]
-    times["a1_ms"] = 0.0
-    times["dk_reduce_ms"] = 0.0
-    times["a2_ms"] = 0.0
-    times["log_diag_ms"] = 0.0
-    times["fused_off_ms"] = 0.0
-    times["off_dc_ms"] = 0.0
-    times["off_ds0_ms"] = 0.0
-    times["log_off_ms"] = 0.0
-    times["combine_ms"] = 0.0
-
-    times["total_ms"] = (
-        times.get("fused_ms", 0.0)
-        + times["log_diag_ms"]
-        + times.get("fused_off_ms", 0.0)
-        + times["off_dc_ms"]
-        + times["off_ds0_ms"]
-        + times["log_off_ms"]
-        + times["combine_ms"]
-    )
+    times["total_ms"] = times["fused_ms"]
     times["BLOCK_M"] = float(BLOCK_M)
     times["BLOCK_D"] = float(BLOCK_D)
     times["FUSED_A1A2_NUM_WARPS"] = float(FUSED_A1A2_NUM_WARPS)
@@ -4005,10 +3117,11 @@ class SsdRank1Triton(torch.autograd.Function):
         else:
             grad_final_f = torch.empty((1, 1), device=V_chunk.device, dtype=torch.float32)
         s0_chunk_f = S0_chunk if S0_chunk.dtype == torch.float32 and S0_chunk.is_contiguous() else S0_chunk.float().contiguous()
+        log_alpha_per_chunk_bnh = log_alpha_per_chunk.reshape(B, H, NC).permute(0, 2, 1).contiguous()
         log_alpha_per_chunk_f = (
-            log_alpha_per_chunk
-            if log_alpha_per_chunk.dtype == torch.float32
-            else log_alpha_per_chunk.float()
+            log_alpha_per_chunk_bnh
+            if log_alpha_per_chunk_bnh.dtype == torch.float32
+            else log_alpha_per_chunk_bnh.float()
         )
         # Reuse dS0 buffer for dS_local_end to avoid an extra full [BH,NC,MD] allocation.
         # The phase-2 kernel loads grad_prefix before writing d_s_local for each tile.
