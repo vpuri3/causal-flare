@@ -163,7 +163,7 @@ def _select_phase3_forward_launch_config(*, BH: int, NC: int, C_CHUNK: int, D: i
     if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 64:
         return _Phase3ForwardLaunchConfig(block_d=64, num_warps=2, num_stages=3)
     if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 128:
-        return _Phase3ForwardLaunchConfig(block_d=64, num_warps=2, num_stages=2)
+        return _Phase3ForwardLaunchConfig(block_d=128, num_warps=4, num_stages=2)
 
     block_d = _select_largest_block_size(D, _SUPPORTED_BLOCK_X_VALUES, where="phase3_fwd", label="D")
     work_items = BH * NC
@@ -783,7 +783,6 @@ def ssd_single_rank1_phase3_fwd_un_kernel(
     USE_BF16_DOT: tl.constexpr,
 ):
     pid_bhnc = tl.program_id(0)
-    pid_d_tile = tl.program_id(1)
     bh_size = b_size * h_size
     if pid_bhnc >= bh_size * nc_size:
         return
@@ -792,14 +791,10 @@ def ssd_single_rank1_phase3_fwd_un_kernel(
     NC_IDX = pid_bhnc % nc_size
     B_IDX = BH_IDX // h_size
     H_IDX = BH_IDX % h_size
-    d_start = pid_d_tile * BLOCK_D
 
     offs_c = tl.arange(0, BLOCK_C)
-    offs_d = d_start + tl.arange(0, BLOCK_D)
     n_idx = NC_IDX * BLOCK_C + offs_c
     mask_c = n_idx < n_size
-    mask_d = offs_d < d_size
-    mask_cd = mask_c[:, None] & mask_d[None, :]
 
     log_ptrs = log_alpha_ptr + B_IDX * stride_r_b + n_idx * stride_r_n + H_IDX * stride_r_h
     log_alpha_vals = tl.load(log_ptrs, mask=mask_c, other=0.0).to(tl.float32)
@@ -809,44 +804,52 @@ def ssd_single_rank1_phase3_fwd_un_kernel(
     log_delta = tl.where(valid, log_delta, 0.0)
     L = tl.where(valid, tl.exp2(log_delta), 0.0)
     p = tl.exp2(log_p * 1.4426950408889634)
-
-    v_ptrs = (
-        V_ptr
-        + B_IDX * stride_v_b
-        + n_idx[:, None] * stride_v_n
-        + H_IDX * stride_v_h
-        + offs_d[None, :] * stride_v_d
-    )
-    V_in = tl.load(v_ptrs, mask=mask_cd, other=0.0)
-    V_f = V_in.to(tl.float32)
     if USE_BF16_DOT:
-        Y_diag = tl.dot(L.to(tl.bfloat16), V_f.to(tl.bfloat16), out_dtype=tl.float32)
-    else:
-        Y_diag = tl.dot(L, V_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        L_tc = L.to(tl.bfloat16)
 
-    s0_ptrs = S0_ptr + BH_IDX * stride_s0_bh + NC_IDX * stride_s0_nc + offs_d * stride_s0_d
-    S0_tile = tl.load(s0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
-    Y_off = p[:, None] * S0_tile[None, :]
-    Y = Y_diag + Y_off
+    for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
+        d_start = d_blk * BLOCK_D
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < d_size
+        mask_cd = mask_c[:, None] & mask_d[None, :]
 
-    out_ptrs = (
-        out_y_ptr
-        + BH_IDX * stride_out_y_bh
-        + NC_IDX * stride_out_y_nc
-        + offs_c[:, None] * stride_out_y_c
-        + offs_d[None, :] * stride_out_y_d
-    )
-    tl.store(out_ptrs, Y.to(V_in.dtype), mask=mask_cd)
-
-    if STORE_Y_OFF:
-        out_off_ptrs = (
-            out_y_off_ptr
-            + BH_IDX * stride_out_y_off_bh
-            + NC_IDX * stride_out_y_off_nc
-            + offs_c[:, None] * stride_out_y_off_c
-            + offs_d[None, :] * stride_out_y_off_d
+        v_ptrs = (
+            V_ptr
+            + B_IDX * stride_v_b
+            + n_idx[:, None] * stride_v_n
+            + H_IDX * stride_v_h
+            + offs_d[None, :] * stride_v_d
         )
-        tl.store(out_off_ptrs, Y_off.to(V_in.dtype), mask=mask_cd)
+        V_in = tl.load(v_ptrs, mask=mask_cd, other=0.0)
+        V_f = V_in.to(tl.float32)
+        if USE_BF16_DOT:
+            Y_diag = tl.dot(L_tc, V_f.to(tl.bfloat16), out_dtype=tl.float32)
+        else:
+            Y_diag = tl.dot(L, V_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+
+        s0_ptrs = S0_ptr + BH_IDX * stride_s0_bh + NC_IDX * stride_s0_nc + offs_d * stride_s0_d
+        S0_tile = tl.load(s0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+        Y_off = p[:, None] * S0_tile[None, :]
+        Y = Y_diag + Y_off
+
+        out_ptrs = (
+            out_y_ptr
+            + BH_IDX * stride_out_y_bh
+            + NC_IDX * stride_out_y_nc
+            + offs_c[:, None] * stride_out_y_c
+            + offs_d[None, :] * stride_out_y_d
+        )
+        tl.store(out_ptrs, Y.to(V_in.dtype), mask=mask_cd)
+
+        if STORE_Y_OFF:
+            out_off_ptrs = (
+                out_y_off_ptr
+                + BH_IDX * stride_out_y_off_bh
+                + NC_IDX * stride_out_y_off_nc
+                + offs_c[:, None] * stride_out_y_off_c
+                + offs_d[None, :] * stride_out_y_off_d
+            )
+            tl.store(out_off_ptrs, Y_off.to(V_in.dtype), mask=mask_cd)
 
 
 def _phase3_forward_from_unchunked(
@@ -889,7 +892,7 @@ def _phase3_forward_from_unchunked(
     else:
         y_off = None
         out_off = out
-    grid = (BH * NC, D // BLOCK_D)
+    grid = (BH * NC,)
     ssd_single_rank1_phase3_fwd_un_kernel[grid](
         V_un,
         log_alpha_un,
