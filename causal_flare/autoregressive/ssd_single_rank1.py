@@ -662,6 +662,132 @@ def _phase1_forward_impl(V: torch.Tensor, log_alpha: torch.Tensor) -> torch.Tens
     return out
 
 
+@triton.jit
+def ssd_single_rank1_phase1_fwd_un_kernel(
+    V_ptr,
+    log_alpha_ptr,
+    out_s_end_ptr,
+    out_log_chunk_ptr,
+    b_size,
+    h_size,
+    n_size,
+    nc_size,
+    c_size,
+    d_size,
+    stride_v_b,
+    stride_v_n,
+    stride_v_h,
+    stride_v_d,
+    stride_r_b,
+    stride_r_n,
+    stride_r_h,
+    stride_out_bh,
+    stride_out_nc,
+    stride_out_d,
+    stride_log_bh,
+    stride_log_nc,
+    BLOCK_D: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    D_STATIC: tl.constexpr,
+):
+    pid_bhnc = tl.program_id(0)
+    pid_d_tile = tl.program_id(1)
+    bh_size = b_size * h_size
+    if pid_bhnc >= bh_size * nc_size:
+        return
+
+    BH_IDX = pid_bhnc // nc_size
+    NC_IDX = pid_bhnc % nc_size
+    B_IDX = BH_IDX // h_size
+    H_IDX = BH_IDX % h_size
+    d_start = pid_d_tile * BLOCK_D
+
+    offs_c = tl.arange(0, BLOCK_C)
+    offs_d = d_start + tl.arange(0, BLOCK_D)
+    n_idx = NC_IDX * BLOCK_C + offs_c
+    mask_c = n_idx < n_size
+    mask_d = offs_d < d_size
+    mask_cd = mask_c[:, None] & mask_d[None, :]
+
+    log_ptrs = log_alpha_ptr + B_IDX * stride_r_b + n_idx * stride_r_n + H_IDX * stride_r_h
+    log_alpha_vals = tl.load(log_ptrs, mask=mask_c, other=0.0).to(tl.float32)
+
+    if pid_d_tile == 0:
+        chunk_sum = tl.sum(log_alpha_vals, axis=0)
+        tl.store(out_log_chunk_ptr + BH_IDX * stride_log_bh + NC_IDX * stride_log_nc, chunk_sum)
+
+    log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
+    factors = tl.exp2((log_suffix_incl - log_alpha_vals) * 1.4426950408889634)
+
+    v_ptrs = (
+        V_ptr
+        + B_IDX * stride_v_b
+        + n_idx[:, None] * stride_v_n
+        + H_IDX * stride_v_h
+        + offs_d[None, :] * stride_v_d
+    )
+    V_f = tl.load(v_ptrs, mask=mask_cd, other=0.0).to(tl.float32)
+    s_end = tl.sum(factors[:, None] * V_f, axis=0)
+
+    out_ptrs = out_s_end_ptr + BH_IDX * stride_out_bh + NC_IDX * stride_out_nc + offs_d * stride_out_d
+    tl.store(out_ptrs, s_end, mask=mask_d)
+
+
+def _phase1_forward_replay_from_unchunked(
+    V: torch.Tensor,
+    log_alpha: torch.Tensor,
+    *,
+    H: int,
+    NC: int,
+    CHUNK_SIZE: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if V.ndim != 4 or log_alpha.ndim != 3:
+        raise ValueError("_phase1_forward_replay_from_unchunked expects V=[B,N,H,D], log_alpha=[B,N,H].")
+    B, N, H_in, D = V.shape
+    if H_in != H:
+        raise ValueError(f"H mismatch: expected {H}, got {H_in}.")
+    if log_alpha.shape != (B, N, H):
+        raise ValueError(f"log_alpha must be [B,N,H]={B, N, H}; got {tuple(log_alpha.shape)}.")
+    if not V.is_cuda:
+        raise NotImplementedError("_phase1_forward_replay_from_unchunked requires CUDA tensors.")
+    _require_chunk_size_multiple_of_16(CHUNK_SIZE, where="_phase1_forward_replay_from_unchunked")
+    if D not in _SUPPORTED_D_VALUES:
+        raise NotImplementedError(
+            f"_phase1_forward_replay_from_unchunked requires D in {sorted(_SUPPORTED_D_VALUES)}; got D={D}."
+        )
+    _ensure_triton_allocator()
+
+    BH = B * H
+    cfg = _select_phase1_forward_launch_config(BH=BH, NC=NC, C_CHUNK=CHUNK_SIZE, D=D)
+    BLOCK_D = cfg.block_d
+
+    S_local_end = torch.empty((BH, NC, D), device=V.device, dtype=torch.float32)
+    log_chunk = torch.empty((BH, NC), device=V.device, dtype=torch.float32)
+    grid = (BH * NC, D // BLOCK_D)
+    ssd_single_rank1_phase1_fwd_un_kernel[grid](
+        V,
+        log_alpha,
+        S_local_end,
+        log_chunk,
+        B,
+        H,
+        N,
+        NC,
+        CHUNK_SIZE,
+        D,
+        *V.stride(),
+        *log_alpha.stride(),
+        *S_local_end.stride(),
+        *log_chunk.stride(),
+        BLOCK_D=BLOCK_D,
+        BLOCK_C=CHUNK_SIZE,
+        D_STATIC=D,
+        num_warps=cfg.num_warps,
+        num_stages=cfg.num_stages,
+    )
+    return S_local_end, log_chunk
+
+
 # --------------------------------------------------------------------------------------------------
 # PHASE 3: CHUNK DENSE REPLAY (TRITON)
 # --------------------------------------------------------------------------------------------------
@@ -1027,6 +1153,201 @@ def _phase3_backward_impl(
     return dV, dlog.to(log_alpha.dtype), dS0_out
 
 
+@triton.jit
+def ssd_single_rank1_phase3_bwd_un_kernel(
+    V_ptr,
+    log_alpha_ptr,
+    grad_y_ptr,
+    S0_ptr,
+    out_dV_ptr,
+    out_dlog_ptr,
+    out_dS0_ptr,
+    b_size,
+    h_size,
+    n_size,
+    nc_size,
+    c_size,
+    d_size,
+    stride_v_b,
+    stride_v_n,
+    stride_v_h,
+    stride_v_d,
+    stride_r_b,
+    stride_r_n,
+    stride_r_h,
+    stride_gy_bh,
+    stride_gy_nc,
+    stride_gy_c,
+    stride_gy_d,
+    stride_s0_bh,
+    stride_s0_nc,
+    stride_s0_d,
+    stride_dv_b,
+    stride_dv_n,
+    stride_dv_h,
+    stride_dv_d,
+    stride_dlog_bh,
+    stride_dlog_nc,
+    stride_dlog_c,
+    stride_ds0_bh,
+    stride_ds0_nc,
+    stride_ds0_d,
+    BLOCK_D: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    D_STATIC: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    pid_bhnc = tl.program_id(0)
+    bh_size = b_size * h_size
+    if pid_bhnc >= bh_size * nc_size:
+        return
+    BH_IDX = pid_bhnc // nc_size
+    NC_IDX = pid_bhnc % nc_size
+    B_IDX = BH_IDX // h_size
+    H_IDX = BH_IDX % h_size
+
+    offs_c = tl.arange(0, BLOCK_C)
+    n_idx = NC_IDX * BLOCK_C + offs_c
+    mask_c = n_idx < n_size
+
+    log_ptrs = log_alpha_ptr + B_IDX * stride_r_b + n_idx * stride_r_n + H_IDX * stride_r_h
+    log_alpha_vals = tl.load(log_ptrs, mask=mask_c, other=0.0).to(tl.float32)
+
+    row_idx = offs_c[:, None]
+    col_idx = offs_c[None, :]
+    valid_tri = col_idx <= row_idx
+    log_p = tl.cumsum(log_alpha_vals, axis=0)
+    p = tl.exp2(log_p * 1.4426950408889634)
+    log_delta = (log_p[:, None] - log_p[None, :]) * 1.4426950408889634
+    log_delta = tl.where(valid_tri, log_delta, 0.0)
+    L = tl.where(valid_tri, tl.exp2(log_delta), 0.0)
+
+    dL = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
+    src = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
+        d_start = d_blk * BLOCK_D
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < d_size
+        mask_cd = mask_c[:, None] & mask_d[None, :]
+
+        v_ptrs = (
+            V_ptr
+            + B_IDX * stride_v_b
+            + n_idx[:, None] * stride_v_n
+            + H_IDX * stride_v_h
+            + offs_d[None, :] * stride_v_d
+        )
+        V_f = tl.load(v_ptrs, mask=mask_cd, other=0.0).to(tl.float32)
+
+        gy_ptrs = (
+            grad_y_ptr
+            + BH_IDX * stride_gy_bh
+            + NC_IDX * stride_gy_nc
+            + offs_c[:, None] * stride_gy_c
+            + offs_d[None, :] * stride_gy_d
+        )
+        G = tl.load(gy_ptrs, mask=mask_cd, other=0.0).to(tl.float32)
+
+        dV_tile = tl.dot(tl.trans(L), G, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        dv_ptrs = (
+            out_dV_ptr
+            + B_IDX * stride_dv_b
+            + n_idx[:, None] * stride_dv_n
+            + H_IDX * stride_dv_h
+            + offs_d[None, :] * stride_dv_d
+        )
+        tl.store(dv_ptrs, dV_tile, mask=mask_cd)
+
+        dL += tl.dot(G, tl.trans(V_f), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+
+        s0_ptrs = S0_ptr + BH_IDX * stride_s0_bh + NC_IDX * stride_s0_nc + offs_d * stride_s0_d
+        S0_tile = tl.load(s0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+        ds0_tile = tl.sum(p[:, None] * G, axis=0)
+        ds0_ptrs = out_dS0_ptr + BH_IDX * stride_ds0_bh + NC_IDX * stride_ds0_nc + offs_d * stride_ds0_d
+        tl.store(ds0_ptrs, ds0_tile, mask=mask_d)
+
+        src += p * tl.sum(G * S0_tile[None, :], axis=1)
+
+    Q = dL * L
+    left_prefix = tl.cumsum(Q, axis=1)
+    left_of = left_prefix - Q
+    suffix_rows = tl.flip(tl.cumsum(tl.flip(left_of, 0), axis=0), 0)
+    is_diag = offs_c[:, None] == offs_c[None, :]
+    dlog_diag = tl.sum(tl.where(is_diag, suffix_rows, 0.0), axis=1)
+    dlog_off = tl.cumsum(src, axis=0, reverse=True)
+    dlog = dlog_diag + dlog_off
+    dlog_ptrs = out_dlog_ptr + BH_IDX * stride_dlog_bh + NC_IDX * stride_dlog_nc + offs_c * stride_dlog_c
+    tl.store(dlog_ptrs, dlog)
+
+
+def _phase3_backward_from_unchunked(
+    V_un: torch.Tensor,
+    log_alpha_un: torch.Tensor,
+    grad_y_chunk: torch.Tensor,
+    S0: torch.Tensor,
+    *,
+    H: int,
+    NC: int,
+    CHUNK_SIZE: int,
+    input_precision: str,
+    return_s0_grad_fp32: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if V_un.ndim != 4 or log_alpha_un.ndim != 3:
+        raise ValueError("_phase3_backward_from_unchunked expects V=[B,N,H,D], log_alpha=[B,N,H].")
+    B, N, H_in, D = V_un.shape
+    if H_in != H:
+        raise ValueError(f"H mismatch: expected {H}, got {H_in}.")
+    if log_alpha_un.shape != (B, N, H):
+        raise ValueError(f"log_alpha must be [B,N,H]={B, N, H}; got {tuple(log_alpha_un.shape)}.")
+    BH = B * H
+    C = CHUNK_SIZE
+    if grad_y_chunk.shape != (BH, NC, C, D):
+        raise ValueError(f"grad_y_chunk must be [BH,NC,C,D]={BH, NC, C, D}; got {tuple(grad_y_chunk.shape)}.")
+    if S0.shape != (BH, NC, D):
+        raise ValueError(f"S0 must be [BH,NC,D]={BH, NC, D}; got {tuple(S0.shape)}.")
+    _require_chunk_size_multiple_of_16(C, where="_phase3_backward_from_unchunked")
+    _ensure_triton_allocator()
+
+    cfg = _select_phase3_backward_launch_config(BH=BH, NC=NC, C_CHUNK=C, D=D)
+    BLOCK_D = cfg.block_d
+    grad_y_in = grad_y_chunk if grad_y_chunk.is_contiguous() else grad_y_chunk.contiguous()
+
+    dV_out = torch.empty_like(V_un)
+    dlog = torch.empty((BH, NC, C), device=V_un.device, dtype=log_alpha_un.dtype)
+    dS0 = torch.empty((BH, NC, D), device=V_un.device, dtype=torch.float32)
+    grid = (BH * NC,)
+    ssd_single_rank1_phase3_bwd_un_kernel[grid](
+        V_un,
+        log_alpha_un,
+        grad_y_in,
+        S0,
+        dV_out,
+        dlog,
+        dS0,
+        B,
+        H,
+        N,
+        NC,
+        C,
+        D,
+        *V_un.stride(),
+        *log_alpha_un.stride(),
+        *grad_y_in.stride(),
+        *S0.stride(),
+        *dV_out.stride(),
+        *dlog.stride(),
+        *dS0.stride(),
+        BLOCK_D=BLOCK_D,
+        BLOCK_C=C,
+        D_STATIC=D,
+        INPUT_PRECISION=input_precision,
+        num_warps=cfg.num_warps,
+        num_stages=cfg.num_stages,
+    )
+    dS0_out = dS0 if return_s0_grad_fp32 else dS0.to(V_un.dtype)
+    return dV_out, dlog.to(log_alpha_un.dtype), dS0_out
+
+
 # --------------------------------------------------------------------------------------------------
 # PHASE 1 BACKWARD (TRITON)
 # --------------------------------------------------------------------------------------------------
@@ -1154,6 +1475,181 @@ def ssd_single_rank1_phase1_bwd_dlog_kernel(
     b = tl.reshape(b_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
     prefix = tl.cumsum(b, axis=0)
     out_desc.store([BH_IDX, NC_IDX, 0], tl.reshape(prefix - b, (1, 1, BLOCK_C)))
+
+
+@triton.jit
+def ssd_single_rank1_phase1_bwd_dv_b_un_kernel(
+    grad_s_ptr,
+    V_ptr,
+    log_alpha_ptr,
+    out_dV_ptr,
+    out_b_partials_ptr,
+    b_size,
+    h_size,
+    n_size,
+    nc_size,
+    c_size,
+    d_size,
+    n_d_tiles,
+    stride_gs_bh,
+    stride_gs_nc,
+    stride_gs_d,
+    stride_v_b,
+    stride_v_n,
+    stride_v_h,
+    stride_v_d,
+    stride_r_b,
+    stride_r_n,
+    stride_r_h,
+    stride_dv_b,
+    stride_dv_n,
+    stride_dv_h,
+    stride_dv_d,
+    stride_bp_bh,
+    stride_bp_nc,
+    stride_bp_dt,
+    stride_bp_c,
+    BLOCK_D: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    D_STATIC: tl.constexpr,
+):
+    pid_bhnc = tl.program_id(0)
+    pid_d_tile = tl.program_id(1)
+    bh_size = b_size * h_size
+    if pid_bhnc >= bh_size * nc_size or pid_d_tile >= n_d_tiles:
+        return
+
+    BH_IDX = pid_bhnc // nc_size
+    NC_IDX = pid_bhnc % nc_size
+    B_IDX = BH_IDX // h_size
+    H_IDX = BH_IDX % h_size
+    d_start = pid_d_tile * BLOCK_D
+
+    offs_c = tl.arange(0, BLOCK_C)
+    offs_d = d_start + tl.arange(0, BLOCK_D)
+    n_idx = NC_IDX * BLOCK_C + offs_c
+    mask_c = n_idx < n_size
+    mask_d = offs_d < d_size
+    mask_cd = mask_c[:, None] & mask_d[None, :]
+
+    gs_ptrs = grad_s_ptr + BH_IDX * stride_gs_bh + NC_IDX * stride_gs_nc + offs_d * stride_gs_d
+    g = tl.load(gs_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+
+    log_ptrs = log_alpha_ptr + B_IDX * stride_r_b + n_idx * stride_r_n + H_IDX * stride_r_h
+    log_alpha_vals = tl.load(log_ptrs, mask=mask_c, other=0.0).to(tl.float32)
+    log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
+    factors = tl.exp2((log_suffix_incl - log_alpha_vals) * 1.4426950408889634)
+
+    dv_ptrs = (
+        out_dV_ptr
+        + B_IDX * stride_dv_b
+        + n_idx[:, None] * stride_dv_n
+        + H_IDX * stride_dv_h
+        + offs_d[None, :] * stride_dv_d
+    )
+    prev_dV = tl.load(dv_ptrs, mask=mask_cd, other=0.0).to(tl.float32)
+    dV_add = factors[:, None] * g[None, :]
+    tl.store(dv_ptrs, prev_dV + dV_add, mask=mask_cd)
+
+    v_ptrs = (
+        V_ptr
+        + B_IDX * stride_v_b
+        + n_idx[:, None] * stride_v_n
+        + H_IDX * stride_v_h
+        + offs_d[None, :] * stride_v_d
+    )
+    V_f = tl.load(v_ptrs, mask=mask_cd, other=0.0).to(tl.float32)
+    b_partial = factors * tl.sum(V_f * g[None, :], axis=1)
+
+    bp_ptrs = (
+        out_b_partials_ptr
+        + BH_IDX * stride_bp_bh
+        + NC_IDX * stride_bp_nc
+        + pid_d_tile * stride_bp_dt
+        + offs_c * stride_bp_c
+    )
+    tl.store(bp_ptrs, b_partial)
+
+
+def _phase1_backward_from_unchunked_accum(
+    grad_s: torch.Tensor,
+    V_un: torch.Tensor,
+    log_alpha_un: torch.Tensor,
+    dV_out: torch.Tensor,
+    *,
+    H: int,
+    NC: int,
+    CHUNK_SIZE: int,
+) -> torch.Tensor:
+    if grad_s.ndim != 3 or V_un.ndim != 4 or log_alpha_un.ndim != 3 or dV_out.ndim != 4:
+        raise ValueError(
+            "_phase1_backward_from_unchunked_accum expects "
+            "grad_s=[BH,NC,D], V=[B,N,H,D], log_alpha=[B,N,H], dV_out=[B,N,H,D]."
+        )
+    B, N, H_in, D = V_un.shape
+    if H_in != H:
+        raise ValueError(f"H mismatch: expected {H}, got {H_in}.")
+    if log_alpha_un.shape != (B, N, H):
+        raise ValueError(f"log_alpha must be [B,N,H]={B, N, H}; got {tuple(log_alpha_un.shape)}.")
+    if dV_out.shape != (B, N, H, D):
+        raise ValueError(f"dV_out must be [B,N,H,D]={B, N, H, D}; got {tuple(dV_out.shape)}.")
+    BH = B * H
+    C = CHUNK_SIZE
+    if grad_s.shape != (BH, NC, D):
+        raise ValueError(f"grad_s must be [BH,NC,D]={BH, NC, D}; got {tuple(grad_s.shape)}.")
+    _ensure_triton_allocator()
+
+    cfg = _select_phase1_backward_launch_config(D=D)
+    BLOCK_D = cfg.block_d
+    n_d_tiles = D // BLOCK_D
+
+    b_partials = _workspace_tensor(
+        "single_phase1_b_partials",
+        (BH, NC, n_d_tiles, C),
+        device=V_un.device,
+        dtype=torch.float32,
+    )
+    grid_dv = (BH * NC, n_d_tiles)
+    ssd_single_rank1_phase1_bwd_dv_b_un_kernel[grid_dv](
+        grad_s,
+        V_un,
+        log_alpha_un,
+        dV_out,
+        b_partials,
+        B,
+        H,
+        N,
+        NC,
+        C,
+        D,
+        n_d_tiles,
+        *grad_s.stride(),
+        *V_un.stride(),
+        *log_alpha_un.stride(),
+        *dV_out.stride(),
+        *b_partials.stride(),
+        BLOCK_D=BLOCK_D,
+        BLOCK_C=C,
+        D_STATIC=D,
+        num_warps=cfg.num_warps,
+        num_stages=cfg.num_stages,
+    )
+    b_vals = torch.sum(b_partials, dim=2)
+    dlog = torch.empty((BH, NC, C), device=V_un.device, dtype=torch.float32)
+    grid_dlog = (BH * NC,)
+    ssd_single_rank1_phase1_bwd_dlog_kernel[grid_dlog](
+        b_vals,
+        dlog,
+        BH,
+        NC,
+        C,
+        *b_vals.stride(),
+        *dlog.stride(),
+        BLOCK_C=C,
+        num_warps=cfg.num_warps,
+        num_stages=cfg.num_stages,
+    )
+    return dlog.to(log_alpha_un.dtype)
 
 
 def _phase1_backward_impl(
@@ -1357,33 +1853,28 @@ class SsdSingleRank1Triton(torch.autograd.Function):
         initial_state_shape = ctx.initial_state_shape
         BH = B * H
 
-        # Re-materialize chunked layouts for backward replay.
-        V_chunk, log_alpha_chunk, init_flat, _B, _N, _H, _D, _NC = _prepare_triton_inputs(
+        # Replay phase-1 / phase-2 directly from unchunked inputs to avoid
+        # materializing chunked V/log copies in backward.
+        S_local_end, log_alpha_per_chunk = _phase1_forward_replay_from_unchunked(
             V_in,
             log_alpha_in,
-            init_flat,
-            where="SsdSingleRank1Triton.backward",
+            H=H,
+            NC=NC,
             CHUNK_SIZE=CHUNK_SIZE,
         )
-        if (_B, _N, _H, _D, _NC) != (B, N, H, D, NC):
-            raise RuntimeError(
-                "Backward replay shape mismatch: "
-                f"expected {(B, N, H, D, NC)}, got {(_B, _N, _H, _D, _NC)}."
-            )
-
-        # Replay phase-1 / phase-2 to recover chunk starts.
-        S_local_end = _phase1_forward_impl(V_chunk, log_alpha_chunk)
-        log_alpha_per_chunk = torch.sum(log_alpha_chunk.float(), dim=-1)
         S0_chunk, _ = _ssd_single_rank1_phase2_prefix_scan_forward_impl(
             S_local_end, log_alpha_per_chunk, init_flat, phase2_compute_dtype
         )
 
         # Phase-3 backward.
-        dV_p3, dlog_p3, dS0 = _phase3_backward_impl(
-            V_chunk,
-            log_alpha_chunk,
+        dV, dlog_p3, dS0 = _phase3_backward_from_unchunked(
+            V_in,
+            log_alpha_in,
             grad_y_chunk,
             S0_chunk,
+            H=H,
+            NC=NC,
+            CHUNK_SIZE=CHUNK_SIZE,
             input_precision=INPUT_PRECISION,
             return_s0_grad_fp32=True,
         )
@@ -1392,7 +1883,7 @@ class SsdSingleRank1Triton(torch.autograd.Function):
         grad_final = (
             grad_S1_chunk
             if grad_S1_chunk is not None
-            else torch.zeros((BH, D), device=V_chunk.device, dtype=phase2_compute_dtype)
+            else torch.zeros((BH, D), device=V_in.device, dtype=phase2_compute_dtype)
         )
         dS_local_end, dlog_per_chunk, d_init_f32 = _phase2_backward_impl(
             dS0.reshape(BH, NC, D),
@@ -1403,16 +1894,27 @@ class SsdSingleRank1Triton(torch.autograd.Function):
         )
 
         # Phase-1 backward.
-        dV_p1, dlog_p1 = _phase1_backward_impl(dS_local_end, V_chunk, log_alpha_chunk)
+        dlog_p1 = _phase1_backward_from_unchunked_accum(
+            dS_local_end,
+            V_in,
+            log_alpha_in,
+            dV,
+            H=H,
+            NC=NC,
+            CHUNK_SIZE=CHUNK_SIZE,
+        )
 
-        dV_p3.add_(dV_p1)
-        dV_chunk = dV_p3
         dlog_p3.add_(dlog_p1)
-        dlog_p3.add_(dlog_per_chunk.unsqueeze(-1).to(log_alpha_chunk.dtype))
+        dlog_p3.add_(dlog_per_chunk.unsqueeze(-1).to(log_alpha_in.dtype))
         dlog_chunk = dlog_p3
 
-        dV = _restore_grad_layout(dV_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
-        dlog = dlog_chunk.reshape(B, H, NC, CHUNK_SIZE).permute(0, 2, 3, 1).reshape(B, NC * CHUNK_SIZE, H)[:, :N]
+        n_exec = NC * CHUNK_SIZE
+        dlog_view = torch.as_strided(
+            dlog_chunk,
+            size=(B, n_exec, H),
+            stride=(H * n_exec, 1, n_exec),
+        )
+        dlog = dlog_view[:, :N, :]
 
         if initial_state_shape is None:
             d_init = None

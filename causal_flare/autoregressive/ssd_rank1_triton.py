@@ -3580,7 +3580,6 @@ class SsdRank1Triton(torch.autograd.Function):
         # - avoid full dS0 chunk buffer
         # - avoid full dS_local_end buffer
         log_alpha_per_chunk = torch.sum(log_alpha_chunk.float(), dim=-1)
-        alpha_per_chunk = torch.exp2(log_alpha_per_chunk * _INV_LN2)
 
         dC_chunk = torch.empty_like(C_chunk)
         dW_chunk = torch.empty_like(W_chunk)
@@ -3603,8 +3602,10 @@ class SsdRank1Triton(torch.autograd.Function):
         n_d_tiles = D // BLOCK_D
         phase1_bwd_cfg = _select_phase1_backward_launch_config(M=M, D=D)
 
-        # Recompute chunk-start states per small block.
-        state_block_nc = 8 if NC >= 8 else NC
+        # Recompute S0 in block-chunks with Triton phase-2 forward, then run
+        # phase-3 -> phase-2 -> phase-1 backward per block to avoid full-size
+        # S0/dS0/dS_local_end tensors.
+        state_block_nc = 32 if NC >= 32 else (16 if NC >= 16 else NC)
         num_state_blocks = (NC + state_block_nc - 1) // state_block_nc
         state_boundaries = _ssd_rank1_bwd_workspace_tensor(
             "phase2_state_boundaries",
@@ -3617,8 +3618,12 @@ class SsdRank1Triton(torch.autograd.Function):
             state_boundaries[blk].copy_(state)
             blk_start = blk * state_block_nc
             blk_end = min((blk + 1) * state_block_nc, NC)
-            for c_idx in range(blk_start, blk_end):
-                state = alpha_per_chunk[:, c_idx:c_idx + 1] * state + S_local_end[:, c_idx, :]
+            _, state = _ssd_rank1_prefix_scan_forward_impl(
+                S_local_end[:, blk_start:blk_end, :],
+                log_alpha_per_chunk[:, blk_start:blk_end],
+                state,
+                compute_dtype,
+            )
         state_boundaries[num_state_blocks].copy_(state)
 
         grad_final_for_p2 = (
@@ -3626,78 +3631,130 @@ class SsdRank1Triton(torch.autograd.Function):
             if grad_S1_chunk is not None
             else torch.zeros((BH, MD), device=C_chunk.device, dtype=torch.float32)
         )
-        grad_end = grad_final_for_p2 if grad_final_for_p2.dtype == torch.float32 else grad_final_for_p2.float()
+        grad_end = (
+            grad_final_for_p2
+            if grad_final_for_p2.dtype == torch.float32 and grad_final_for_p2.is_contiguous()
+            else grad_final_for_p2.float().contiguous()
+        )
+        d_init_f32 = _ssd_rank1_bwd_workspace_tensor(
+            "phase2_dinit_block",
+            (BH, MD),
+            device=C_chunk.device,
+            dtype=torch.float32,
+        )
 
         for blk in range(num_state_blocks - 1, -1, -1):
             blk_start = blk * state_block_nc
             blk_end = min((blk + 1) * state_block_nc, NC)
             blk_nc = blk_end - blk_start
 
-            # Recompute S0 for this block only.
-            s0_block = _ssd_rank1_bwd_workspace_tensor(
-                "phase2_s0_block",
-                (BH, blk_nc, MD),
-                device=C_chunk.device,
-                dtype=torch.float32,
+            s_local_blk = S_local_end[:, blk_start:blk_end, :]
+            log_blk = log_alpha_per_chunk[:, blk_start:blk_end]
+            c_blk = C_chunk[:, blk_start:blk_end, :, :]
+            w_blk = W_chunk[:, blk_start:blk_end, :, :]
+            v_blk = V_chunk[:, blk_start:blk_end, :, :]
+            log_alpha_tok_blk = log_alpha_chunk[:, blk_start:blk_end, :]
+            grad_y_blk = grad_y_chunk[:, blk_start:blk_end, :, :]
+
+            # Recompute S0 only for this block from its start boundary.
+            s0_blk, _ = _ssd_rank1_prefix_scan_forward_impl(
+                s_local_blk,
+                log_blk,
+                state_boundaries[blk],
+                compute_dtype,
             )
-            state_blk = state_boundaries[blk]
-            for local_idx, c_idx in enumerate(range(blk_start, blk_end)):
-                s0_block[:, local_idx, :].copy_(state_blk)
-                state_blk = alpha_per_chunk[:, c_idx:c_idx + 1] * state_blk + S_local_end[:, c_idx, :]
 
             # Phase-3 backward on this block.
             dC_blk, dW_blk, dV_blk, dlog_blk, dS0_blk = _ssd_rank1_dense_output_backward_impl(
-                C_chunk[:, blk_start:blk_end, :, :],
-                W_chunk[:, blk_start:blk_end, :, :],
-                V_chunk[:, blk_start:blk_end, :, :],
-                log_alpha_chunk[:, blk_start:blk_end, :],
-                grad_y_chunk[:, blk_start:blk_end, :, :],
-                S0_saved=s0_block,
+                c_blk,
+                w_blk,
+                v_blk,
+                log_alpha_tok_blk,
+                grad_y_blk,
+                S0_saved=s0_blk,
                 y_off_saved=None,
                 input_precision=INPUT_PRECISION,
                 s0_was_flat=True,
                 return_s0_grad_fp32=True,
             )
 
-            # Phase-2 reverse scan equations over this block only; consume dS0
-            # immediately and emit dS_local_end as grad_s_blk (no full tensor).
-            grad_s_blk = _ssd_rank1_bwd_workspace_tensor(
-                "phase2_grad_s_block",
+            # Phase-2 backward on this block only: consume dS0 immediately and
+            # produce block-local dS_local_end + dlog_per_chunk + dinit.
+            dS_local_end_blk = _ssd_rank1_bwd_workspace_tensor(
+                "phase2_dS_local_end_block",
                 (BH, blk_nc, MD),
                 device=C_chunk.device,
                 dtype=torch.float32,
             )
-            dlog_per_chunk_blk = _ssd_rank1_bwd_workspace_tensor(
+            d_log_per_chunk_blk = _ssd_rank1_bwd_workspace_tensor(
                 "phase2_dlog_per_chunk_block",
                 (BH, blk_nc),
                 device=C_chunk.device,
                 dtype=torch.float32,
             )
-            for local_idx in range(blk_nc - 1, -1, -1):
-                c_idx = blk_start + local_idx
-                grad_s_blk[:, local_idx, :].copy_(grad_end)
-                alpha_c = alpha_per_chunk[:, c_idx:c_idx + 1]
-                s0_c = s0_block[:, local_idx, :]
-                dlog_per_chunk_blk[:, local_idx].copy_(torch.sum(grad_end * (alpha_c * s0_c), dim=-1))
-                grad_end = dS0_blk[:, local_idx, :] + alpha_c * grad_end
+            grad_chunk_start_f = (
+                dS0_blk
+                if dS0_blk.dtype == torch.float32 and dS0_blk.is_contiguous()
+                else dS0_blk.float().contiguous()
+            )
+            s0_blk_f = s0_blk if s0_blk.dtype == torch.float32 and s0_blk.is_contiguous() else s0_blk.float().contiguous()
+            log_blk_f = log_blk if log_blk.dtype == torch.float32 and log_blk.is_contiguous() else log_blk.float().contiguous()
+
+            block_nc = _select_phase2_block_nc(NC=blk_nc)
+            grid_bwd = lambda META: (BH,)
+            ssd_rank1_prefix_scan_bwd_dense_kernel[grid_bwd](
+                grad_chunk_start_f,
+                grad_end,
+                s0_blk_f,
+                log_blk_f,
+                dS_local_end_blk,
+                d_log_per_chunk_blk,
+                d_init_f32,
+                BH,
+                blk_nc,
+                MD,
+                *grad_chunk_start_f.stride(),
+                *grad_end.stride(),
+                *s0_blk_f.stride(),
+                *log_blk_f.stride(),
+                *dS_local_end_blk.stride(),
+                *d_log_per_chunk_blk.stride(),
+                *d_init_f32.stride(),
+                BLOCK_NC=block_nc,
+                NC_STATIC=blk_nc,
+                USE_FP32_COMPUTE=(compute_dtype == torch.float32),
+                USE_BF16_COMPUTE=(compute_dtype == torch.bfloat16),
+            )
+            grad_end.copy_(d_init_f32)
 
             # Phase-1 backward on block-local dS_local_end.
-            grad_s_md_blk = grad_s_blk.reshape(BH, blk_nc, M, D)
-            dlog_p1_blk = torch.empty_like(log_alpha_chunk[:, blk_start:blk_end, :])
+            grad_s_md_blk = dS_local_end_blk.reshape(BH, blk_nc, M, D)
+            dlog_p1_blk = torch.empty_like(log_alpha_tok_blk)
 
             grid_dw = (BH * blk_nc, n_m_tiles)
             ssd_rank1_chunk_end_state_bwd_dw_chunk_kernel[grid_dw](
-                grad_s_md_blk, V_chunk[:, blk_start:blk_end, :, :], log_alpha_chunk[:, blk_start:blk_end, :], dW_blk,
-                BH, blk_nc, CHUNK_SIZE, M, D,
+                grad_s_md_blk,
+                v_blk,
+                log_alpha_tok_blk,
+                dW_blk,
+                BH,
+                blk_nc,
+                CHUNK_SIZE,
+                M,
+                D,
                 *grad_s_md_blk.stride(),
-                *V_chunk[:, blk_start:blk_end, :, :].stride(),
-                *log_alpha_chunk[:, blk_start:blk_end, :].stride(),
+                *v_blk.stride(),
+                *log_alpha_tok_blk.stride(),
                 *dW_blk.stride(),
-                BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_C=CHUNK_SIZE,
-                C_STATIC=CHUNK_SIZE, D_STATIC=D,
+                BLOCK_M=BLOCK_M,
+                BLOCK_D=BLOCK_D,
+                BLOCK_C=CHUNK_SIZE,
+                C_STATIC=CHUNK_SIZE,
+                D_STATIC=D,
                 INPUT_PRECISION="ieee" if C_chunk.dtype == torch.float32 else "tf32",
                 ACCUMULATE=True,
-                num_warps=phase1_bwd_cfg.num_warps, num_stages=phase1_bwd_cfg.num_stages,
+                num_warps=phase1_bwd_cfg.num_warps,
+                num_stages=phase1_bwd_cfg.num_stages,
             )
 
             b_partials_blk = _ssd_rank1_bwd_workspace_tensor(
@@ -3709,9 +3766,9 @@ class SsdRank1Triton(torch.autograd.Function):
             grid_dv = (BH * blk_nc, n_d_tiles)
             ssd_rank1_chunk_end_state_bwd_dv_b_chunk_kernel[grid_dv](
                 grad_s_md_blk,
-                W_chunk[:, blk_start:blk_end, :, :],
-                V_chunk[:, blk_start:blk_end, :, :],
-                log_alpha_chunk[:, blk_start:blk_end, :],
+                w_blk,
+                v_blk,
+                log_alpha_tok_blk,
                 dV_blk,
                 b_partials_blk,
                 BH,
@@ -3721,29 +3778,33 @@ class SsdRank1Triton(torch.autograd.Function):
                 D,
                 n_d_tiles,
                 *grad_s_md_blk.stride(),
-                *W_chunk[:, blk_start:blk_end, :, :].stride(),
-                *V_chunk[:, blk_start:blk_end, :, :].stride(),
-                *log_alpha_chunk[:, blk_start:blk_end, :].stride(),
+                *w_blk.stride(),
+                *v_blk.stride(),
+                *log_alpha_tok_blk.stride(),
                 *dV_blk.stride(),
                 *b_partials_blk.stride(),
-                BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_C=CHUNK_SIZE,
-                C_STATIC=CHUNK_SIZE, M_STATIC=M,
+                BLOCK_M=BLOCK_M,
+                BLOCK_D=BLOCK_D,
+                BLOCK_C=CHUNK_SIZE,
+                C_STATIC=CHUNK_SIZE,
+                M_STATIC=M,
                 INPUT_PRECISION="ieee" if C_chunk.dtype == torch.float32 else "tf32",
                 ACCUMULATE=True,
-                num_warps=phase1_bwd_cfg.num_warps, num_stages=phase1_bwd_cfg.num_stages,
+                num_warps=phase1_bwd_cfg.num_warps,
+                num_stages=phase1_bwd_cfg.num_stages,
             )
             b_vals_blk = torch.sum(b_partials_blk, dim=2)
 
             grid_dr = (BH * blk_nc,)
             ssd_rank1_chunk_end_state_bwd_dr_kernel[grid_dr](
                 b_vals_blk,
-                log_alpha_chunk[:, blk_start:blk_end, :],
+                log_alpha_tok_blk,
                 dlog_p1_blk,
                 BH,
                 blk_nc,
                 CHUNK_SIZE,
                 *b_vals_blk.stride(),
-                *log_alpha_chunk[:, blk_start:blk_end, :].stride(),
+                *log_alpha_tok_blk.stride(),
                 *dlog_p1_blk.stride(),
                 BLOCK_C=CHUNK_SIZE,
                 C_STATIC=CHUNK_SIZE,
@@ -3752,7 +3813,7 @@ class SsdRank1Triton(torch.autograd.Function):
             )
 
             dlog_blk.add_(dlog_p1_blk)
-            dlog_blk.add_(dlog_per_chunk_blk.unsqueeze(-1).to(log_alpha_chunk.dtype))
+            dlog_blk.add_(d_log_per_chunk_blk.unsqueeze(-1).to(log_alpha_chunk.dtype))
 
             dC_chunk[:, blk_start:blk_end, :, :] = dC_blk
             dW_chunk[:, blk_start:blk_end, :, :] = dW_blk
@@ -3760,7 +3821,7 @@ class SsdRank1Triton(torch.autograd.Function):
             dlog_alpha_chunk[:, blk_start:blk_end, :] = dlog_blk
 
         d_init_f32 = grad_end
-        del grad_y_chunk, S_local_end, log_alpha_per_chunk, alpha_per_chunk, state_boundaries, state
+        del grad_y_chunk, S_local_end, log_alpha_per_chunk, state_boundaries, state
 
         # ---- Restore outer layout ----
         # Convert chunked [BH,NC,C,*] grads back to user-facing [B,N,H,*].
