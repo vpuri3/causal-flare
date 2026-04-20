@@ -698,6 +698,7 @@ def ssd_single_rank1_phase3_fwd_kernel(
     BLOCK_C: tl.constexpr,
     D_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
+    STORE_Y_OFF: tl.constexpr,
 ):
     pid_bhnc = tl.program_id(0)
     pid_d_tile = tl.program_id(1)
@@ -731,12 +732,13 @@ def ssd_single_rank1_phase3_fwd_kernel(
         strides=[stride_out_y_bh, stride_out_y_nc, stride_out_y_c, stride_out_y_d],
         block_shape=[1, 1, BLOCK_C, BLOCK_D],
     )
-    out_off_desc = tl.make_tensor_descriptor(
-        out_y_off_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_out_y_off_bh, stride_out_y_off_nc, stride_out_y_off_c, stride_out_y_off_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
+    if STORE_Y_OFF:
+        out_off_desc = tl.make_tensor_descriptor(
+            out_y_off_ptr,
+            shape=[bh_size, nc_size, c_size, d_size],
+            strides=[stride_out_y_off_bh, stride_out_y_off_nc, stride_out_y_off_c, stride_out_y_off_d],
+            block_shape=[1, 1, BLOCK_C, BLOCK_D],
+        )
 
     offs_c = tl.arange(0, BLOCK_C)
     valid = offs_c[None, :] <= offs_c[:, None]
@@ -757,7 +759,8 @@ def ssd_single_rank1_phase3_fwd_kernel(
     Y = Y_diag + Y_off
 
     out_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(Y.to(V_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
-    out_off_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(Y_off.to(V_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
+    if STORE_Y_OFF:
+        out_off_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(Y_off.to(V_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
 
 def _phase3_forward_impl(
@@ -792,14 +795,19 @@ def _phase3_forward_impl(
     cfg = _select_phase3_forward_launch_config(BH=BH, NC=NC, C_CHUNK=C, D=D)
     BLOCK_D = cfg.block_d
     out = torch.empty_like(V)
-    y_off = torch.empty_like(V)
+    if RETURN_Y_OFF:
+        y_off: torch.Tensor | None = torch.empty_like(V)
+        out_off = y_off
+    else:
+        y_off = None
+        out_off = out
     grid = (BH * NC, D // BLOCK_D)
     ssd_single_rank1_phase3_fwd_kernel[grid](
         V,
         log_alpha,
         S0_vec,
         out,
-        y_off,
+        out_off,
         BH,
         NC,
         C,
@@ -808,15 +816,17 @@ def _phase3_forward_impl(
         *log_alpha.stride(),
         *S0_vec.stride(),
         *out.stride(),
-        *y_off.stride(),
+        *out_off.stride(),
         BLOCK_D=BLOCK_D,
         BLOCK_C=C,
         D_STATIC=D,
         INPUT_PRECISION=input_precision,
+        STORE_Y_OFF=RETURN_Y_OFF,
         num_warps=cfg.num_warps,
         num_stages=cfg.num_stages,
     )
     if RETURN_Y_OFF:
+        assert y_off is not None
         return out, y_off
     return out
 
@@ -982,6 +992,7 @@ def _phase3_backward_impl(
 
     cfg = _select_phase3_backward_launch_config(BH=BH, NC=NC, C_CHUNK=C, D=D)
     BLOCK_D = cfg.block_d
+    grad_y_in = grad_y if grad_y.is_contiguous() else grad_y.contiguous()
     dV = torch.empty_like(V)
     dlog = torch.empty((BH, NC, C), device=V.device, dtype=torch.float32)
     dS0 = torch.empty((BH, NC, D), device=V.device, dtype=torch.float32)
@@ -989,7 +1000,7 @@ def _phase3_backward_impl(
     ssd_single_rank1_phase3_bwd_kernel[grid](
         V,
         log_alpha,
-        grad_y.contiguous(),
+        grad_y_in,
         S0_vec,
         dV,
         dlog,
@@ -1000,7 +1011,7 @@ def _phase3_backward_impl(
         D,
         *V.stride(),
         *log_alpha.stride(),
-        *grad_y.stride(),
+        *grad_y_in.stride(),
         *S0_vec.stride(),
         *dV.stride(),
         *dlog.stride(),
@@ -1316,7 +1327,9 @@ class SsdSingleRank1Triton(torch.autograd.Function):
 
         y_chunk = _phase3_forward_impl(V_chunk, log_alpha_chunk, S0_chunk, INPUT_PRECISION, RETURN_Y_OFF=False)
 
-        ctx.save_for_backward(V_chunk, log_alpha_chunk, init_flat)
+        # Save unchunked inputs; replay chunking in backward to reduce forward
+        # activation residency from chunked copies.
+        ctx.save_for_backward(V, log_alpha, init_flat)
         ctx.CHUNK_SIZE = CHUNK_SIZE
         ctx.INPUT_PRECISION = INPUT_PRECISION
         ctx.B = B
@@ -1324,14 +1337,14 @@ class SsdSingleRank1Triton(torch.autograd.Function):
         ctx.H = H
         ctx.D = D
         ctx.NC_exec = NC_exec
-        ctx.compute_dtype = V_chunk.dtype
+        ctx.compute_dtype = V.dtype
         ctx.phase2_compute_dtype = torch.float32
         ctx.initial_state_shape = None if initial_state is None else tuple(initial_state.shape)
         return y_chunk, S1_chunk
 
     @staticmethod
     def backward(ctx, grad_y_chunk, grad_S1_chunk):
-        V_chunk, log_alpha_chunk, init_flat = ctx.saved_tensors
+        V_in, log_alpha_in, init_flat = ctx.saved_tensors
         CHUNK_SIZE = ctx.CHUNK_SIZE
         INPUT_PRECISION = ctx.INPUT_PRECISION
         B = ctx.B
@@ -1343,6 +1356,20 @@ class SsdSingleRank1Triton(torch.autograd.Function):
         phase2_compute_dtype = ctx.phase2_compute_dtype
         initial_state_shape = ctx.initial_state_shape
         BH = B * H
+
+        # Re-materialize chunked layouts for backward replay.
+        V_chunk, log_alpha_chunk, init_flat, _B, _N, _H, _D, _NC = _prepare_triton_inputs(
+            V_in,
+            log_alpha_in,
+            init_flat,
+            where="SsdSingleRank1Triton.backward",
+            CHUNK_SIZE=CHUNK_SIZE,
+        )
+        if (_B, _N, _H, _D, _NC) != (B, N, H, D, NC):
+            raise RuntimeError(
+                "Backward replay shape mismatch: "
+                f"expected {(B, N, H, D, NC)}, got {(_B, _N, _H, _D, _NC)}."
+            )
 
         # Replay phase-1 / phase-2 to recover chunk starts.
         S_local_end = _phase1_forward_impl(V_chunk, log_alpha_chunk)
@@ -1378,8 +1405,11 @@ class SsdSingleRank1Triton(torch.autograd.Function):
         # Phase-1 backward.
         dV_p1, dlog_p1 = _phase1_backward_impl(dS_local_end, V_chunk, log_alpha_chunk)
 
-        dV_chunk = dV_p3 + dV_p1
-        dlog_chunk = dlog_p3 + dlog_p1 + dlog_per_chunk.unsqueeze(-1).to(log_alpha_chunk.dtype)
+        dV_p3.add_(dV_p1)
+        dV_chunk = dV_p3
+        dlog_p3.add_(dlog_p1)
+        dlog_p3.add_(dlog_per_chunk.unsqueeze(-1).to(log_alpha_chunk.dtype))
+        dlog_chunk = dlog_p3
 
         dV = _restore_grad_layout(dV_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
         dlog = dlog_chunk.reshape(B, H, NC, CHUNK_SIZE).permute(0, 2, 3, 1).reshape(B, NC * CHUNK_SIZE, H)[:, :N]
