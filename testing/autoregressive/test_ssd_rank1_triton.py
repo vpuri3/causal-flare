@@ -2,16 +2,16 @@ import pytest
 import torch
 
 from causal_flare.autoregressive.ssd_rank1_triton import (
-    SsdRank1ChunkEndStateTriton,
-    SsdRank1PrefixScanTriton,
-    SsdRank1DenseOutputTriton,
+    _ssd_rank1_chunk_end_state_forward_impl,
+    _ssd_rank1_prefix_scan_forward_impl,
+    _ssd_rank1_dense_output_forward_impl,
     ssd_rank1_pytorch,
     ssd_rank1_token_loop_oracle,
     ssd_rank1_prefix_scan_reference,
     ssd_rank1_chunk_end_state_reference,
-    ssd_rank1_dense_output_backward_kernel_profile,
-    ssd_rank1_dense_output_backward_reference,
     ssd_rank1_dense_output_reference,
+    ssd_rank1_dense_output_backward_reference,
+    ssd_rank1_dense_output_backward_kernel_profile,
     ssd_rank1_triton,
 )
 
@@ -159,7 +159,7 @@ def test_phase1_chunkwise_affine_state_scan_outline_forward_matches_reference(m:
     S_local_end, r_chunk, init = _make_inputs(seed=11 + m + d, bh=2, nc=16, m=m, d=d, dtype=dtype)
     start_ref, final_ref = ssd_rank1_prefix_scan_reference(S_local_end, r_chunk, init)
     log_alpha_chunk = torch.log(r_chunk.float()).to(r_chunk.dtype)
-    start, final = SsdRank1PrefixScanTriton.apply(S_local_end, log_alpha_chunk, init)
+    start, final = _ssd_rank1_prefix_scan_forward_impl(S_local_end, log_alpha_chunk, init)
     rtol, atol = _tol(dtype)
     torch.testing.assert_close(start, start_ref, rtol=rtol, atol=atol)
     torch.testing.assert_close(final, final_ref, rtol=rtol, atol=atol)
@@ -194,7 +194,7 @@ def test_ssd_rank1_chunk_end_state_reference_matches_token_loop(dtype: torch.dty
 def test_phase0_chunk_end_state_kernel_matches_reference(dtype: torch.dtype):
     w, v, log_alpha = _make_phase0_inputs(seed=202, bh=2, nc=8, c=32, m=16, d=32, dtype=dtype)
     s_ref = ssd_rank1_chunk_end_state_reference(w, v, log_alpha)
-    s_sc = SsdRank1ChunkEndStateTriton.apply(w, v, log_alpha)
+    s_sc = _ssd_rank1_chunk_end_state_forward_impl(w, v, log_alpha)
     rtol, atol = _tol(dtype)
     torch.testing.assert_close(s_sc, s_ref, rtol=rtol, atol=atol)
 
@@ -203,86 +203,9 @@ def test_phase0_chunk_end_state_kernel_matches_reference(dtype: torch.dtype):
 def test_phase0_chunk_end_state_outline_matches_reference_forward(dtype: torch.dtype):
     w, v, log_alpha = _make_phase0_inputs(seed=404, bh=2, nc=8, c=32, m=16, d=32, dtype=dtype)
     s_ref = ssd_rank1_chunk_end_state_reference(w, v, log_alpha)
-    s_out = SsdRank1ChunkEndStateTriton.apply(w, v, log_alpha)
+    s_out = _ssd_rank1_chunk_end_state_forward_impl(w, v, log_alpha)
     rtol, atol = _tol(dtype)
     torch.testing.assert_close(s_out, s_ref, rtol=rtol, atol=atol)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase0 backward triton test requires CUDA")
-@pytest.mark.parametrize("dtype", _supported_dtypes())
-def test_phase0_chunk_end_state_outline_backward_matches_reference(dtype: torch.dtype):
-    w, v, log_alpha = _make_phase0_inputs(seed=909, bh=1, nc=8, c=32, m=16, d=32, dtype=dtype)
-
-    w_ref = w.clone().detach().requires_grad_(True)
-    v_ref = v.clone().detach().requires_grad_(True)
-    log_alpha_ref = log_alpha.clone().detach().requires_grad_(True)
-    s_ref = ssd_rank1_chunk_end_state_reference(w_ref, v_ref, log_alpha_ref)
-    loss_ref = s_ref.square().mean()
-    loss_ref.backward()
-
-    w_tri = w.clone().detach().requires_grad_(True)
-    v_tri = v.clone().detach().requires_grad_(True)
-    log_alpha_tri = log_alpha.clone().detach().requires_grad_(True)
-    s_tri = SsdRank1ChunkEndStateTriton.apply(w_tri, v_tri, log_alpha_tri)
-    loss_tri = s_tri.square().mean()
-    loss_tri.backward()
-
-    rtol, atol = _tol(dtype)
-    torch.testing.assert_close(w_tri.grad, w_ref.grad, rtol=rtol, atol=atol)
-    torch.testing.assert_close(v_tri.grad, v_ref.grad, rtol=rtol, atol=atol)
-    r_rtol, r_atol = _phase0_r_grad_tol(dtype)
-    torch.testing.assert_close(log_alpha_tri.grad, log_alpha_ref.grad, rtol=r_rtol, atol=r_atol)
-
-
-def _finite_difference_grad(
-    scalar_fn,
-    x: torch.Tensor,
-    eps: float = 1e-3,
-) -> torch.Tensor:
-    x_flat = x.reshape(-1)
-    out = torch.empty_like(x_flat, dtype=torch.float32)
-    for i in range(x_flat.numel()):
-        x_pos = x.clone()
-        x_neg = x.clone()
-        x_pos.reshape(-1)[i] += eps
-        x_neg.reshape(-1)[i] -= eps
-        f_pos = scalar_fn(x_pos).to(torch.float32)
-        f_neg = scalar_fn(x_neg).to(torch.float32)
-        out[i] = (f_pos - f_neg) / (2.0 * eps)
-    return out.reshape_as(x)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase0 finite-difference test requires CUDA")
-def test_phase0_chunk_end_state_finite_difference_gradients():
-    pytest.skip("Phase0 finite-difference test removed: unsupported M/D grid for current kernel contract.")
-
-    grad_s = torch.randn(1, 2, 6, device=w.device, dtype=dtype)
-    w_var = w.clone().detach().requires_grad_(True)
-    v_var = v.clone().detach().requires_grad_(True)
-    r_var = r.clone().detach().requires_grad_(True)
-    s = SsdRank1ChunkEndStateTriton.apply(w_var, v_var, r_var, 16)
-    loss = (s * grad_s).sum()
-    loss.backward()
-
-    def f_w(x):
-        s_ = SsdRank1ChunkEndStateTriton.apply(x, v, r, 16)
-        return (s_ * grad_s).sum()
-
-    def f_v(x):
-        s_ = SsdRank1ChunkEndStateTriton.apply(w, x, r, 16)
-        return (s_ * grad_s).sum()
-
-    def f_r(x):
-        s_ = SsdRank1ChunkEndStateTriton.apply(w, v, x, 16)
-        return (s_ * grad_s).sum()
-
-    d_w_fd = _finite_difference_grad(f_w, w, eps=1e-3)
-    d_v_fd = _finite_difference_grad(f_v, v, eps=1e-3)
-    d_r_fd = _finite_difference_grad(f_r, r, eps=1e-3)
-
-    torch.testing.assert_close(w_var.grad, d_w_fd, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(v_var.grad, d_v_fd, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(r_var.grad, d_r_fd, rtol=3e-2, atol=3e-2)
 
 
 @pytest.mark.parametrize("dtype", _supported_dtypes())
@@ -355,103 +278,9 @@ def test_phase3_chunk_dense_output_outline_matches_reference_forward(dtype: torc
     c_tok, w_tok, v_tok, log_alpha_tok = _make_phase3_inputs(seed=1401, bh=2, nc=2, c=16, m=16, d=32, dtype=dtype)
     y_ref = ssd_rank1_dense_output_reference(c_tok, w_tok, v_tok, log_alpha_tok)
     input_precision = "ieee" if dtype == torch.float32 else "tf32"
-    y_tri = SsdRank1DenseOutputTriton.apply(
-        c_tok,
-        w_tok,
-        v_tok,
-        log_alpha_tok,
-        None,
-        input_precision,
-    )
+    y_tri = _ssd_rank1_dense_output_forward_impl(c_tok, w_tok, v_tok, log_alpha_tok, None, input_precision)
     rtol, atol = _phase3_tol(dtype)
     torch.testing.assert_close(y_tri, y_ref, rtol=rtol, atol=atol)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase3 backward triton test requires CUDA")
-@pytest.mark.parametrize("dtype", _supported_dtypes())
-def test_phase3_chunk_dense_output_outline_backward_matches_reference(dtype: torch.dtype):
-    c_tok, w_tok, v_tok, log_alpha_tok = _make_phase3_inputs(seed=1501, bh=1, nc=2, c=16, m=16, d=32, dtype=dtype)
-    s0 = torch.randn(1, 2, 16 * 32, device=c_tok.device, dtype=dtype)
-
-    c_ref = c_tok.clone().detach().requires_grad_(True)
-    w_ref = w_tok.clone().detach().requires_grad_(True)
-    v_ref = v_tok.clone().detach().requires_grad_(True)
-    log_alpha_ref = log_alpha_tok.clone().detach().requires_grad_(True)
-    s0_ref = s0.clone().detach().requires_grad_(True)
-    y_ref = ssd_rank1_dense_output_reference(c_ref, w_ref, v_ref, log_alpha_ref, s0_ref)
-    loss_ref = 0.37 * y_ref.square().mean() + 0.63 * y_ref.abs().mean()
-    loss_ref.backward()
-
-    c_tri = c_tok.clone().detach().requires_grad_(True)
-    w_tri = w_tok.clone().detach().requires_grad_(True)
-    v_tri = v_tok.clone().detach().requires_grad_(True)
-    log_alpha_tri = log_alpha_tok.clone().detach().requires_grad_(True)
-    s0_tri = s0.clone().detach().requires_grad_(True)
-    input_precision = "ieee" if dtype == torch.float32 else "tf32"
-    y_tri = SsdRank1DenseOutputTriton.apply(
-        c_tri,
-        w_tri,
-        v_tri,
-        log_alpha_tri,
-        s0_tri,
-        input_precision,
-    )
-    loss_tri = 0.37 * y_tri.square().mean() + 0.63 * y_tri.abs().mean()
-    loss_tri.backward()
-
-    rtol, atol = _phase3_tol(dtype)
-    torch.testing.assert_close(c_tri.grad, c_ref.grad, rtol=rtol, atol=atol)
-    torch.testing.assert_close(w_tri.grad, w_ref.grad, rtol=rtol, atol=atol)
-    torch.testing.assert_close(v_tri.grad, v_ref.grad, rtol=rtol, atol=atol)
-    rtol_r, atol_r = _phase3_r_grad_tol(dtype)
-    torch.testing.assert_close(log_alpha_tri.grad, log_alpha_ref.grad, rtol=rtol_r, atol=atol_r)
-    torch.testing.assert_close(s0_tri.grad, s0_ref.grad, rtol=rtol, atol=atol)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase3 backward targeted test requires CUDA")
-def test_phase3_chunk_dense_output_outline_backward_matches_reference_targeted_c64():
-    dtype = torch.float32
-    bh, nc, c, m, d = 1, 8, 64, 128, 64
-    c_tok, w_tok, v_tok, log_alpha_tok = _make_phase3_inputs(seed=1511, bh=bh, nc=nc, c=c, m=m, d=d, dtype=dtype)
-    s0 = torch.randn(bh, nc, m * d, device=c_tok.device, dtype=dtype)
-    grad_y = torch.randn(bh, nc, c, d, device=c_tok.device, dtype=dtype)
-
-    dC_ref, dW_ref, dV_ref, dlog_alpha_ref, dS0_ref = ssd_rank1_dense_output_backward_reference(
-        c_tok,
-        w_tok,
-        v_tok,
-        log_alpha_tok,
-        grad_y,
-        s0,
-    )
-    assert dS0_ref is not None
-
-    c_tri = c_tok.clone().detach().requires_grad_(True)
-    w_tri = w_tok.clone().detach().requires_grad_(True)
-    v_tri = v_tok.clone().detach().requires_grad_(True)
-    log_alpha_tri = log_alpha_tok.clone().detach().requires_grad_(True)
-    s0_tri = s0.clone().detach().requires_grad_(True)
-    y_tri = SsdRank1DenseOutputTriton.apply(
-        c_tri,
-        w_tri,
-        v_tri,
-        log_alpha_tri,
-        s0_tri,
-        "ieee",
-    )
-    loss_tri = (y_tri * grad_y).sum()
-    loss_tri.backward()
-
-    torch.testing.assert_close(c_tri.grad, dC_ref, rtol=1e-4, atol=5e-4)
-    torch.testing.assert_close(w_tri.grad, dW_ref, rtol=1e-4, atol=5e-4)
-    torch.testing.assert_close(v_tri.grad, dV_ref, rtol=1e-4, atol=5e-4)
-    torch.testing.assert_close(log_alpha_tri.grad, dlog_alpha_ref, rtol=1e-4, atol=5e-4)
-    torch.testing.assert_close(s0_tri.grad, dS0_ref.reshape(bh, nc, m * d), rtol=1e-4, atol=5e-4)
-
-
-@pytest.mark.skip(reason="Phase3 finite-difference test removed: unsupported M/D grid for current kernel contract.")
-def test_phase3_chunk_dense_output_finite_difference_is_not_implemented():
-    pass
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase3 backward profile smoke requires CUDA")
@@ -469,14 +298,14 @@ def test_phase3_chunk_dense_output_backward_profile_smoke_cuda():
 def test_phase0_chunk_end_state_outline_requires_c_multiple_of_16():
     w, v, log_alpha = _make_phase0_inputs(seed=1751, bh=1, nc=8, c=6, m=16, d=32, dtype=torch.float32)
     with pytest.raises(NotImplementedError, match="positive multiple of 16"):
-        SsdRank1ChunkEndStateTriton.apply(w, v, log_alpha)
+        _ssd_rank1_chunk_end_state_forward_impl(w, v, log_alpha)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase3 invalid-C contract requires CUDA")
 def test_phase3_chunk_dense_output_outline_requires_c_multiple_of_16():
     c_tok, w_tok, v_tok, log_alpha_tok = _make_phase3_inputs(seed=1752, bh=1, nc=1, c=6, m=16, d=32, dtype=torch.float32)
     with pytest.raises(NotImplementedError, match="positive multiple of 16"):
-        SsdRank1DenseOutputTriton.apply(c_tok, w_tok, v_tok, log_alpha_tok, None, "tf32")
+        _ssd_rank1_dense_output_forward_impl(c_tok, w_tok, v_tok, log_alpha_tok, None, "tf32")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Static-C phase0 triton test requires CUDA")
@@ -487,142 +316,20 @@ def test_phase0_chunk_end_state_kernel_matches_reference_static_c(dtype: torch.d
         pytest.skip("bf16 not supported on this CUDA device")
     w, v, log_alpha = _make_phase0_inputs(seed=515 + c, bh=1, nc=8, c=c, m=16, d=32, dtype=dtype)
     s_ref = ssd_rank1_chunk_end_state_reference(w, v, log_alpha)
-    s_sc = SsdRank1ChunkEndStateTriton.apply(w, v, log_alpha)
+    s_sc = _ssd_rank1_chunk_end_state_forward_impl(w, v, log_alpha)
     rtol, atol = _tol(dtype)
     torch.testing.assert_close(s_sc, s_ref, rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("dtype", _supported_dtypes())
-@pytest.mark.parametrize(("m", "d"), [(16, 32), (32, 64), (128, 32)])
-def test_phase1_chunkwise_affine_state_scan_outline_backward_matches_reference(m: int, d: int, dtype: torch.dtype):
-    S_local_end, r_chunk, init = _make_inputs(seed=17 + m + d, bh=2, nc=16, m=m, d=d, dtype=dtype)
-
-    S_local_end_ref = S_local_end.clone().detach().requires_grad_(True)
-    log_alpha_chunk_ref = torch.log(r_chunk.float()).to(r_chunk.dtype).clone().detach().requires_grad_(True)
-    init_ref = init.clone().detach().requires_grad_(True)
-    start_ref, final_ref = ssd_rank1_prefix_scan_reference(S_local_end_ref, torch.exp(log_alpha_chunk_ref), init_ref)
-    loss_ref = 0.37 * start_ref.square().mean() + 0.63 * final_ref.abs().mean()
-    loss_ref.backward()
-
-    S_local_end_tri = S_local_end.clone().detach().requires_grad_(True)
-    log_alpha_chunk_tri = torch.log(r_chunk.float()).to(r_chunk.dtype).clone().detach().requires_grad_(True)
-    init_tri = init.clone().detach().requires_grad_(True)
-    start_tri, final_tri = SsdRank1PrefixScanTriton.apply(S_local_end_tri, log_alpha_chunk_tri, init_tri)
-    loss_tri = 0.37 * start_tri.square().mean() + 0.63 * final_tri.abs().mean()
-    loss_tri.backward()
-
-    rtol, atol = _tol(dtype)
-    torch.testing.assert_close(S_local_end_tri.grad, S_local_end_ref.grad, rtol=rtol, atol=atol)
-    torch.testing.assert_close(init_tri.grad, init_ref.grad, rtol=rtol, atol=atol)
-    r_rtol, r_atol = _r_grad_tol(dtype)
-    torch.testing.assert_close(log_alpha_chunk_tri.grad, log_alpha_chunk_ref.grad, rtol=r_rtol, atol=r_atol)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase1 finite-difference test requires CUDA")
-def test_phase1_chunkwise_affine_state_scan_finite_difference_gradients():
-    pytest.skip("Phase1 finite-difference test intentionally disabled for fast iteration.")
-    dtype = torch.float32
-    bh, nc, m, d = 1, 3, 16, 32
-    md = m * d
-    torch.manual_seed(1717)
-    device = "cuda"
-    s_local = torch.randn(bh, nc, md, device=device, dtype=dtype)
-    r_chunk = torch.sigmoid(torch.randn(bh, nc, device=device, dtype=dtype))
-    init = torch.randn(bh, md, device=device, dtype=dtype)
-
-    g_start = torch.randn(bh, nc, md, device=device, dtype=dtype)
-    g_final = torch.randn(bh, md, device=device, dtype=dtype)
-
-    s = s_local.clone().detach().requires_grad_(True)
-    log_alpha = torch.log(r_chunk.float()).to(r_chunk.dtype).clone().detach().requires_grad_(True)
-    i = init.clone().detach().requires_grad_(True)
-    start, final = SsdRank1PrefixScanTriton.apply(s, log_alpha, i)
-    loss = (start * g_start).sum() + (final * g_final).sum()
-    loss.backward()
-
-    def f_s(x):
-        start_, final_ = SsdRank1PrefixScanTriton.apply(x, torch.log(r_chunk.float()).to(r_chunk.dtype), init)
-        return (start_ * g_start).sum() + (final_ * g_final).sum()
-
-    def f_r(x):
-        start_, final_ = SsdRank1PrefixScanTriton.apply(s_local, torch.log(x.float()).to(x.dtype), init)
-        return (start_ * g_start).sum() + (final_ * g_final).sum()
-
-    def f_i(x):
-        start_, final_ = SsdRank1PrefixScanTriton.apply(
-            s_local,
-            torch.log(r_chunk.float()).to(r_chunk.dtype),
-            x,
-        )
-        return (start_ * g_start).sum() + (final_ * g_final).sum()
-
-    d_s_fd = _finite_difference_grad(f_s, s_local, eps=1e-3)
-    d_r_fd = _finite_difference_grad(f_r, r_chunk, eps=1e-3)
-    d_i_fd = _finite_difference_grad(f_i, init, eps=1e-3)
-
-    torch.testing.assert_close(s.grad, d_s_fd, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(log_alpha.grad, d_r_fd * r_chunk, rtol=3e-2, atol=3e-2)
-    torch.testing.assert_close(i.grad, d_i_fd, rtol=2e-2, atol=2e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Benchmark test requires CUDA")
-def test_phase1_chunkwise_affine_state_scan_small_benchmark_cuda():
-    # Small benchmark smoke to ensure timing path remains functional.
-    dtype = torch.float16
-    S_local_end, r_chunk, init = _make_inputs(seed=123, bh=16, nc=16, m=16, d=32, dtype=dtype)
-    log_alpha_chunk = torch.log(r_chunk.float()).to(r_chunk.dtype)
-
-    def _time_forward(fn, iters: int = 10):
-        for _ in range(3):
-            _ = fn()
-        torch.cuda.synchronize()
-        t0 = torch.cuda.Event(enable_timing=True)
-        t1 = torch.cuda.Event(enable_timing=True)
-        t0.record()
-        for _ in range(iters):
-            _ = fn()
-        t1.record()
-        torch.cuda.synchronize()
-        return t0.elapsed_time(t1) / iters
-
-    def _time_backward(fn, iters: int = 10):
-        for _ in range(2):
-            s = S_local_end.detach().clone().requires_grad_(True)
-            r = r_chunk.detach().clone().requires_grad_(True)
-            i = init.detach().clone().requires_grad_(True)
-            out, fin = fn(s, r, i)
-            (out.float().square().mean() + fin.float().square().mean()).backward()
-        torch.cuda.synchronize()
-        t0 = torch.cuda.Event(enable_timing=True)
-        t1 = torch.cuda.Event(enable_timing=True)
-        t0.record()
-        for _ in range(iters):
-            s = S_local_end.detach().clone().requires_grad_(True)
-            r = r_chunk.detach().clone().requires_grad_(True)
-            i = init.detach().clone().requires_grad_(True)
-            out, fin = fn(s, r, i)
-            (out.float().square().mean() + fin.float().square().mean()).backward()
-        t1.record()
-        torch.cuda.synchronize()
-        return t0.elapsed_time(t1) / iters
-
-    tri_fwd = _time_forward(lambda: SsdRank1PrefixScanTriton.apply(S_local_end, log_alpha_chunk, init))
-    ref_fwd = _time_forward(lambda: ssd_rank1_prefix_scan_reference(S_local_end, r_chunk, init))
-    tri_bwd = _time_backward(lambda s, r, i: SsdRank1PrefixScanTriton.apply(s, torch.log(r.float()).to(r.dtype), i))
-    ref_bwd = _time_backward(lambda s, r, i: ssd_rank1_prefix_scan_reference(s, r, i))
-
-    assert tri_fwd > 0 and ref_fwd > 0 and tri_bwd > 0 and ref_bwd > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Full phase123 composition test requires CUDA")
 def test_ssd_rank1_triton_matches_reference_forward():
     dtype = torch.float32
-    b, h, m, d = 2, 2, 16, 32
-    c, w, v, log_alpha = _make_phase123_inputs(seed=2026, b=b, n=111, h=h, m=m, d=d, dtype=dtype)
+    b, h, m, d = 2, 4, 16, 32
+    c, w, v, log_alpha = _make_phase123_inputs(seed=2026, b=b, n=512, h=h, m=m, d=d, dtype=dtype)
     init = torch.randn(b, h, m * d, device=c.device, dtype=dtype)
 
     y_ref, final_ref = ssd_rank1_pytorch(
-        c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone(), CHUNK_SIZE=64
+        c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone(), CHUNK_SIZE=32
     )
     y_tri, final_tri = ssd_rank1_triton(
         c.clone(),
@@ -630,7 +337,7 @@ def test_ssd_rank1_triton_matches_reference_forward():
         v.clone(),
         log_alpha.clone(),
         initial_state=init.clone(),
-        CHUNK_SIZE=64,
+        CHUNK_SIZE=32,
         INPUT_PRECISION="ieee",
     )
 
@@ -642,12 +349,12 @@ def test_ssd_rank1_triton_matches_reference_forward():
 
 def test_ssd_rank1_pytorch_matches_token_loop_oracle():
     dtype = torch.float32
-    b, h, m, d = 2, 2, 16, 32
-    c, w, v, log_alpha = _make_phase123_inputs(seed=3026, b=b, n=97, h=h, m=m, d=d, dtype=dtype)
+    b, h, m, d = 2, 4, 16, 32
+    c, w, v, log_alpha = _make_phase123_inputs(seed=3026, b=b, n=512, h=h, m=m, d=d, dtype=dtype)
     init = torch.randn(b, h, m * d, device=c.device, dtype=dtype)
 
     y_ref, final_ref = ssd_rank1_pytorch(
-        c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone(), CHUNK_SIZE=64
+        c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone(), CHUNK_SIZE=32
     )
     y_oracle, final_oracle = ssd_rank1_token_loop_oracle(
         c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone()
@@ -657,3 +364,26 @@ def test_ssd_rank1_pytorch_matches_token_loop_oracle():
     rtol_s, atol_s = _tol(dtype)
     torch.testing.assert_close(y_ref, y_oracle, rtol=rtol_y, atol=atol_y)
     torch.testing.assert_close(final_ref, final_oracle, rtol=rtol_s, atol=atol_s)
+
+
+@pytest.mark.parametrize(
+    ("b", "h", "n", "chunk_size", "match"),
+    [
+        (1, 4, 512, 64, "BH to be a multiple of 8"),
+        (1, 8, 256, 64, "N to be a multiple of 512"),
+        (1, 8, 512, 16, "CHUNK_SIZE in"),
+    ],
+)
+def test_ssd_rank1_triton_forward_contract_rejects_unsupported_shapes(
+    b: int,
+    h: int,
+    n: int,
+    chunk_size: int,
+    match: str,
+):
+    c = torch.randn(b, n, h, 16)
+    w = torch.randn(b, n, h, 16)
+    v = torch.randn(b, n, h, 32)
+    log_alpha = -torch.nn.functional.softplus(torch.randn(b, n, h))
+    with pytest.raises(NotImplementedError, match=match):
+        ssd_rank1_triton(c, w, v, log_alpha, CHUNK_SIZE=chunk_size)
