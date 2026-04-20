@@ -429,6 +429,7 @@ def test_phase1_fused_backward_kernel_matches_split_path_fp32():
         M_STATIC=M,
         D_STATIC=D,
         INPUT_PRECISION="ieee",
+        USE_BF16_DOT_INPUTS=False,
         ACCUMULATE=True,
         num_warps=launch_cfg.num_warps,
         num_stages=launch_cfg.num_stages,
