@@ -1,8 +1,4 @@
-"""Triton path for SSD rank-1 autoregressive chunk-prefix state scans.
-
-This file currently implements forward for mode-0 chunk-prefix propagation and
-keeps backward as an explicit TODO.
-"""
+"""Triton path for SSD rank-1 autoregressive chunk-prefix state scans."""
 
 from __future__ import annotations
 
@@ -18,21 +14,9 @@ _SUPPORTED_D_VALUES = {32, 64, 128}
 _SUPPORTED_CHUNK_SIZES = {32, 64, 128, 256}
 _SUPPORTED_BLOCK_T_VALUES = (16, 8, 4, 2, 1)
 _SUPPORTED_BLOCK_X_VALUES = (128, 64, 32, 16)
-_SUPPORTED_BLOCK_MD_VALUES = (512, 256, 128, 64)
 _SUPPORTED_PHASE1_BLOCK_T_VALUES = {1, 2, 4, 8, 16}
 _EXPERIMENTAL_TRITON_ALLOCATOR_SET = False
 _INV_LN2 = 1.4426950408889634
-
-# Phase-3 backward tuning knobs (C is compile-time; tune M/D tiles and launch).
-_PHASE3_BWD_BLOCK_M = 64
-_PHASE3_BWD_BLOCK_D = 64
-_PHASE3_BWD_A1_NUM_WARPS = 8
-_PHASE3_BWD_A2_NUM_WARPS = 8
-_PHASE3_BWD_OFF_NUM_WARPS = 8
-_PHASE3_BWD_DIAG_NUM_WARPS = 2
-_PHASE3_BWD_FUSED_A1A2_NUM_WARPS = 4
-_PHASE3_BWD_FUSED_OFF_NUM_WARPS = 4
-_PHASE3_BWD_NUM_STAGES = 3
 
 # Reusable buffers for Phase-3 backward intermediates to reduce allocation overhead.
 _PHASE3_BWD_WORKSPACE: dict[tuple, torch.Tensor] = {}
