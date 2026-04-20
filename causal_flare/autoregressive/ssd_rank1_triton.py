@@ -3550,141 +3550,42 @@ class SsdRank1Triton(torch.autograd.Function):
         # =========================================
         # BACKWARD REPLAY: RECOMPUTE FORWARD INTERMEDIATES
         # =========================================
+        # --------------------------------------------------------------------------------------------------
+        # POTENTIAL MEMORY/SPEED FOLLOW-UPS (ordered roughly from safest/easiest to largest rewrite):
+        #
+        # 1) Phase-3 forward: skip allocating/storing `y_off` when RETURN_Y_OFF=False.
+        #    Today we still allocate/store a full [BH,NC,C,D] buffer even when the caller does not need it.
+        #
+        # 2) Phase-3 backward: guard `.contiguous()` on upstream grads.
+        #    Avoid cloning full grad buffers when layout is already contiguous.
+        #
+        # 3) Phase-3 backward off-path: remove eager `y_off_saved` materialization fallback.
+        #    Computing/storing full `y_off_saved` in eager is memory-heavy; derive needed terms in-kernel.
+        #
+        # 4) Backward outputs: remove chunk-grad -> restored-grad double residency.
+        #    Today we hold dC/dW/dV in chunk layout and then allocate restored [B,N,H,*] copies.
+        #
+        # 5) Saved activations: save unchunked inputs and replay chunking in backward.
+        #    Similar to the single-rank1 optimization; trades some replay compute for lower forward residency.
+        #
+        # 6) Block loop internals: avoid per-block temporary grad tensors and copy-back.
+        #    Accumulate directly into global outputs (or final-layout outputs) to reduce transient peaks/copies.
+        # --------------------------------------------------------------------------------------------------
         # Phase 1 forward replay gives S_local_end needed by Phase 2 replay.
         S_local_end = _ssd_rank1_chunk_end_state_forward_impl(W_chunk, V_chunk, log_alpha_chunk, 32)
 
-        # Phase 2 forward replay gives S0_chunk (chunk-start states) needed by
-        # Phase 3 backward and Phase 2 backward.
+        # Blockwise replay / backward schedule to reduce peak memory from phase
+        # state transients:
+        # - avoid full S0_chunk materialization
+        # - avoid full dS0 chunk buffer
+        # - avoid full dS_local_end buffer
         log_alpha_per_chunk = torch.sum(log_alpha_chunk.float(), dim=-1)
-        S0_chunk, _ = _ssd_rank1_prefix_scan_forward_impl(
-            S_local_end, log_alpha_per_chunk, init_flat, compute_dtype,
-        )
-        # S_local_end is only needed to replay S0_chunk; release it before
-        # phase-3 backward to lower peak live memory.
-        del S_local_end
+        alpha_per_chunk = torch.exp2(log_alpha_per_chunk * _INV_LN2)
 
-        # =========================================
-        # BACKWARD PHASE 3: DENSE OUTPUT BACKWARD
-        # =========================================
-        # Produces:
-        #   dC_chunk, dW_chunk, dV_chunk, dlog_alpha_chunk_p3
-        #   dS0_chunk = dL/dS0_chunk (this feeds Phase 2 backward)
-        # Keep dS0 in fp32 to avoid extra bf16->fp32 roundtrip before Phase 2 bwd.
-        dC_chunk, dW_chunk, dV_chunk, dlog_alpha_chunk_p3, dS0_chunk = _ssd_rank1_dense_output_backward_impl(
-            C_chunk,
-            W_chunk,
-            V_chunk,
-            log_alpha_chunk,
-            grad_y_chunk,
-            S0_saved=S0_chunk,
-            y_off_saved=None,
-            input_precision=INPUT_PRECISION,
-            s0_was_flat=False,
-            return_s0_grad_fp32=True,
-        )
-        # grad_y_chunk is no longer needed after Phase 3 backward.
-        # Releasing them early lowers live memory before Phase 2/1 backward.
-        del grad_y_chunk
-
-        # =========================================
-        # BACKWARD PHASE 2: PREFIX SCAN BACKWARD
-        # =========================================
-        # Phase 2 forward equations:
-        #   S0 = prefix_scan(S_local_end, log_alpha_per_chunk, init)
-        #   S1 = final_state(...)
-        # So Phase 2 backward consumes:
-        #   grad_chunk_start = dL/dS0_chunk  (from Phase 3 backward)
-        #   grad_final_state = dL/dS1_chunk  (upstream argument grad_S1_chunk)
-        grad_final_for_p2 = (
-            grad_S1_chunk
-            if grad_S1_chunk is not None
-            else torch.zeros((BH, MD), device=C_chunk.device, dtype=compute_dtype)
-        )
-        dS_local_end = torch.empty((BH, NC, MD), device=C_chunk.device, dtype=torch.float32)
-        dS_local_end = _ssd_rank1_bwd_workspace_tensor(
-            "phase2_dS_local_end",
-            (BH, NC, MD),
-            device=C_chunk.device,
-            dtype=torch.float32,
-        )
-        d_log_alpha_per_chunk = _ssd_rank1_bwd_workspace_tensor(
-            "phase2_dlog_per_chunk",
-            (BH, NC),
-            device=C_chunk.device,
-            dtype=torch.float32,
-        )
-        d_init_f32 = _ssd_rank1_bwd_workspace_tensor(
-            "phase2_dinit",
-            (BH, MD),
-            device=C_chunk.device,
-            dtype=torch.float32,
-        )
-
-        # Normalize dtype/layout for kernel launch without redundant copies:
-        # if already fp32 contiguous, pass through directly.
-        grad_chunk_start = dS0_chunk.reshape(BH, NC, MD)
-        grad_chunk_start_f = (
-            grad_chunk_start
-            if grad_chunk_start.dtype == torch.float32 and grad_chunk_start.is_contiguous()
-            else grad_chunk_start.float().contiguous()
-        )
-        grad_final_state_f = (
-            grad_final_for_p2
-            if grad_final_for_p2.dtype == torch.float32 and grad_final_for_p2.is_contiguous()
-            else grad_final_for_p2.float().contiguous()
-        )
-        S0_chunk_f = S0_chunk if S0_chunk.dtype == torch.float32 and S0_chunk.is_contiguous() else S0_chunk.float().contiguous()
-        log_alpha_per_chunk_f = (
-            log_alpha_per_chunk
-            if log_alpha_per_chunk.dtype == torch.float32 and log_alpha_per_chunk.is_contiguous()
-            else log_alpha_per_chunk.float().contiguous()
-        )
-
-        # Keep phase-2 backward on the autotuned launch path (remote baseline).
-        # Forcing large fixed BLOCK_MD/BLOCK_NC here regressed runtime badly on
-        # larger BH/NC shapes.
-        block_nc = _select_phase2_block_nc(NC=NC)
-        grid_bwd = lambda META: (BH,)
-        # Phase-2 reverse scan:
-        #   inputs  : dS0_chunk and dS1
-        #   outputs : dS_local_end, d(log_alpha_per_chunk), dinit
-        ssd_rank1_prefix_scan_bwd_dense_kernel[grid_bwd](
-            grad_chunk_start_f,
-            grad_final_state_f,
-            S0_chunk_f,
-            log_alpha_per_chunk_f,
-            dS_local_end,
-            d_log_alpha_per_chunk,
-            d_init_f32,
-            BH,
-            NC,
-            MD,
-            *grad_chunk_start_f.stride(),
-            *grad_final_state_f.stride(),
-            *S0_chunk_f.stride(),
-            *log_alpha_per_chunk_f.stride(),
-            *dS_local_end.stride(),
-            *d_log_alpha_per_chunk.stride(),
-            *d_init_f32.stride(),
-            BLOCK_NC=block_nc,
-            NC_STATIC=NC,
-            USE_FP32_COMPUTE=(compute_dtype == torch.float32),
-            USE_BF16_COMPUTE=(compute_dtype == torch.bfloat16),
-        )
-
-        # S0_chunk is now consumed; release before Phase 1 backward.
-        del log_alpha_per_chunk, dS0_chunk, S0_chunk
-
-        # =========================================
-        # BACKWARD PHASE 1: CHUNK END-STATE BACKWARD
-        # =========================================
-        # Phase 1 maps (W,V,log_alpha) -> S_local_end.
-        # We now have dL/dS_local_end from Phase 2 backward and can run
-        # the three Phase 1 backward kernels to obtain:
-        #   d_W_p1, d_V_p1, d_log_alpha_p1.
-        grad_s_md = dS_local_end.view(BH, NC, M, D)
-
-        d_log_alpha_p1 = torch.empty_like(log_alpha_chunk)
+        dC_chunk = torch.empty_like(C_chunk)
+        dW_chunk = torch.empty_like(W_chunk)
+        dV_chunk = torch.empty_like(V_chunk)
+        dlog_alpha_chunk = torch.empty_like(log_alpha_chunk)
 
         BLOCK_M = _select_largest_block_size(
             M,
@@ -3702,66 +3603,164 @@ class SsdRank1Triton(torch.autograd.Function):
         n_d_tiles = D // BLOCK_D
         phase1_bwd_cfg = _select_phase1_backward_launch_config(M=M, D=D)
 
-        grid_dw = (BH * NC, n_m_tiles)
-        # From dS_local_end, compute phase-1 contribution to dW.
-        ssd_rank1_chunk_end_state_bwd_dw_chunk_kernel[grid_dw](
-            grad_s_md, V_chunk, log_alpha_chunk, dW_chunk,
-            BH, NC, CHUNK_SIZE, M, D,
-            *grad_s_md.stride(), *V_chunk.stride(), *log_alpha_chunk.stride(), *dW_chunk.stride(),
-            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_C=CHUNK_SIZE,
-            C_STATIC=CHUNK_SIZE, D_STATIC=D,
-            INPUT_PRECISION="ieee" if C_chunk.dtype == torch.float32 else "tf32",
-            ACCUMULATE=True,
-            num_warps=phase1_bwd_cfg.num_warps, num_stages=phase1_bwd_cfg.num_stages,
-        )
-
-        b_partials = _ssd_rank1_bwd_workspace_tensor(
-            "phase1_b_partials",
-            (BH, NC, n_d_tiles, CHUNK_SIZE),
+        # Recompute chunk-start states per small block.
+        state_block_nc = 8 if NC >= 8 else NC
+        num_state_blocks = (NC + state_block_nc - 1) // state_block_nc
+        state_boundaries = _ssd_rank1_bwd_workspace_tensor(
+            "phase2_state_boundaries",
+            (num_state_blocks + 1, BH, MD),
             device=C_chunk.device,
             dtype=torch.float32,
         )
-        grid_dv = (BH * NC, n_d_tiles)
-        # Compute phase-1 contribution to dV and the intermediate `b` terms used for dlog_alpha_p1.
-        ssd_rank1_chunk_end_state_bwd_dv_b_chunk_kernel[grid_dv](
-            grad_s_md, W_chunk, V_chunk, log_alpha_chunk, dV_chunk, b_partials,
-            BH, NC, CHUNK_SIZE, M, D, n_d_tiles,
-            *grad_s_md.stride(), *W_chunk.stride(), *V_chunk.stride(), *log_alpha_chunk.stride(),
-            *dV_chunk.stride(), *b_partials.stride(),
-            BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_C=CHUNK_SIZE,
-            C_STATIC=CHUNK_SIZE, M_STATIC=M,
-            INPUT_PRECISION="ieee" if C_chunk.dtype == torch.float32 else "tf32",
-            ACCUMULATE=True,
-            num_warps=phase1_bwd_cfg.num_warps, num_stages=phase1_bwd_cfg.num_stages,
+        state = init_flat if init_flat.dtype == torch.float32 else init_flat.float()
+        for blk in range(num_state_blocks):
+            state_boundaries[blk].copy_(state)
+            blk_start = blk * state_block_nc
+            blk_end = min((blk + 1) * state_block_nc, NC)
+            for c_idx in range(blk_start, blk_end):
+                state = alpha_per_chunk[:, c_idx:c_idx + 1] * state + S_local_end[:, c_idx, :]
+        state_boundaries[num_state_blocks].copy_(state)
+
+        grad_final_for_p2 = (
+            grad_S1_chunk
+            if grad_S1_chunk is not None
+            else torch.zeros((BH, MD), device=C_chunk.device, dtype=torch.float32)
         )
-        b_vals = torch.sum(b_partials, dim=2)
+        grad_end = grad_final_for_p2 if grad_final_for_p2.dtype == torch.float32 else grad_final_for_p2.float()
 
-        grid_dr = (BH * NC,)
-        # Convert reduced `b` terms into phase-1 dlog_alpha contribution.
-        ssd_rank1_chunk_end_state_bwd_dr_kernel[grid_dr](
-            b_vals, log_alpha_chunk, d_log_alpha_p1,
-            BH, NC, CHUNK_SIZE,
-            *b_vals.stride(), *log_alpha_chunk.stride(), *d_log_alpha_p1.stride(),
-            BLOCK_C=CHUNK_SIZE, C_STATIC=CHUNK_SIZE,
-            num_warps=phase1_bwd_cfg.num_warps, num_stages=phase1_bwd_cfg.num_stages,
-        )
+        for blk in range(num_state_blocks - 1, -1, -1):
+            blk_start = blk * state_block_nc
+            blk_end = min((blk + 1) * state_block_nc, NC)
+            blk_nc = blk_end - blk_start
 
-        # keep d_init_f32 alive for initial_state grad
-        del dS_local_end, grad_s_md, b_partials, b_vals
+            # Recompute S0 for this block only.
+            s0_block = _ssd_rank1_bwd_workspace_tensor(
+                "phase2_s0_block",
+                (BH, blk_nc, MD),
+                device=C_chunk.device,
+                dtype=torch.float32,
+            )
+            state_blk = state_boundaries[blk]
+            for local_idx, c_idx in enumerate(range(blk_start, blk_end)):
+                s0_block[:, local_idx, :].copy_(state_blk)
+                state_blk = alpha_per_chunk[:, c_idx:c_idx + 1] * state_blk + S_local_end[:, c_idx, :]
 
-        # =========================================
-        # BACKWARD FINALIZE: ACCUMULATE + RESTORE LAYOUT
-        # =========================================
-        # Accumulate per-phase contributions.
-        # W/V/log_alpha each receive contributions from:
-        #   - Phase 3 path
-        #   - Phase 1 path (through S_local_end)
-        # plus for log_alpha an additional Phase 2 chunk-scale contribution.
-        # d_log_alpha_per_chunk is one scalar per chunk; broadcast over token index
-        # so each token in the chunk receives the same phase-2 contribution.
-        dlog_alpha_chunk_p3.add_(d_log_alpha_p1)
-        dlog_alpha_chunk_p3.add_(d_log_alpha_per_chunk.unsqueeze(-1).to(log_alpha_chunk.dtype))
-        dlog_alpha_chunk = dlog_alpha_chunk_p3
+            # Phase-3 backward on this block.
+            dC_blk, dW_blk, dV_blk, dlog_blk, dS0_blk = _ssd_rank1_dense_output_backward_impl(
+                C_chunk[:, blk_start:blk_end, :, :],
+                W_chunk[:, blk_start:blk_end, :, :],
+                V_chunk[:, blk_start:blk_end, :, :],
+                log_alpha_chunk[:, blk_start:blk_end, :],
+                grad_y_chunk[:, blk_start:blk_end, :, :],
+                S0_saved=s0_block,
+                y_off_saved=None,
+                input_precision=INPUT_PRECISION,
+                s0_was_flat=True,
+                return_s0_grad_fp32=True,
+            )
+
+            # Phase-2 reverse scan equations over this block only; consume dS0
+            # immediately and emit dS_local_end as grad_s_blk (no full tensor).
+            grad_s_blk = _ssd_rank1_bwd_workspace_tensor(
+                "phase2_grad_s_block",
+                (BH, blk_nc, MD),
+                device=C_chunk.device,
+                dtype=torch.float32,
+            )
+            dlog_per_chunk_blk = _ssd_rank1_bwd_workspace_tensor(
+                "phase2_dlog_per_chunk_block",
+                (BH, blk_nc),
+                device=C_chunk.device,
+                dtype=torch.float32,
+            )
+            for local_idx in range(blk_nc - 1, -1, -1):
+                c_idx = blk_start + local_idx
+                grad_s_blk[:, local_idx, :].copy_(grad_end)
+                alpha_c = alpha_per_chunk[:, c_idx:c_idx + 1]
+                s0_c = s0_block[:, local_idx, :]
+                dlog_per_chunk_blk[:, local_idx].copy_(torch.sum(grad_end * (alpha_c * s0_c), dim=-1))
+                grad_end = dS0_blk[:, local_idx, :] + alpha_c * grad_end
+
+            # Phase-1 backward on block-local dS_local_end.
+            grad_s_md_blk = grad_s_blk.reshape(BH, blk_nc, M, D)
+            dlog_p1_blk = torch.empty_like(log_alpha_chunk[:, blk_start:blk_end, :])
+
+            grid_dw = (BH * blk_nc, n_m_tiles)
+            ssd_rank1_chunk_end_state_bwd_dw_chunk_kernel[grid_dw](
+                grad_s_md_blk, V_chunk[:, blk_start:blk_end, :, :], log_alpha_chunk[:, blk_start:blk_end, :], dW_blk,
+                BH, blk_nc, CHUNK_SIZE, M, D,
+                *grad_s_md_blk.stride(),
+                *V_chunk[:, blk_start:blk_end, :, :].stride(),
+                *log_alpha_chunk[:, blk_start:blk_end, :].stride(),
+                *dW_blk.stride(),
+                BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_C=CHUNK_SIZE,
+                C_STATIC=CHUNK_SIZE, D_STATIC=D,
+                INPUT_PRECISION="ieee" if C_chunk.dtype == torch.float32 else "tf32",
+                ACCUMULATE=True,
+                num_warps=phase1_bwd_cfg.num_warps, num_stages=phase1_bwd_cfg.num_stages,
+            )
+
+            b_partials_blk = _ssd_rank1_bwd_workspace_tensor(
+                "phase1_b_partials_block",
+                (BH, blk_nc, n_d_tiles, CHUNK_SIZE),
+                device=C_chunk.device,
+                dtype=torch.float32,
+            )
+            grid_dv = (BH * blk_nc, n_d_tiles)
+            ssd_rank1_chunk_end_state_bwd_dv_b_chunk_kernel[grid_dv](
+                grad_s_md_blk,
+                W_chunk[:, blk_start:blk_end, :, :],
+                V_chunk[:, blk_start:blk_end, :, :],
+                log_alpha_chunk[:, blk_start:blk_end, :],
+                dV_blk,
+                b_partials_blk,
+                BH,
+                blk_nc,
+                CHUNK_SIZE,
+                M,
+                D,
+                n_d_tiles,
+                *grad_s_md_blk.stride(),
+                *W_chunk[:, blk_start:blk_end, :, :].stride(),
+                *V_chunk[:, blk_start:blk_end, :, :].stride(),
+                *log_alpha_chunk[:, blk_start:blk_end, :].stride(),
+                *dV_blk.stride(),
+                *b_partials_blk.stride(),
+                BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_C=CHUNK_SIZE,
+                C_STATIC=CHUNK_SIZE, M_STATIC=M,
+                INPUT_PRECISION="ieee" if C_chunk.dtype == torch.float32 else "tf32",
+                ACCUMULATE=True,
+                num_warps=phase1_bwd_cfg.num_warps, num_stages=phase1_bwd_cfg.num_stages,
+            )
+            b_vals_blk = torch.sum(b_partials_blk, dim=2)
+
+            grid_dr = (BH * blk_nc,)
+            ssd_rank1_chunk_end_state_bwd_dr_kernel[grid_dr](
+                b_vals_blk,
+                log_alpha_chunk[:, blk_start:blk_end, :],
+                dlog_p1_blk,
+                BH,
+                blk_nc,
+                CHUNK_SIZE,
+                *b_vals_blk.stride(),
+                *log_alpha_chunk[:, blk_start:blk_end, :].stride(),
+                *dlog_p1_blk.stride(),
+                BLOCK_C=CHUNK_SIZE,
+                C_STATIC=CHUNK_SIZE,
+                num_warps=phase1_bwd_cfg.num_warps,
+                num_stages=phase1_bwd_cfg.num_stages,
+            )
+
+            dlog_blk.add_(dlog_p1_blk)
+            dlog_blk.add_(dlog_per_chunk_blk.unsqueeze(-1).to(log_alpha_chunk.dtype))
+
+            dC_chunk[:, blk_start:blk_end, :, :] = dC_blk
+            dW_chunk[:, blk_start:blk_end, :, :] = dW_blk
+            dV_chunk[:, blk_start:blk_end, :, :] = dV_blk
+            dlog_alpha_chunk[:, blk_start:blk_end, :] = dlog_blk
+
+        d_init_f32 = grad_end
+        del grad_y_chunk, S_local_end, log_alpha_per_chunk, alpha_per_chunk, state_boundaries, state
 
         # ---- Restore outer layout ----
         # Convert chunked [BH,NC,C,*] grads back to user-facing [B,N,H,*].
@@ -3770,7 +3769,13 @@ class SsdRank1Triton(torch.autograd.Function):
         dV = _ssd_rank1_restore_grad_layout(dV_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
         # dlog_alpha is rank-3 [B,N,H], so its reshape/permute differs from
         # the rank-4 tensor restore helper used for C/W/V.
-        dlog_alpha = dlog_alpha_chunk.reshape(B, H, NC, CHUNK_SIZE).permute(0, 2, 3, 1).reshape(B, N, H)
+        nc_data = triton.cdiv(N, CHUNK_SIZE)
+        dlog_alpha = (
+            dlog_alpha_chunk[:, :nc_data, :]
+            .reshape(B, H, nc_data, CHUNK_SIZE)
+            .permute(0, 2, 3, 1)
+            .reshape(B, nc_data * CHUNK_SIZE, H)
+        )[:, :N, :]
 
         # Restore initial_state gradient in the same shape family the caller used.
         if initial_state_shape is not None:
