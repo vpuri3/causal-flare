@@ -142,6 +142,21 @@ def _select_phase2_block_nc(*, NC: int) -> int:
     return 16
 
 
+def _select_phase2_md_launch(*, MD: int) -> tuple[int, int, int]:
+    """Heuristic phase-2 BLOCK_MD/num_warps/num_stages for imported rank1 kernels."""
+    if MD % 64 != 0:
+        raise NotImplementedError(f"_select_phase2_md_launch requires MD divisible by 64; got MD={MD}.")
+    if MD >= 8192:
+        return (512 if MD % 512 == 0 else 256, 8, 3)
+    if MD >= 4096:
+        return (256, 4, 3)
+    if MD >= 2048:
+        return (128, 4, 2)
+    if MD >= 128:
+        return (128, 4, 2)
+    return (64, 2, 2)
+
+
 def _select_phase1_forward_launch_config(*, BH: int, NC: int, C_CHUNK: int, D: int) -> _Phase1ForwardLaunchConfig:
     # Tuned hot-shape override for N=2048, BH=512, CHUNK=64.
     if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 64:
@@ -1365,6 +1380,7 @@ def _phase2_backward_impl(
     )
 
     block_nc = _select_phase2_block_nc(NC=NC)
+    block_md, phase2_num_warps, phase2_num_stages = _select_phase2_md_launch(MD=D)
     grid = lambda META: (BH,)
     ssd_single_rank1_phase2_prefix_scan_bwd_dense_kernel[grid](
         grad_chunk_start_f,
@@ -1387,11 +1403,14 @@ def _phase2_backward_impl(
         *d_log_alpha_per_chunk.stride(),
         *d_init.stride(),
         BLOCK_NC=block_nc,
+        BLOCK_MD=block_md,
         NC_STATIC=NC,
         USE_FP32_COMPUTE=(compute_dtype == torch.float32),
         USE_BF16_COMPUTE=(compute_dtype == torch.bfloat16),
         HAS_GRAD_FINAL=True,
         WRITE_D_INIT=True,
+        num_warps=phase2_num_warps,
+        num_stages=phase2_num_stages,
     )
     return dS_local_end, d_log_alpha_per_chunk, d_init
 

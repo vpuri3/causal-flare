@@ -46,6 +46,13 @@ class _Phase1BackwardLaunchConfig:
 
 
 @dataclass(frozen=True)
+class _Phase2LaunchConfig:
+    block_md: int
+    num_warps: int
+    num_stages: int
+
+
+@dataclass(frozen=True)
 class _StaticSsdRank1ShapeConfig:
     chunk_size: int
     input_dtype: torch.dtype
@@ -145,6 +152,9 @@ _STATIC_SSD_RANK1_SHAPE_CONFIGS: dict[tuple[int, int, int, int], _StaticSsdRank1
     ),
 }
 
+_ACTIVE_STATIC_SSD_RANK1_KEY: tuple[int, int, int, int] | None = None
+_ACTIVE_STATIC_SSD_RANK1_CONFIG: _StaticSsdRank1ShapeConfig | None = None
+
 
 def _lookup_static_ssd_rank1_shape_config(*, BH: int, N: int, M: int, D: int) -> _StaticSsdRank1ShapeConfig:
     key = (BH, N, M, D)
@@ -156,6 +166,21 @@ def _lookup_static_ssd_rank1_shape_config(*, BH: int, N: int, M: int, D: int) ->
             f"(BH={BH}, N={N}, M={M}, D={D}). Supported keys: {supported}."
         )
     return cfg
+
+
+def set_ssd_rank1_static_shape(*, BH: int, N: int, M: int, D: int) -> None:
+    """Bind a single static shape config for all subsequent hot-path calls."""
+    global _ACTIVE_STATIC_SSD_RANK1_KEY, _ACTIVE_STATIC_SSD_RANK1_CONFIG
+    cfg = _lookup_static_ssd_rank1_shape_config(BH=BH, N=N, M=M, D=D)
+    _ACTIVE_STATIC_SSD_RANK1_KEY = (BH, N, M, D)
+    _ACTIVE_STATIC_SSD_RANK1_CONFIG = cfg
+
+
+def clear_ssd_rank1_static_shape() -> None:
+    """Clear globally bound static shape config (debug/testing utility)."""
+    global _ACTIVE_STATIC_SSD_RANK1_KEY, _ACTIVE_STATIC_SSD_RANK1_CONFIG
+    _ACTIVE_STATIC_SSD_RANK1_KEY = None
+    _ACTIVE_STATIC_SSD_RANK1_CONFIG = None
 
 
 def _validate_static_hot_path_contract(
@@ -187,7 +212,18 @@ def _validate_static_hot_path_contract(
         raise NotImplementedError("Static SSD rank1 path requires CUDA tensors.")
     if not C.is_contiguous() or not W.is_contiguous() or not V.is_contiguous() or not log_alpha.is_contiguous():
         raise ValueError("Static SSD rank1 path requires contiguous C/W/V/log_alpha.")
-    cfg = _lookup_static_ssd_rank1_shape_config(BH=B * H, N=N, M=M, D=D)
+    global _ACTIVE_STATIC_SSD_RANK1_KEY, _ACTIVE_STATIC_SSD_RANK1_CONFIG
+    shape_key = (B * H, N, M, D)
+    if _ACTIVE_STATIC_SSD_RANK1_CONFIG is None:
+        set_ssd_rank1_static_shape(BH=shape_key[0], N=shape_key[1], M=shape_key[2], D=shape_key[3])
+    if _ACTIVE_STATIC_SSD_RANK1_KEY != shape_key:
+        raise ValueError(
+            "Static SSD rank1 path is bound to one shape per process. "
+            f"Active={_ACTIVE_STATIC_SSD_RANK1_KEY}, requested={shape_key}. "
+            "Call clear_ssd_rank1_static_shape() then set_ssd_rank1_static_shape(...) to switch."
+        )
+    assert _ACTIVE_STATIC_SSD_RANK1_CONFIG is not None
+    cfg = _ACTIVE_STATIC_SSD_RANK1_CONFIG
     if cfg.has_initial_state:
         raise NotImplementedError("Static SSD rank1 config with initial_state is not implemented in this path.")
     if initial_state is not None:
@@ -337,6 +373,20 @@ def _select_phase2_block_nc(*, NC: int) -> int:
     if NC >= 32 and NC % 32 == 0:
         return 32
     return 16
+
+
+def _select_phase2_launch_config(*, MD: int, NC: int, where: str) -> _Phase2LaunchConfig:
+    if MD % 64 != 0:
+        raise NotImplementedError(f"{where} requires MD to be divisible by 64; got MD={MD}.")
+    if NC % 16 != 0:
+        raise NotImplementedError(f"{where} requires NC to be divisible by 16; got NC={NC}.")
+    if MD >= 8192:
+        return _Phase2LaunchConfig(block_md=512 if MD % 512 == 0 else 256, num_warps=8, num_stages=3)
+    if MD >= 4096:
+        return _Phase2LaunchConfig(block_md=256, num_warps=4, num_stages=3)
+    if MD >= 2048:
+        return _Phase2LaunchConfig(block_md=128, num_warps=4, num_stages=2)
+    return _Phase2LaunchConfig(block_md=64, num_warps=2, num_stages=2)
 
 
 def _select_phase3_forward_launch_config(
@@ -1263,18 +1313,9 @@ def _ssd_rank1_chunk_end_state_forward_impl(
     return s_local_end_md.reshape(BH, NC, M * D)
 
 
-_PHASE2_PREFIX_SCAN_FWD_CONFIGS = [
-    triton.Config({"BLOCK_MD": 64}, num_warps=2, num_stages=2),
-    triton.Config({"BLOCK_MD": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_MD": 256}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_MD": 512}, num_warps=8, num_stages=3),
-]
-
-
 # --------------------------------------------------------------------------------------------------
 # PHASE 2: PREFIX SCAN OVER CHUNKS
 # --------------------------------------------------------------------------------------------------
-@triton.autotune(configs=_PHASE2_PREFIX_SCAN_FWD_CONFIGS, key=["md_size", "nc_size"])
 @triton.jit
 def ssd_rank1_prefix_scan_fwd_kernel(
     s_local_ptr,
@@ -1418,15 +1459,6 @@ def ssd_rank1_prefix_scan_fwd_kernel(
             md0 += BLOCK_MD
 
 
-_PHASE2_PREFIX_SCAN_BWD_CONFIGS = [
-    triton.Config({"BLOCK_MD": 64}, num_warps=2, num_stages=2),
-    triton.Config({"BLOCK_MD": 128}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_MD": 256}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_MD": 512}, num_warps=8, num_stages=3),
-]
-
-
-@triton.autotune(configs=_PHASE2_PREFIX_SCAN_BWD_CONFIGS, key=["md_size", "nc_size"])
 @triton.jit
 def ssd_rank1_prefix_scan_bwd_dense_kernel(
     grad_prefix_ptr,
@@ -1673,6 +1705,7 @@ def _ssd_rank1_prefix_scan_forward_impl(
     final_state = torch.empty((BH, MD), device=S_local_end.device, dtype=torch.float32)
 
     block_nc = _select_phase2_block_nc(NC=NC)
+    phase2_cfg = _select_phase2_launch_config(MD=MD, NC=NC, where="_ssd_rank1_prefix_scan_forward_impl")
     grid_fwd = lambda META: (BH,)
     ssd_rank1_prefix_scan_fwd_kernel[grid_fwd](
         S_local_end_in,
@@ -1692,10 +1725,13 @@ def _ssd_rank1_prefix_scan_forward_impl(
         *final_state.stride(),
         NC_STATIC=NC,
         BLOCK_NC=block_nc,
+        BLOCK_MD=phase2_cfg.block_md,
         USE_FP32_COMPUTE=(compute_dtype == torch.float32),
         USE_BF16_COMPUTE=(compute_dtype == torch.bfloat16),
         HAS_INITIAL_STATE=has_initial_state,
         RETURN_FINAL_STATE=return_final_state,
+        num_warps=phase2_cfg.num_warps,
+        num_stages=phase2_cfg.num_stages,
     )
     if return_final_state:
         return chunk_start, final_state
@@ -3112,7 +3148,7 @@ def ssd_rank1_dense_output_backward_kernel_profile(
 # PHASE 123: FULL PARALLEL SCAN (UNIFIED AUTOGRAD)
 # --------------------------------------------------------------------------------------------------
 
-class SsdRank1Triton(torch.autograd.Function):
+class SsdRank1TritonDebug(torch.autograd.Function):
     """Unified SSD rank-1 Triton autograd function (Phases 1+2+3).
 
     High-level dataflow:
@@ -3148,7 +3184,7 @@ class SsdRank1Triton(torch.autograd.Function):
         # where BH=B*H, NC=#chunks, C=CHUNK_SIZE.
         C_chunk, W_chunk, V_chunk, log_alpha_chunk, init_flat, B, N, H, M, D, NC_exec = _ssd_rank1_prepare_unchunked_inputs(
             C, W, V, log_alpha, initial_state,
-            where="SsdRank1Triton.forward",
+            where="SsdRank1TritonDebug.forward",
             CHUNK_SIZE=CHUNK_SIZE,
             materialize_zero_init=False,
         )
@@ -3244,7 +3280,7 @@ class SsdRank1Triton(torch.autograd.Function):
         INPUT_PRECISION = ctx.INPUT_PRECISION
         C_chunk, W_chunk, V_chunk, log_alpha_chunk, init_flat, B, N, H, M, D, NC_exec = _ssd_rank1_prepare_unchunked_inputs(
             C, W, V, log_alpha, initial_state,
-            where="SsdRank1Triton.backward",
+            where="SsdRank1TritonDebug.backward",
             CHUNK_SIZE=CHUNK_SIZE,
             materialize_zero_init=False,
         )
@@ -3317,6 +3353,7 @@ class SsdRank1Triton(torch.autograd.Function):
             dtype=torch.float32,
         )
         block_nc = _select_phase2_block_nc(NC=NC)
+        phase2_cfg = _select_phase2_launch_config(MD=MD, NC=NC, where="SsdRank1TritonDebug.backward")
         grid_bwd = lambda META: (BH,)
         ssd_rank1_prefix_scan_bwd_dense_kernel[grid_bwd](
             grad_chunk_start_f,
@@ -3339,11 +3376,14 @@ class SsdRank1Triton(torch.autograd.Function):
             *d_log_per_chunk.stride(),
             *d_init_f32.stride(),
             BLOCK_NC=block_nc,
+            BLOCK_MD=phase2_cfg.block_md,
             NC_STATIC=NC,
             USE_FP32_COMPUTE=(compute_dtype == torch.float32),
             USE_BF16_COMPUTE=(compute_dtype == torch.bfloat16),
             HAS_GRAD_FINAL=has_grad_final,
             WRITE_D_INIT=write_d_init,
+            num_warps=phase2_cfg.num_warps,
+            num_stages=phase2_cfg.num_stages,
         )
         del S0_chunk, dS0, grad_final_f, s0_chunk_f, log_alpha_per_chunk_f, log_alpha_per_chunk
 
@@ -3351,13 +3391,13 @@ class SsdRank1Triton(torch.autograd.Function):
         BLOCK_M = _select_largest_block_size(
             M,
             _SUPPORTED_BLOCK_X_VALUES,
-            where="SsdRank1Triton.backward",
+            where="SsdRank1TritonDebug.backward",
             label="M",
         )
         BLOCK_D = _select_largest_block_size(
             D,
             _SUPPORTED_BLOCK_X_VALUES,
-            where="SsdRank1Triton.backward",
+            where="SsdRank1TritonDebug.backward",
             label="D",
         )
         phase1_input_precision = "ieee" if input_dtype == torch.float32 else "tf32"
@@ -3425,7 +3465,7 @@ class SsdRank1Triton(torch.autograd.Function):
         dW = _ssd_rank1_restore_grad_layout(dW_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
         dV = _ssd_rank1_restore_grad_layout(dV_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
         if not dlog_chunk.is_contiguous():
-            raise ValueError("SsdRank1Triton.backward expects contiguous dlog_chunk storage.")
+            raise ValueError("SsdRank1TritonDebug.backward expects contiguous dlog_chunk storage.")
         # [BH,NC,C] -> [B,N,H] as a zero-copy view (same storage, different strides).
         dlog_alpha = dlog_chunk.as_strided((B, N, H), (H * N, 1, N))
 
@@ -3573,6 +3613,7 @@ def _ssd_rank1_phase2_forward_static(
         device=S_local_end.device,
         dtype=torch.float32,
     )
+    phase2_cfg = _select_phase2_launch_config(MD=MD, NC=NC, where="_ssd_rank1_phase2_forward_static")
     grid = (BH,)
     ssd_rank1_prefix_scan_fwd_kernel[grid](
         S_local_end,
@@ -3592,10 +3633,13 @@ def _ssd_rank1_phase2_forward_static(
         *final_state_out.stride(),
         NC_STATIC=NC,
         BLOCK_NC=cfg.phase2_block_nc,
+        BLOCK_MD=phase2_cfg.block_md,
         USE_FP32_COMPUTE=False,
         USE_BF16_COMPUTE=True,
         HAS_INITIAL_STATE=False,
         RETURN_FINAL_STATE=True,
+        num_warps=phase2_cfg.num_warps,
+        num_stages=phase2_cfg.num_stages,
     )
     return chunk_start
 
@@ -3792,6 +3836,7 @@ def _ssd_rank1_phase2_backward_static(
         device=grad_chunk_start_f.device,
         dtype=torch.float32,
     )
+    phase2_cfg = _select_phase2_launch_config(MD=MD, NC=NC, where="_ssd_rank1_phase2_backward_static")
     grid = (BH,)
     ssd_rank1_prefix_scan_bwd_dense_kernel[grid](
         grad_chunk_start_f,
@@ -3814,11 +3859,14 @@ def _ssd_rank1_phase2_backward_static(
         *d_log_per_chunk.stride(),
         *d_init.stride(),
         BLOCK_NC=cfg.phase2_block_nc,
+        BLOCK_MD=phase2_cfg.block_md,
         NC_STATIC=NC,
         USE_FP32_COMPUTE=False,
         USE_BF16_COMPUTE=True,
         HAS_GRAD_FINAL=True,
         WRITE_D_INIT=True,
+        num_warps=phase2_cfg.num_warps,
+        num_stages=phase2_cfg.num_stages,
     )
     return dS_local_end, d_log_per_chunk, d_init
 
@@ -4017,6 +4065,93 @@ class SsdRank1TritonStatic(torch.autograd.Function):
         return dC, dW, dV, dlog_alpha, None, None, None, None
 
 
+def ssd_rank1_triton_debug(
+    C: torch.Tensor,
+    W: torch.Tensor,
+    V: torch.Tensor,
+    log_alpha: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    CHUNK_SIZE: int | None = None,
+    INPUT_PRECISION: str = "tf32",
+    RETURN_FINAL_STATE: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Debug/dynamic entrypoint retaining heuristic/autograd-flexible behavior."""
+    if CHUNK_SIZE is None:
+        B0, N0, H0, M0 = C.shape
+        D0 = V.shape[-1]
+        CHUNK_SIZE = _select_chunk_size_heuristic(N=N0, M=M0, D=D0, BH=B0 * H0)
+    if RETURN_FINAL_STATE:
+        y_chunk, S1_chunk = SsdRank1TritonDebug.apply(
+            C, W, V, log_alpha, initial_state, CHUNK_SIZE, INPUT_PRECISION, RETURN_FINAL_STATE,
+        )
+    else:
+        y_chunk = SsdRank1TritonDebug.apply(
+            C, W, V, log_alpha, initial_state, CHUNK_SIZE, INPUT_PRECISION, RETURN_FINAL_STATE,
+        )
+        S1_chunk = None
+    B = C.shape[0]
+    N = C.shape[1]
+    H = C.shape[2]
+    return _ssd_rank1_restore_output_layout(y_chunk, S1_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
+
+
+def warmup_ssd_rank1_triton_static(
+    *,
+    shape_keys: list[tuple[int, int, int, int]] | None = None,
+    device: torch.device | None = None,
+    include_backward: bool = True,
+) -> None:
+    """Compile and warm static SSD rank-1 kernels for configured shapes."""
+    if device is None:
+        if not torch.cuda.is_available():
+            raise NotImplementedError("warmup_ssd_rank1_triton_static requires CUDA.")
+        device = torch.device("cuda", torch.cuda.current_device())
+    if device.type != "cuda":
+        raise NotImplementedError("warmup_ssd_rank1_triton_static requires a CUDA device.")
+    _ensure_triton_allocator()
+    keys = sorted(_STATIC_SSD_RANK1_SHAPE_CONFIGS.keys()) if shape_keys is None else shape_keys
+    for key in keys:
+        BH, N, M, D = key
+        cfg = _lookup_static_ssd_rank1_shape_config(BH=BH, N=N, M=M, D=D)
+        B = 32
+        H = BH // B
+        if B * H != BH:
+            raise ValueError(f"warmup shape key {key} is not representable with fixed B={B}.")
+        C = torch.zeros((B, N, H, M), device=device, dtype=cfg.input_dtype)
+        W = torch.zeros((B, N, H, M), device=device, dtype=cfg.input_dtype)
+        V = torch.zeros((B, N, H, D), device=device, dtype=cfg.input_dtype)
+        log_alpha = torch.full((B, N, H), -1.0, device=device, dtype=cfg.input_dtype)
+        set_ssd_rank1_static_shape(BH=BH, N=N, M=M, D=D)
+        y, s = ssd_rank1_triton(
+            C,
+            W,
+            V,
+            log_alpha,
+            None,
+            cfg.chunk_size,
+            cfg.input_precision,
+            cfg.return_final_state,
+        )
+        if include_backward:
+            Cg = C.detach().clone().requires_grad_(True)
+            Wg = W.detach().clone().requires_grad_(True)
+            Vg = V.detach().clone().requires_grad_(True)
+            Lg = log_alpha.detach().clone().requires_grad_(True)
+            yg, sg = ssd_rank1_triton(
+                Cg,
+                Wg,
+                Vg,
+                Lg,
+                None,
+                cfg.chunk_size,
+                cfg.input_precision,
+                cfg.return_final_state,
+            )
+            loss = torch.sum(yg, dtype=torch.float32) + torch.sum(sg, dtype=torch.float32)
+            loss.backward()
+    torch.cuda.synchronize(device)
+
+
 def ssd_rank1_triton(
     C: torch.Tensor,
     W: torch.Tensor,
@@ -4062,5 +4197,9 @@ def ssd_rank1_triton(
 
 __all__ = [
     "ssd_rank1_pytorch",
+    "ssd_rank1_triton_debug",
     "ssd_rank1_triton",
+    "set_ssd_rank1_static_shape",
+    "clear_ssd_rank1_static_shape",
+    "warmup_ssd_rank1_triton_static",
 ]
