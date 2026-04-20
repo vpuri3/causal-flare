@@ -17,6 +17,16 @@ from causal_flare.autoregressive.ssd_rank1_triton import (
     ssd_rank1_dense_output_backward_kernel_profile,
     ssd_rank1_triton,
 )
+from causal_flare.autoregressive.ssd_rank1_triton_debug import ssd_rank1_triton_debug
+
+
+@pytest.fixture(autouse=True)
+def _reset_static_shape_binding():
+    if hasattr(ssd_mod, "clear_ssd_rank1_static_shape"):
+        ssd_mod.clear_ssd_rank1_static_shape()
+    yield
+    if hasattr(ssd_mod, "clear_ssd_rank1_static_shape"):
+        ssd_mod.clear_ssd_rank1_static_shape()
 
 
 def _supported_dtypes():
@@ -422,7 +432,7 @@ def test_ssd_rank1_triton_matches_token_loop_oracle_forward():
     y_oracle, final_oracle = ssd_rank1_token_loop_oracle(
         c.clone(), w.clone(), v.clone(), log_alpha.clone(), initial_state=init.clone()
     )
-    y_tri, final_tri = ssd_rank1_triton(
+    y_tri, final_tri = ssd_rank1_triton_debug(
         c.clone(),
         w.clone(),
         v.clone(),
@@ -479,4 +489,4 @@ def test_ssd_rank1_triton_forward_contract_rejects_unsupported_shapes(
     v = torch.randn(b, n, h, 32)
     log_alpha = -torch.nn.functional.softplus(torch.randn(b, n, h))
     with pytest.raises(NotImplementedError, match=match):
-        ssd_rank1_triton(c, w, v, log_alpha, CHUNK_SIZE=chunk_size)
+        ssd_rank1_triton_debug(c, w, v, log_alpha, CHUNK_SIZE=chunk_size)
