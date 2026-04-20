@@ -424,6 +424,12 @@ def ssd_rank1_chunk_end_state_reference(
 
     Closed form:
       S_local_end = sum_{j=0..C-1} (prod_{u=j+1..C-1} alpha_u) * (W_j ⊗ V_j)
+
+    Vectorized implementation:
+      Let
+        r_j = prod_{u=j+1..C-1} alpha_u
+      then for each `(BH, NC)` chunk lane:
+        S_local_end[M,D] = ( (r[T] * W^T[M,T]) @ V[T,D] )
     """
     if W.ndim != 4 or V.ndim != 4 or log_alpha.ndim != 3:
         raise ValueError(
@@ -451,20 +457,19 @@ def ssd_rank1_chunk_end_state_reference(
     _require_supported_md(M, D, where="ssd_rank1_chunk_end_state_reference")
     _require_nonpositive_log_alpha(log_alpha, where="ssd_rank1_chunk_end_state_reference")
     log_alpha_f = log_alpha.float()
-    alpha = torch.exp2(log_alpha_f * _INV_LN2)
     W_f = W.float()
     V_f = V.float()
+    # Build exclusive suffix retain factors:
+    #   r[j] = prod_{u=j+1..C-1} alpha[u] = exp(sum_{u=j+1..C-1} log_alpha[u]).
+    # We compute this via reverse cumsum in log-space for better numerical behavior.
+    log_alpha_rev = torch.flip(log_alpha_f, dims=[-1])
+    log_suffix_incl_rev = torch.cumsum(log_alpha_rev, dim=-1)
+    log_suffix_excl_rev = log_suffix_incl_rev - log_alpha_rev
+    r = torch.flip(torch.exp2(log_suffix_excl_rev * _INV_LN2), dims=[-1])
 
-    # Recurrence inside each chunk on matrix state S_t in [M, D]:
-    # S_{t+1} = alpha_t * S_t + W_t[:, None] * V_t[None, :]
-    # where alpha_t = exp(log_alpha_t).
-    S = torch.zeros((BH, NC, M, D), device=W.device, dtype=torch.float32)
-    for t in range(C):
-        S = (
-            alpha[:, :, t].unsqueeze(-1).unsqueeze(-1) * S
-            + W_f[:, :, t, :].unsqueeze(-1) * V_f[:, :, t, :].unsqueeze(-2)
-        )
-    S_local_end = S.reshape(BH, NC, M * D)
+    # S[M,D] = (r[T] * W^T[M,T]) @ V[T,D], batched across [BH,NC].
+    weighted_w_t = W_f.transpose(-1, -2) * r.unsqueeze(-2)
+    S_local_end = torch.matmul(weighted_w_t, V_f).reshape(BH, NC, M * D)
     return S_local_end
 
 
