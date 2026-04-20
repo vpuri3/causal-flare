@@ -45,6 +45,183 @@ class _Phase1BackwardLaunchConfig:
     num_stages: int
 
 
+@dataclass(frozen=True)
+class _StaticSsdRank1ShapeConfig:
+    chunk_size: int
+    input_dtype: torch.dtype
+    input_precision: str
+    has_initial_state: bool
+    return_final_state: bool
+    phase1_block_t: int
+    phase1_block_m: int
+    phase1_block_d: int
+    phase2_block_nc: int
+    phase3_forward: _Phase3ForwardLaunchConfig
+    phase3_backward: _Phase3BackwardLaunchConfig
+    phase1_backward: _Phase1BackwardLaunchConfig
+
+
+_STATIC_SSD_RANK1_SHAPE_CONFIGS: dict[tuple[int, int, int, int], _StaticSsdRank1ShapeConfig] = {
+    # key: (BH, N, M, D)
+    (512, 2048, 64, 64): _StaticSsdRank1ShapeConfig(
+        chunk_size=64,
+        input_dtype=torch.bfloat16,
+        input_precision="tf32",
+        has_initial_state=False,
+        return_final_state=True,
+        phase1_block_t=16,
+        phase1_block_m=64,
+        phase1_block_d=64,
+        phase2_block_nc=32,
+        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=4, num_stages=4),
+        phase3_backward=_Phase3BackwardLaunchConfig(
+            block_m=64,
+            block_d=64,
+            fused_a1a2_num_warps=4,
+            fused_off_num_warps=4,
+            num_stages=3,
+        ),
+        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=3),
+    ),
+    (512, 2048, 64, 128): _StaticSsdRank1ShapeConfig(
+        chunk_size=64,
+        input_dtype=torch.bfloat16,
+        input_precision="tf32",
+        has_initial_state=False,
+        return_final_state=True,
+        phase1_block_t=16,
+        phase1_block_m=64,
+        phase1_block_d=128,
+        phase2_block_nc=32,
+        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=128, num_warps=4, num_stages=2),
+        phase3_backward=_Phase3BackwardLaunchConfig(
+            block_m=64,
+            block_d=64,
+            fused_a1a2_num_warps=4,
+            fused_off_num_warps=4,
+            num_stages=3,
+        ),
+        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=2),
+    ),
+    (512, 1024, 64, 64): _StaticSsdRank1ShapeConfig(
+        chunk_size=64,
+        input_dtype=torch.bfloat16,
+        input_precision="tf32",
+        has_initial_state=False,
+        return_final_state=True,
+        phase1_block_t=16,
+        phase1_block_m=64,
+        phase1_block_d=64,
+        phase2_block_nc=16,
+        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=4, num_stages=4),
+        phase3_backward=_Phase3BackwardLaunchConfig(
+            block_m=64,
+            block_d=64,
+            fused_a1a2_num_warps=4,
+            fused_off_num_warps=4,
+            num_stages=3,
+        ),
+        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=3),
+    ),
+    (512, 1024, 64, 128): _StaticSsdRank1ShapeConfig(
+        chunk_size=64,
+        input_dtype=torch.bfloat16,
+        input_precision="tf32",
+        has_initial_state=False,
+        return_final_state=True,
+        phase1_block_t=16,
+        phase1_block_m=64,
+        phase1_block_d=128,
+        phase2_block_nc=16,
+        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=128, num_warps=4, num_stages=2),
+        phase3_backward=_Phase3BackwardLaunchConfig(
+            block_m=64,
+            block_d=64,
+            fused_a1a2_num_warps=4,
+            fused_off_num_warps=4,
+            num_stages=3,
+        ),
+        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=2),
+    ),
+}
+
+
+def _lookup_static_ssd_rank1_shape_config(*, BH: int, N: int, M: int, D: int) -> _StaticSsdRank1ShapeConfig:
+    key = (BH, N, M, D)
+    cfg = _STATIC_SSD_RANK1_SHAPE_CONFIGS.get(key)
+    if cfg is None:
+        supported = sorted(_STATIC_SSD_RANK1_SHAPE_CONFIGS.keys())
+        raise NotImplementedError(
+            "No static SSD rank1 launch config for shape "
+            f"(BH={BH}, N={N}, M={M}, D={D}). Supported keys: {supported}."
+        )
+    return cfg
+
+
+def _validate_static_hot_path_contract(
+    C: torch.Tensor,
+    W: torch.Tensor,
+    V: torch.Tensor,
+    log_alpha: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    CHUNK_SIZE: int | None,
+    INPUT_PRECISION: str,
+    RETURN_FINAL_STATE: bool,
+) -> _StaticSsdRank1ShapeConfig:
+    if C.ndim != 4 or W.ndim != 4 or V.ndim != 4 or log_alpha.ndim != 3:
+        raise ValueError(
+            "Static SSD rank1 path expects C/W=[B,N,H,M], V=[B,N,H,D], log_alpha=[B,N,H]. "
+            f"Got C={tuple(C.shape)}, W={tuple(W.shape)}, V={tuple(V.shape)}, log_alpha={tuple(log_alpha.shape)}."
+        )
+    B, N, H, M = C.shape
+    if W.shape != (B, N, H, M):
+        raise ValueError(f"Static SSD rank1 path requires W shape [B,N,H,M]={B, N, H, M}; got {tuple(W.shape)}.")
+    if V.shape[:3] != (B, N, H):
+        raise ValueError(f"Static SSD rank1 path requires V shape [B,N,H,*]={B, N, H}; got {tuple(V.shape)}.")
+    D = V.shape[-1]
+    if log_alpha.shape != (B, N, H):
+        raise ValueError(f"Static SSD rank1 path requires log_alpha shape [B,N,H]={B, N, H}; got {tuple(log_alpha.shape)}.")
+    if C.device != W.device or C.device != V.device or C.device != log_alpha.device:
+        raise ValueError("Static SSD rank1 path requires C/W/V/log_alpha on the same device.")
+    if not C.is_cuda:
+        raise NotImplementedError("Static SSD rank1 path requires CUDA tensors.")
+    if not C.is_contiguous() or not W.is_contiguous() or not V.is_contiguous() or not log_alpha.is_contiguous():
+        raise ValueError("Static SSD rank1 path requires contiguous C/W/V/log_alpha.")
+    cfg = _lookup_static_ssd_rank1_shape_config(BH=B * H, N=N, M=M, D=D)
+    if cfg.has_initial_state:
+        raise NotImplementedError("Static SSD rank1 config with initial_state is not implemented in this path.")
+    if initial_state is not None:
+        raise ValueError("Static SSD rank1 path requires initial_state=None.")
+    if C.dtype != cfg.input_dtype or W.dtype != cfg.input_dtype or V.dtype != cfg.input_dtype or log_alpha.dtype != cfg.input_dtype:
+        raise ValueError(
+            f"Static SSD rank1 path requires dtype={cfg.input_dtype}; "
+            f"got C={C.dtype}, W={W.dtype}, V={V.dtype}, log_alpha={log_alpha.dtype}."
+        )
+    if INPUT_PRECISION != cfg.input_precision:
+        raise ValueError(
+            f"Static SSD rank1 path requires INPUT_PRECISION='{cfg.input_precision}'; got '{INPUT_PRECISION}'."
+        )
+    if RETURN_FINAL_STATE != cfg.return_final_state:
+        raise ValueError(
+            f"Static SSD rank1 path requires RETURN_FINAL_STATE={cfg.return_final_state}; got {RETURN_FINAL_STATE}."
+        )
+    if CHUNK_SIZE is None:
+        pass
+    elif CHUNK_SIZE != cfg.chunk_size:
+        raise ValueError(
+            f"Static SSD rank1 path requires CHUNK_SIZE={cfg.chunk_size} for this shape; got CHUNK_SIZE={CHUNK_SIZE}."
+        )
+
+    _require_supported_md(M, D, where="_validate_static_hot_path_contract")
+    _require_supported_forward_contract(B * H, N, CHUNK_SIZE=cfg.chunk_size, where="_validate_static_hot_path_contract")
+    _require_nonpositive_log_alpha(log_alpha, where="_validate_static_hot_path_contract")
+    if N % cfg.chunk_size != 0:
+        raise NotImplementedError(
+            f"Static SSD rank1 path requires N divisible by CHUNK_SIZE={cfg.chunk_size}; got N={N}."
+        )
+    return cfg
+
+
 def _ensure_triton_allocator() -> None:
     global _EXPERIMENTAL_TRITON_ALLOCATOR_SET
     if _EXPERIMENTAL_TRITON_ALLOCATOR_SET:
@@ -3301,6 +3478,545 @@ def _ssd_rank1_restore_grad_layout(
     out_strides = (H * N * trailing_prod, trailing_prod, N * trailing_prod, *trailing_strides)
     return grad_chunk.as_strided(out_shape, out_strides)
 
+
+def _ssd_rank1_prepare_unchunked_inputs_static(
+    C: torch.Tensor,
+    W: torch.Tensor,
+    V: torch.Tensor,
+    log_alpha: torch.Tensor,
+    *,
+    cfg: _StaticSsdRank1ShapeConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int, int, int, int]:
+    """Static hot-path input preparation: canonical unchunked layout only."""
+    B, N, H, M = C.shape
+    D = V.shape[-1]
+    CHUNK_SIZE = cfg.chunk_size
+    NC = N // CHUNK_SIZE
+    BH = B * H
+    C_chunk = C.view(B, NC, CHUNK_SIZE, H, M)
+    W_chunk = W.view(B, NC, CHUNK_SIZE, H, M)
+    V_chunk = V.view(B, NC, CHUNK_SIZE, H, D)
+    log_alpha_chunk = log_alpha.view(B, NC, CHUNK_SIZE, H)
+    return C_chunk, W_chunk, V_chunk, log_alpha_chunk, B, N, H, M, D, NC, BH
+
+
+def _ssd_rank1_chunk_end_state_forward_impl_static(
+    W_5d: torch.Tensor,
+    V_5d: torch.Tensor,
+    log_alpha_4d: torch.Tensor,
+    *,
+    cfg: _StaticSsdRank1ShapeConfig,
+) -> torch.Tensor:
+    """Static hot-path phase-1 forward: canonical [B,NC,C,H,*] only."""
+    B, NC, C_CHUNK, H, M = W_5d.shape
+    D = V_5d.shape[-1]
+    BH = B * H
+    s_local_end_md = _ssd_rank1_bwd_workspace_tensor(
+        "static_phase1_s_local_end",
+        (BH, NC, M, D),
+        device=W_5d.device,
+        dtype=torch.float32,
+    )
+    grid = (BH * NC, M // cfg.phase1_block_m, D // cfg.phase1_block_d)
+    ssd_rank1_chunk_end_state_fwd_kernel[grid](
+        W_5d,
+        V_5d,
+        log_alpha_4d,
+        s_local_end_md,
+        B,
+        H,
+        BH,
+        NC,
+        C_CHUNK,
+        M,
+        D,
+        *W_5d.stride(),
+        *V_5d.stride(),
+        *log_alpha_4d.stride(),
+        *s_local_end_md.stride(),
+        BLOCK_M=cfg.phase1_block_m,
+        BLOCK_D=cfg.phase1_block_d,
+        BLOCK_T=cfg.phase1_block_t,
+        BLOCK_C=C_CHUNK,
+        C_STATIC=C_CHUNK,
+        INPUT_PRECISION=cfg.input_precision,
+        USE_BF16_DOT_INPUTS=True,
+    )
+    return s_local_end_md.reshape(BH, NC, M * D)
+
+
+def _ssd_rank1_phase2_forward_static(
+    S_local_end: torch.Tensor,
+    log_alpha_per_chunk_bnh: torch.Tensor,
+    final_state_out: torch.Tensor,
+    *,
+    cfg: _StaticSsdRank1ShapeConfig,
+) -> torch.Tensor:
+    """Static hot-path phase-2 forward: fixed BF16 compute, no initial-state branch."""
+    BH, NC, MD = S_local_end.shape
+    B, NC_log, H = log_alpha_per_chunk_bnh.shape
+    if NC_log != NC:
+        raise ValueError(f"log_alpha_per_chunk_bnh NC mismatch: got {NC_log}, expected {NC}.")
+    if B * H != BH:
+        raise ValueError(f"log_alpha_per_chunk_bnh B*H mismatch: got {B}*{H}, expected BH={BH}.")
+    if final_state_out.shape != (BH, MD):
+        raise ValueError(f"final_state_out must be [BH,MD]=({BH},{MD}); got {tuple(final_state_out.shape)}.")
+    init_dummy = _ssd_rank1_bwd_workspace_tensor(
+        "static_phase2_init_dummy",
+        (1, 1),
+        device=S_local_end.device,
+        dtype=torch.float32,
+    )
+    chunk_start = _ssd_rank1_bwd_workspace_tensor(
+        "static_phase2_chunk_start",
+        (BH, NC, MD),
+        device=S_local_end.device,
+        dtype=torch.float32,
+    )
+    grid = (BH,)
+    ssd_rank1_prefix_scan_fwd_kernel[grid](
+        S_local_end,
+        log_alpha_per_chunk_bnh,
+        init_dummy,
+        chunk_start,
+        final_state_out,
+        B,
+        H,
+        BH,
+        NC,
+        MD,
+        *S_local_end.stride(),
+        *log_alpha_per_chunk_bnh.stride(),
+        *init_dummy.stride(),
+        *chunk_start.stride(),
+        *final_state_out.stride(),
+        NC_STATIC=NC,
+        BLOCK_NC=cfg.phase2_block_nc,
+        USE_FP32_COMPUTE=False,
+        USE_BF16_COMPUTE=True,
+        HAS_INITIAL_STATE=False,
+        RETURN_FINAL_STATE=True,
+    )
+    return chunk_start
+
+
+def _ssd_rank1_dense_output_forward_impl_static(
+    C_5d: torch.Tensor,
+    W_5d: torch.Tensor,
+    V_5d: torch.Tensor,
+    log_alpha_4d: torch.Tensor,
+    S0_chunk: torch.Tensor,
+    *,
+    cfg: _StaticSsdRank1ShapeConfig,
+) -> torch.Tensor:
+    """Static hot-path phase-3 forward: canonical layout and fixed precision knobs."""
+    B, NC, C_CHUNK, H, M = C_5d.shape
+    D = V_5d.shape[-1]
+    BH = B * H
+    if S0_chunk.shape != (BH, NC, M * D):
+        raise ValueError(f"S0_chunk must be [BH,NC,MD]=({BH},{NC},{M * D}); got {tuple(S0_chunk.shape)}.")
+    if M % cfg.phase3_forward.block_m != 0 or D % cfg.phase3_forward.block_d != 0:
+        raise NotImplementedError(
+            "Static phase-3 forward requires M and D divisible by configured blocks. "
+            f"Got M={M}, D={D}, BLOCK_M={cfg.phase3_forward.block_m}, BLOCK_D={cfg.phase3_forward.block_d}."
+        )
+    S0_md = _ssd_rank1_bwd_workspace_tensor(
+        "static_phase3_s0_md_fwd",
+        (BH, NC, M, D),
+        device=C_5d.device,
+        dtype=C_5d.dtype,
+    )
+    S0_md.copy_(S0_chunk.reshape(BH, NC, M, D))
+    out = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
+    grid = (BH * NC, D // cfg.phase3_forward.block_d)
+    ssd_rank1_dense_output_fwd_kernel[grid](
+        C_5d,
+        W_5d,
+        V_5d,
+        log_alpha_4d,
+        S0_md,
+        out,
+        out,
+        B,
+        H,
+        BH,
+        NC,
+        C_CHUNK,
+        M,
+        D,
+        *C_5d.stride(),
+        *W_5d.stride(),
+        *V_5d.stride(),
+        *log_alpha_4d.stride(),
+        *S0_md.stride(),
+        *out.stride(),
+        *out.stride(),
+        BLOCK_M=cfg.phase3_forward.block_m,
+        BLOCK_D=cfg.phase3_forward.block_d,
+        BLOCK_C=C_CHUNK,
+        C_STATIC=C_CHUNK,
+        M_STATIC=M,
+        INPUT_PRECISION=cfg.input_precision,
+        USE_BF16_DOT_INPUTS=True,
+        WRITE_Y_OFF=False,
+        num_warps=cfg.phase3_forward.num_warps,
+        num_stages=cfg.phase3_forward.num_stages,
+    )
+    return out
+
+
+def _ssd_rank1_dense_output_backward_impl_static(
+    C_5d: torch.Tensor,
+    W_5d: torch.Tensor,
+    V_5d: torch.Tensor,
+    log_alpha_4d: torch.Tensor,
+    grad_out_c: torch.Tensor,
+    S0_chunk: torch.Tensor,
+    *,
+    cfg: _StaticSsdRank1ShapeConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Static hot-path phase-3 backward: canonical layout only, fixed branch choices."""
+    B, NC, C_CHUNK, H, M = C_5d.shape
+    D = V_5d.shape[-1]
+    BH = B * H
+    if grad_out_c.shape != (BH, NC, C_CHUNK, D):
+        raise ValueError(
+            f"grad_out_c must be [BH,NC,C,D]=({BH},{NC},{C_CHUNK},{D}); got {tuple(grad_out_c.shape)}."
+        )
+    if S0_chunk.shape != (BH, NC, M * D):
+        raise ValueError(f"S0_chunk must be [BH,NC,MD]=({BH},{NC},{M * D}); got {tuple(S0_chunk.shape)}.")
+    if M % cfg.phase3_backward.block_m != 0 or D % cfg.phase3_backward.block_d != 0:
+        raise NotImplementedError(
+            "Static phase-3 backward requires M and D divisible by configured blocks. "
+            f"Got M={M}, D={D}, BLOCK_M={cfg.phase3_backward.block_m}, BLOCK_D={cfg.phase3_backward.block_d}."
+        )
+    S0_md = _ssd_rank1_bwd_workspace_tensor(
+        "static_phase3_s0_md_bwd",
+        (BH, NC, M, D),
+        device=C_5d.device,
+        dtype=C_5d.dtype,
+    )
+    S0_md.copy_(S0_chunk.reshape(BH, NC, M, D))
+    dV = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
+    dC = torch.empty((BH, NC, C_CHUNK, M), device=C_5d.device, dtype=C_5d.dtype)
+    dW = torch.empty((BH, NC, C_CHUNK, M), device=C_5d.device, dtype=C_5d.dtype)
+    dlog = _ssd_rank1_bwd_workspace_tensor(
+        "static_phase3_dlog_fp32",
+        (BH, NC, C_CHUNK),
+        device=C_5d.device,
+        dtype=torch.float32,
+    )
+    dS0 = _ssd_rank1_bwd_workspace_tensor(
+        "static_phase3_dS0",
+        (BH, NC, M, D),
+        device=C_5d.device,
+        dtype=torch.float32,
+    )
+    grid = (BH * NC,)
+    phase3_bwd_num_warps = max(cfg.phase3_backward.fused_a1a2_num_warps, cfg.phase3_backward.fused_off_num_warps)
+    ssd_rank1_dense_output_bwd_fused_kernel[grid](
+        C_5d,
+        W_5d,
+        V_5d,
+        log_alpha_4d,
+        grad_out_c,
+        S0_md,
+        dV,
+        dC,
+        dW,
+        dlog,
+        dS0,
+        B,
+        H,
+        BH,
+        NC,
+        C_CHUNK,
+        M,
+        D,
+        *C_5d.stride(),
+        *W_5d.stride(),
+        *V_5d.stride(),
+        *log_alpha_4d.stride(),
+        *grad_out_c.stride(),
+        *S0_md.stride(),
+        *dV.stride(),
+        *dC.stride(),
+        *dW.stride(),
+        *dlog.stride(),
+        *dS0.stride(),
+        BLOCK_M=cfg.phase3_backward.block_m,
+        BLOCK_D=cfg.phase3_backward.block_d,
+        BLOCK_C=C_CHUNK,
+        C_STATIC=C_CHUNK,
+        M_STATIC=M,
+        D_STATIC=D,
+        INPUT_PRECISION=cfg.input_precision,
+        USE_BF16_DOT_INPUTS=True,
+        HAS_S0=True,
+        num_warps=phase3_bwd_num_warps,
+        num_stages=cfg.phase3_backward.num_stages,
+    )
+    return dC, dW, dV, dlog, dS0.reshape(BH, NC, M * D)
+
+
+def _ssd_rank1_phase2_backward_static(
+    grad_chunk_start_f: torch.Tensor,
+    grad_final_f: torch.Tensor,
+    S0_chunk: torch.Tensor,
+    log_alpha_per_chunk_bnh: torch.Tensor,
+    *,
+    cfg: _StaticSsdRank1ShapeConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Static hot-path phase-2 backward: fixed flags and canonical layout."""
+    BH, NC, MD = grad_chunk_start_f.shape
+    B, NC_log, H = log_alpha_per_chunk_bnh.shape
+    if NC_log != NC:
+        raise ValueError(f"log_alpha_per_chunk_bnh NC mismatch: got {NC_log}, expected {NC}.")
+    if B * H != BH:
+        raise ValueError(f"log_alpha_per_chunk_bnh B*H mismatch: got {B}*{H}, expected BH={BH}.")
+    if grad_final_f.shape != (BH, MD):
+        raise ValueError(f"grad_final_f must be [BH,MD]=({BH},{MD}); got {tuple(grad_final_f.shape)}.")
+    if S0_chunk.shape != (BH, NC, MD):
+        raise ValueError(f"S0_chunk must be [BH,NC,MD]=({BH},{NC},{MD}); got {tuple(S0_chunk.shape)}.")
+
+    dS_local_end = grad_chunk_start_f
+    d_log_per_chunk = _ssd_rank1_bwd_workspace_tensor(
+        "static_phase2_dlog_per_chunk",
+        (BH, NC),
+        device=grad_chunk_start_f.device,
+        dtype=torch.float32,
+    )
+    d_init = _ssd_rank1_bwd_workspace_tensor(
+        "static_phase2_dinit",
+        (BH, MD),
+        device=grad_chunk_start_f.device,
+        dtype=torch.float32,
+    )
+    grid = (BH,)
+    ssd_rank1_prefix_scan_bwd_dense_kernel[grid](
+        grad_chunk_start_f,
+        grad_final_f,
+        S0_chunk,
+        log_alpha_per_chunk_bnh,
+        dS_local_end,
+        d_log_per_chunk,
+        d_init,
+        B,
+        H,
+        BH,
+        NC,
+        MD,
+        *grad_chunk_start_f.stride(),
+        *grad_final_f.stride(),
+        *S0_chunk.stride(),
+        *log_alpha_per_chunk_bnh.stride(),
+        *dS_local_end.stride(),
+        *d_log_per_chunk.stride(),
+        *d_init.stride(),
+        BLOCK_NC=cfg.phase2_block_nc,
+        NC_STATIC=NC,
+        USE_FP32_COMPUTE=False,
+        USE_BF16_COMPUTE=True,
+        HAS_GRAD_FINAL=True,
+        WRITE_D_INIT=True,
+    )
+    return dS_local_end, d_log_per_chunk, d_init
+
+
+class SsdRank1TritonStatic(torch.autograd.Function):
+    """Static hot-path autograd with shape-keyed fixed launch configs."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        C: torch.Tensor,
+        W: torch.Tensor,
+        V: torch.Tensor,
+        log_alpha: torch.Tensor,
+        initial_state: torch.Tensor | None,
+        CHUNK_SIZE: int,
+        INPUT_PRECISION: str,
+        RETURN_FINAL_STATE: bool,
+    ):
+        cfg = _validate_static_hot_path_contract(
+            C,
+            W,
+            V,
+            log_alpha,
+            initial_state,
+            CHUNK_SIZE,
+            INPUT_PRECISION,
+            RETURN_FINAL_STATE,
+        )
+        _ensure_triton_allocator()
+        C_chunk, W_chunk, V_chunk, log_alpha_chunk, B, N, H, M, D, NC, BH = _ssd_rank1_prepare_unchunked_inputs_static(
+            C,
+            W,
+            V,
+            log_alpha,
+            cfg=cfg,
+        )
+        s_local_end = _ssd_rank1_chunk_end_state_forward_impl_static(
+            W_chunk,
+            V_chunk,
+            log_alpha_chunk,
+            cfg=cfg,
+        )
+        log_alpha_per_chunk_bnh = log_alpha_chunk.sum(dim=2, dtype=torch.float32).contiguous()
+        S1_chunk = torch.empty((BH, M * D), device=C.device, dtype=torch.float32)
+        S0_chunk = _ssd_rank1_phase2_forward_static(
+            s_local_end,
+            log_alpha_per_chunk_bnh,
+            S1_chunk,
+            cfg=cfg,
+        )
+        y_chunk = _ssd_rank1_dense_output_forward_impl_static(
+            C_chunk,
+            W_chunk,
+            V_chunk,
+            log_alpha_chunk,
+            S0_chunk,
+            cfg=cfg,
+        )
+
+        ctx.save_for_backward(C, W, V, log_alpha)
+        ctx.B = B
+        ctx.N = N
+        ctx.H = H
+        ctx.M = M
+        ctx.D = D
+        ctx.NC = NC
+        ctx.CHUNK_SIZE = cfg.chunk_size
+        ctx.cfg_key = (B * H, N, M, D)
+        return y_chunk, S1_chunk
+
+    @staticmethod
+    def backward(ctx, grad_y_chunk, grad_S1_chunk):
+        C, W, V, log_alpha = ctx.saved_tensors
+        B = ctx.B
+        N = ctx.N
+        H = ctx.H
+        M = ctx.M
+        D = ctx.D
+        NC = ctx.NC
+        CHUNK_SIZE = ctx.CHUNK_SIZE
+        BH = B * H
+        cfg = _lookup_static_ssd_rank1_shape_config(BH=BH, N=N, M=M, D=D)
+
+        C_chunk, W_chunk, V_chunk, log_alpha_chunk, _, _, _, _, _, _, _ = _ssd_rank1_prepare_unchunked_inputs_static(
+            C,
+            W,
+            V,
+            log_alpha,
+            cfg=cfg,
+        )
+        s_local_end = _ssd_rank1_chunk_end_state_forward_impl_static(
+            W_chunk,
+            V_chunk,
+            log_alpha_chunk,
+            cfg=cfg,
+        )
+        log_alpha_per_chunk_bnh = log_alpha_chunk.sum(dim=2, dtype=torch.float32).contiguous()
+        final_replay = _ssd_rank1_bwd_workspace_tensor(
+            "static_phase2_final_replay",
+            (BH, M * D),
+            device=C.device,
+            dtype=torch.float32,
+        )
+        S0_chunk = _ssd_rank1_phase2_forward_static(
+            s_local_end,
+            log_alpha_per_chunk_bnh,
+            final_replay,
+            cfg=cfg,
+        )
+
+        grad_y_in = grad_y_chunk if grad_y_chunk.is_contiguous() else grad_y_chunk.contiguous()
+        dC_chunk, dW_chunk, dV_chunk, dlog_phase3_fp32, dS0 = _ssd_rank1_dense_output_backward_impl_static(
+            C_chunk,
+            W_chunk,
+            V_chunk,
+            log_alpha_chunk,
+            grad_y_in,
+            S0_chunk,
+            cfg=cfg,
+        )
+        dlog_chunk = _ssd_rank1_bwd_workspace_tensor(
+            "static_dlog_chunk_accum",
+            (BH, NC, CHUNK_SIZE),
+            device=C.device,
+            dtype=log_alpha.dtype,
+        )
+        dlog_chunk.copy_(dlog_phase3_fp32)
+        grad_chunk_start_f = dS0 if dS0.is_contiguous() else dS0.contiguous()
+        if grad_S1_chunk is None:
+            grad_final_f = _ssd_rank1_bwd_workspace_tensor(
+                "static_phase2_grad_final_zero",
+                (BH, M * D),
+                device=C.device,
+                dtype=torch.float32,
+            )
+            grad_final_f.zero_()
+        else:
+            grad_final_f = (
+                grad_S1_chunk
+                if grad_S1_chunk.dtype == torch.float32 and grad_S1_chunk.is_contiguous()
+                else grad_S1_chunk.float().contiguous()
+            )
+        dS_local_end, d_log_per_chunk, _ = _ssd_rank1_phase2_backward_static(
+            grad_chunk_start_f,
+            grad_final_f,
+            S0_chunk,
+            log_alpha_per_chunk_bnh,
+            cfg=cfg,
+        )
+
+        grad_s_md = dS_local_end.reshape(BH, NC, M, D)
+        grid_phase1 = (BH * NC,)
+        ssd_rank1_chunk_end_state_bwd_fused_kernel[grid_phase1](
+            grad_s_md,
+            W_chunk,
+            V_chunk,
+            log_alpha_chunk,
+            dW_chunk,
+            dV_chunk,
+            dlog_chunk,
+            B,
+            H,
+            BH,
+            NC,
+            CHUNK_SIZE,
+            M,
+            D,
+            *grad_s_md.stride(),
+            *W_chunk.stride(),
+            *V_chunk.stride(),
+            *log_alpha_chunk.stride(),
+            *dW_chunk.stride(),
+            *dV_chunk.stride(),
+            *dlog_chunk.stride(),
+            BLOCK_M=cfg.phase1_block_m,
+            BLOCK_D=cfg.phase1_block_d,
+            BLOCK_C=CHUNK_SIZE,
+            C_STATIC=CHUNK_SIZE,
+            M_STATIC=M,
+            D_STATIC=D,
+            INPUT_PRECISION=cfg.input_precision,
+            USE_BF16_DOT_INPUTS=True,
+            ACCUMULATE=True,
+            num_warps=cfg.phase1_backward.num_warps,
+            num_stages=cfg.phase1_backward.num_stages,
+        )
+
+        dlog_chunk.add_(d_log_per_chunk.unsqueeze(-1).to(dlog_chunk.dtype))
+        dC = _ssd_rank1_restore_grad_layout(dC_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
+        dW = _ssd_rank1_restore_grad_layout(dW_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
+        dV = _ssd_rank1_restore_grad_layout(dV_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
+        if not dlog_chunk.is_contiguous():
+            raise ValueError("SsdRank1TritonStatic.backward expects contiguous dlog_chunk storage.")
+        dlog_alpha = dlog_chunk.as_strided((B, N, H), (H * N, 1, N))
+        return dC, dW, dV, dlog_alpha, None, None, None, None
+
+
 def ssd_rank1_triton(
     C: torch.Tensor,
     W: torch.Tensor,
@@ -3311,26 +4027,32 @@ def ssd_rank1_triton(
     INPUT_PRECISION: str = "tf32",
     RETURN_FINAL_STATE: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """SSD rank-1 Triton entrypoint using unified autograd with recomputation."""
-    if CHUNK_SIZE is None:
-        B0, N0, H0, M0 = C.shape
-        D0 = V.shape[-1]
-        CHUNK_SIZE = _select_chunk_size_heuristic(N=N0, M=M0, D=D0, BH=B0 * H0)
-
-    if RETURN_FINAL_STATE:
-        y_chunk, S1_chunk = SsdRank1Triton.apply(
-            C, W, V, log_alpha, initial_state, CHUNK_SIZE, INPUT_PRECISION, RETURN_FINAL_STATE,
-        )
-    else:
-        y_chunk = SsdRank1Triton.apply(
-            C, W, V, log_alpha, initial_state, CHUNK_SIZE, INPUT_PRECISION, RETURN_FINAL_STATE,
-        )
-        S1_chunk = None
+    """SSD rank-1 Triton entrypoint for static hot-path execution."""
+    cfg = _validate_static_hot_path_contract(
+        C,
+        W,
+        V,
+        log_alpha,
+        initial_state,
+        CHUNK_SIZE,
+        INPUT_PRECISION,
+        RETURN_FINAL_STATE,
+    )
+    y_chunk, S1_chunk = SsdRank1TritonStatic.apply(
+        C,
+        W,
+        V,
+        log_alpha,
+        initial_state,
+        cfg.chunk_size,
+        cfg.input_precision,
+        cfg.return_final_state,
+    )
 
     B = C.shape[0]
     N = C.shape[1]
     H = C.shape[2]
-    return _ssd_rank1_restore_output_layout(y_chunk, S1_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
+    return _ssd_rank1_restore_output_layout(y_chunk, S1_chunk, B=B, N=N, H=H, C=cfg.chunk_size)
 
 
 # --------------------------------------------------------------------------------------------------
