@@ -1,6 +1,8 @@
 import pytest
 import torch
 
+import causal_flare.autoregressive.ssd_rank1_triton as ssd_mod
+
 from causal_flare.autoregressive.ssd_rank1_triton import (
     _ssd_rank1_chunk_end_state_forward_impl,
     _ssd_rank1_prefix_scan_forward_impl,
@@ -292,6 +294,144 @@ def test_phase3_chunk_dense_output_backward_profile_smoke_cuda():
     profile = ssd_rank1_dense_output_backward_kernel_profile(c_tok, w_tok, v_tok, log_alpha_tok, grad_y, s0)
     assert "total_ms" in profile
     assert profile["total_ms"] > 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase1 fused-kernel parity requires CUDA")
+def test_phase1_fused_backward_kernel_matches_split_path_fp32():
+    ssd_mod._ensure_triton_allocator()
+    torch.manual_seed(1901)
+    BH, NC, C_CHUNK, M, D = 2, 8, 64, 64, 64
+    dtype = torch.float32
+    device = "cuda"
+
+    grad_s = torch.randn(BH, NC, M, D, device=device, dtype=torch.float32)
+    W = torch.randn(BH, NC, C_CHUNK, M, device=device, dtype=dtype)
+    V = torch.randn(BH, NC, C_CHUNK, D, device=device, dtype=dtype)
+    log_alpha = (-torch.rand(BH, NC, C_CHUNK, device=device, dtype=dtype) * 0.2)
+    dW_base = torch.randn(BH, NC, C_CHUNK, M, device=device, dtype=dtype)
+    dV_base = torch.randn(BH, NC, C_CHUNK, D, device=device, dtype=dtype)
+    dlog_base = torch.randn(BH, NC, C_CHUNK, device=device, dtype=dtype)
+
+    block_m = ssd_mod._select_largest_block_size(M, ssd_mod._SUPPORTED_BLOCK_X_VALUES, where="test_phase1_fused", label="M")
+    block_d = ssd_mod._select_largest_block_size(D, ssd_mod._SUPPORTED_BLOCK_X_VALUES, where="test_phase1_fused", label="D")
+    n_m_tiles = M // block_m
+    n_d_tiles = D // block_d
+    launch_cfg = ssd_mod._select_phase1_backward_launch_config(M=M, D=D)
+
+    # Split-kernel baseline (old path).
+    dW_split = dW_base.clone()
+    dV_split = dV_base.clone()
+    b_vals = torch.zeros((BH, NC, C_CHUNK), device=device, dtype=torch.float32)
+    dlog_split_only = torch.empty_like(log_alpha)
+    ssd_mod.ssd_rank1_chunk_end_state_bwd_dw_chunk_kernel[(BH * NC, n_m_tiles)](
+        grad_s,
+        V,
+        log_alpha,
+        dW_split,
+        BH,
+        NC,
+        C_CHUNK,
+        M,
+        D,
+        *grad_s.stride(),
+        *V.stride(),
+        *log_alpha.stride(),
+        *dW_split.stride(),
+        BLOCK_M=block_m,
+        BLOCK_D=block_d,
+        BLOCK_C=C_CHUNK,
+        C_STATIC=C_CHUNK,
+        D_STATIC=D,
+        INPUT_PRECISION="ieee",
+        ACCUMULATE=True,
+        num_warps=launch_cfg.num_warps,
+        num_stages=launch_cfg.num_stages,
+    )
+    ssd_mod.ssd_rank1_chunk_end_state_bwd_dv_b_chunk_kernel[(BH * NC, n_d_tiles)](
+        grad_s,
+        W,
+        V,
+        log_alpha,
+        dV_split,
+        b_vals,
+        BH,
+        NC,
+        C_CHUNK,
+        M,
+        D,
+        n_d_tiles,
+        *grad_s.stride(),
+        *W.stride(),
+        *V.stride(),
+        *log_alpha.stride(),
+        *dV_split.stride(),
+        *b_vals.stride(),
+        BLOCK_M=block_m,
+        BLOCK_D=block_d,
+        BLOCK_C=C_CHUNK,
+        C_STATIC=C_CHUNK,
+        M_STATIC=M,
+        INPUT_PRECISION="ieee",
+        ACCUMULATE=True,
+        num_warps=launch_cfg.num_warps,
+        num_stages=launch_cfg.num_stages,
+    )
+    ssd_mod.ssd_rank1_chunk_end_state_bwd_dr_kernel[(BH * NC,)](
+        b_vals,
+        log_alpha,
+        dlog_split_only,
+        BH,
+        NC,
+        C_CHUNK,
+        *b_vals.stride(),
+        *log_alpha.stride(),
+        *dlog_split_only.stride(),
+        BLOCK_C=C_CHUNK,
+        C_STATIC=C_CHUNK,
+        num_warps=launch_cfg.num_warps,
+        num_stages=launch_cfg.num_stages,
+    )
+    dlog_split = dlog_base + dlog_split_only
+
+    # Fused-kernel path.
+    dW_fused = dW_base.clone()
+    dV_fused = dV_base.clone()
+    dlog_fused = dlog_base.clone()
+    ssd_mod.ssd_rank1_chunk_end_state_bwd_fused_kernel[(BH * NC,)](
+        grad_s,
+        W,
+        V,
+        log_alpha,
+        dW_fused,
+        dV_fused,
+        dlog_fused,
+        BH,
+        NC,
+        C_CHUNK,
+        M,
+        D,
+        *grad_s.stride(),
+        *W.stride(),
+        *V.stride(),
+        *log_alpha.stride(),
+        *dW_fused.stride(),
+        *dV_fused.stride(),
+        *dlog_fused.stride(),
+        BLOCK_M=block_m,
+        BLOCK_D=block_d,
+        BLOCK_C=C_CHUNK,
+        C_STATIC=C_CHUNK,
+        M_STATIC=M,
+        D_STATIC=D,
+        INPUT_PRECISION="ieee",
+        ACCUMULATE=True,
+        num_warps=launch_cfg.num_warps,
+        num_stages=launch_cfg.num_stages,
+    )
+
+    torch.testing.assert_close(dW_fused, dW_split, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(dV_fused, dV_split, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(dlog_fused, dlog_split, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Phase0 invalid-C contract requires CUDA")

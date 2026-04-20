@@ -1381,7 +1381,7 @@ def ssd_single_rank1_phase3_bwd_un_kernel(
     grad_y_ptr,
     S0_ptr,
     out_dV_ptr,
-    out_dlog_ptr,
+    out_dlog_alpha_ptr,
     out_dS0_ptr,
     b_size,
     h_size,
@@ -1407,9 +1407,9 @@ def ssd_single_rank1_phase3_bwd_un_kernel(
     stride_dv_n,
     stride_dv_h,
     stride_dv_d,
-    stride_dlog_bh,
-    stride_dlog_nc,
-    stride_dlog_c,
+    stride_dlog_alpha_bh,
+    stride_dlog_alpha_nc,
+    stride_dlog_alpha_c,
     stride_ds0_bh,
     stride_ds0_nc,
     stride_ds0_d,
@@ -1496,9 +1496,14 @@ def ssd_single_rank1_phase3_bwd_un_kernel(
     is_diag = offs_c[:, None] == offs_c[None, :]
     dlog_diag = tl.sum(tl.where(is_diag, suffix_rows, 0.0), axis=1)
     dlog_off = tl.cumsum(src, axis=0, reverse=True)
-    dlog = dlog_diag + dlog_off
-    dlog_ptrs = out_dlog_ptr + BH_IDX * stride_dlog_bh + NC_IDX * stride_dlog_nc + offs_c * stride_dlog_c
-    tl.store(dlog_ptrs, dlog)
+    dlog_alpha = dlog_diag + dlog_off
+    dlog_alpha_ptrs = (
+        out_dlog_alpha_ptr
+        + BH_IDX * stride_dlog_alpha_bh
+        + NC_IDX * stride_dlog_alpha_nc
+        + offs_c * stride_dlog_alpha_c
+    )
+    tl.store(dlog_alpha_ptrs, dlog_alpha)
 
 
 def _phase3_backward_from_unchunked(
@@ -1512,6 +1517,7 @@ def _phase3_backward_from_unchunked(
     CHUNK_SIZE: int,
     input_precision: str,
     return_s0_grad_fp32: bool = False,
+    dlog_alpha_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if V_un.ndim != 4 or log_alpha_un.ndim != 3:
         raise ValueError("_phase3_backward_from_unchunked expects V=[B,N,H,D], log_alpha=[B,N,H].")
@@ -1534,7 +1540,16 @@ def _phase3_backward_from_unchunked(
     grad_y_in = grad_y_chunk if grad_y_chunk.is_contiguous() else grad_y_chunk.contiguous()
 
     dV_out = torch.empty_like(V_un)
-    dlog = torch.empty((BH, NC, C), device=V_un.device, dtype=log_alpha_un.dtype)
+    if dlog_alpha_out is None:
+        dlog_alpha = torch.empty((BH, NC, C), device=V_un.device, dtype=log_alpha_un.dtype)
+    else:
+        if dlog_alpha_out.shape != (BH, NC, C):
+            raise ValueError(f"dlog_alpha_out must be [BH,NC,C]={BH, NC, C}; got {tuple(dlog_alpha_out.shape)}.")
+        if dlog_alpha_out.device != V_un.device:
+            raise ValueError("dlog_alpha_out must be on the same device as inputs.")
+        if dlog_alpha_out.dtype not in (log_alpha_un.dtype, torch.float32):
+            raise ValueError("dlog_alpha_out must match log_alpha dtype or be float32.")
+        dlog_alpha = dlog_alpha_out
     dS0 = torch.empty((BH, NC, D), device=V_un.device, dtype=torch.float32)
     grid = (BH * NC,)
     ssd_single_rank1_phase3_bwd_un_kernel[grid](
@@ -1543,7 +1558,7 @@ def _phase3_backward_from_unchunked(
         grad_y_in,
         S0,
         dV_out,
-        dlog,
+        dlog_alpha,
         dS0,
         B,
         H,
@@ -1556,7 +1571,7 @@ def _phase3_backward_from_unchunked(
         *grad_y_in.stride(),
         *S0.stride(),
         *dV_out.stride(),
-        *dlog.stride(),
+        *dlog_alpha.stride(),
         *dS0.stride(),
         BLOCK_D=BLOCK_D,
         BLOCK_C=C,
@@ -1566,7 +1581,7 @@ def _phase3_backward_from_unchunked(
         num_stages=cfg.num_stages,
     )
     dS0_out = dS0 if return_s0_grad_fp32 else dS0.to(V_un.dtype)
-    return dV_out, dlog.to(log_alpha_un.dtype), dS0_out
+    return dV_out, dlog_alpha, dS0_out
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1792,6 +1807,101 @@ def ssd_single_rank1_phase1_bwd_dv_b_un_kernel(
     tl.store(bp_ptrs, b_partial)
 
 
+@triton.jit
+def ssd_single_rank1_phase1_bwd_un_accum_kernel(
+    grad_s_ptr,
+    V_ptr,
+    log_alpha_ptr,
+    out_dV_ptr,
+    out_dlog_alpha_ptr,
+    b_size,
+    h_size,
+    n_size,
+    nc_size,
+    c_size,
+    d_size,
+    stride_gs_bh,
+    stride_gs_nc,
+    stride_gs_d,
+    stride_v_b,
+    stride_v_n,
+    stride_v_h,
+    stride_v_d,
+    stride_r_b,
+    stride_r_n,
+    stride_r_h,
+    stride_dv_b,
+    stride_dv_n,
+    stride_dv_h,
+    stride_dv_d,
+    stride_dlog_alpha_bh,
+    stride_dlog_alpha_nc,
+    stride_dlog_alpha_c,
+    BLOCK_D: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    D_STATIC: tl.constexpr,
+):
+    pid_bhnc = tl.program_id(0)
+    bh_size = b_size * h_size
+    if pid_bhnc >= bh_size * nc_size:
+        return
+
+    BH_IDX = pid_bhnc // nc_size
+    NC_IDX = pid_bhnc % nc_size
+    B_IDX = BH_IDX // h_size
+    H_IDX = BH_IDX % h_size
+
+    offs_c = tl.arange(0, BLOCK_C)
+    n_idx = NC_IDX * BLOCK_C + offs_c
+    mask_c = n_idx < n_size
+
+    log_ptrs = log_alpha_ptr + B_IDX * stride_r_b + n_idx * stride_r_n + H_IDX * stride_r_h
+    log_alpha_vals = tl.load(log_ptrs, mask=mask_c, other=0.0).to(tl.float32)
+    log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
+    factors = tl.exp2((log_suffix_incl - log_alpha_vals) * 1.4426950408889634)
+
+    b_vals = tl.zeros((BLOCK_C,), dtype=tl.float32)
+    for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
+        d_start = d_blk * BLOCK_D
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < d_size
+        mask_cd = mask_c[:, None] & mask_d[None, :]
+
+        gs_ptrs = grad_s_ptr + BH_IDX * stride_gs_bh + NC_IDX * stride_gs_nc + offs_d * stride_gs_d
+        g = tl.load(gs_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+
+        dv_ptrs = (
+            out_dV_ptr
+            + B_IDX * stride_dv_b
+            + n_idx[:, None] * stride_dv_n
+            + H_IDX * stride_dv_h
+            + offs_d[None, :] * stride_dv_d
+        )
+        prev_dV = tl.load(dv_ptrs, mask=mask_cd, other=0.0).to(tl.float32)
+        dV_add = factors[:, None] * g[None, :]
+        tl.store(dv_ptrs, prev_dV + dV_add, mask=mask_cd)
+
+        v_ptrs = (
+            V_ptr
+            + B_IDX * stride_v_b
+            + n_idx[:, None] * stride_v_n
+            + H_IDX * stride_v_h
+            + offs_d[None, :] * stride_v_d
+        )
+        V_f = tl.load(v_ptrs, mask=mask_cd, other=0.0).to(tl.float32)
+        b_vals += factors * tl.sum(V_f * g[None, :], axis=1)
+
+    dlog_alpha = tl.cumsum(b_vals, axis=0) - b_vals
+    dlog_alpha_ptrs = (
+        out_dlog_alpha_ptr
+        + BH_IDX * stride_dlog_alpha_bh
+        + NC_IDX * stride_dlog_alpha_nc
+        + offs_c * stride_dlog_alpha_c
+    )
+    prev_dlog_alpha = tl.load(dlog_alpha_ptrs, mask=mask_c, other=0.0).to(tl.float32)
+    tl.store(dlog_alpha_ptrs, prev_dlog_alpha + dlog_alpha, mask=mask_c)
+
+
 def _phase1_backward_from_unchunked_accum(
     grad_s: torch.Tensor,
     V_un: torch.Tensor,
@@ -1801,6 +1911,7 @@ def _phase1_backward_from_unchunked_accum(
     H: int,
     NC: int,
     CHUNK_SIZE: int,
+    dlog_alpha_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if grad_s.ndim != 3 or V_un.ndim != 4 or log_alpha_un.ndim != 3 or dV_out.ndim != 4:
         raise ValueError(
@@ -1822,55 +1933,41 @@ def _phase1_backward_from_unchunked_accum(
 
     cfg = _select_phase1_backward_launch_config(D=D)
     BLOCK_D = cfg.block_d
-    n_d_tiles = D // BLOCK_D
-
-    b_partials = _workspace_tensor(
-        "single_phase1_b_partials",
-        (BH, NC, n_d_tiles, C),
-        device=V_un.device,
-        dtype=torch.float32,
-    )
-    grid_dv = (BH * NC, n_d_tiles)
-    ssd_single_rank1_phase1_bwd_dv_b_un_kernel[grid_dv](
+    if dlog_alpha_out is None:
+        dlog_alpha_buffer = torch.zeros((BH, NC, C), device=V_un.device, dtype=log_alpha_un.dtype)
+    else:
+        if dlog_alpha_out.shape != (BH, NC, C):
+            raise ValueError(f"dlog_alpha_out must be [BH,NC,C]={BH, NC, C}; got {tuple(dlog_alpha_out.shape)}.")
+        if dlog_alpha_out.device != V_un.device:
+            raise ValueError("dlog_alpha_out must be on the same device as inputs.")
+        if dlog_alpha_out.dtype not in (log_alpha_un.dtype, torch.float32):
+            raise ValueError("dlog_alpha_out must match log_alpha dtype or be float32.")
+        dlog_alpha_buffer = dlog_alpha_out
+    grid = (BH * NC,)
+    ssd_single_rank1_phase1_bwd_un_accum_kernel[grid](
         grad_s,
         V_un,
         log_alpha_un,
         dV_out,
-        b_partials,
+        dlog_alpha_buffer,
         B,
         H,
         N,
         NC,
         C,
         D,
-        n_d_tiles,
         *grad_s.stride(),
         *V_un.stride(),
         *log_alpha_un.stride(),
         *dV_out.stride(),
-        *b_partials.stride(),
+        *dlog_alpha_buffer.stride(),
         BLOCK_D=BLOCK_D,
         BLOCK_C=C,
+        num_warps=cfg.num_warps,
+        num_stages=cfg.num_stages,
         D_STATIC=D,
-        num_warps=cfg.num_warps,
-        num_stages=cfg.num_stages,
     )
-    b_vals = torch.sum(b_partials, dim=2)
-    dlog = torch.empty((BH, NC, C), device=V_un.device, dtype=torch.float32)
-    grid_dlog = (BH * NC,)
-    ssd_single_rank1_phase1_bwd_dlog_kernel[grid_dlog](
-        b_vals,
-        dlog,
-        BH,
-        NC,
-        C,
-        *b_vals.stride(),
-        *dlog.stride(),
-        BLOCK_C=C,
-        num_warps=cfg.num_warps,
-        num_stages=cfg.num_stages,
-    )
-    return dlog.to(log_alpha_un.dtype)
+    return dlog_alpha_buffer
 
 
 def _phase1_backward_impl(
@@ -2101,8 +2198,11 @@ class SsdSingleRank1Triton(torch.autograd.Function):
             S_local_end, log_alpha_per_chunk, init_flat, phase2_compute_dtype
         )
 
+        # Use one shared dlog_alpha buffer across phase-3 and phase-1.
+        dlog_alpha = torch.zeros((BH, NC, CHUNK_SIZE), device=V_in.device, dtype=torch.float32)
+
         # Phase-3 backward.
-        dV, dlog_p3, dS0 = _phase3_backward_from_unchunked(
+        dV, dlog_alpha, dS0 = _phase3_backward_from_unchunked(
             V_in,
             log_alpha_in,
             grad_y_chunk,
@@ -2112,6 +2212,7 @@ class SsdSingleRank1Triton(torch.autograd.Function):
             CHUNK_SIZE=CHUNK_SIZE,
             input_precision=INPUT_PRECISION,
             return_s0_grad_fp32=True,
+            dlog_alpha_out=dlog_alpha,
         )
 
         # Phase-2 backward.
@@ -2120,7 +2221,7 @@ class SsdSingleRank1Triton(torch.autograd.Function):
             if grad_S1_chunk is not None
             else torch.zeros((BH, D), device=V_in.device, dtype=phase2_compute_dtype)
         )
-        dS_local_end, dlog_per_chunk, d_init_f32 = _phase2_backward_impl(
+        dS_local_end, dlog_alpha_per_chunk, d_init_f32 = _phase2_backward_impl(
             dS0.reshape(BH, NC, D),
             grad_final,
             S0_chunk,
@@ -2129,7 +2230,7 @@ class SsdSingleRank1Triton(torch.autograd.Function):
         )
 
         # Phase-1 backward.
-        dlog_p1 = _phase1_backward_from_unchunked_accum(
+        _phase1_backward_from_unchunked_accum(
             dS_local_end,
             V_in,
             log_alpha_in,
@@ -2137,19 +2238,19 @@ class SsdSingleRank1Triton(torch.autograd.Function):
             H=H,
             NC=NC,
             CHUNK_SIZE=CHUNK_SIZE,
+            dlog_alpha_out=dlog_alpha,
         )
 
-        dlog_p3.add_(dlog_p1)
-        dlog_p3.add_(dlog_per_chunk.unsqueeze(-1).to(log_alpha_in.dtype))
-        dlog_chunk = dlog_p3
+        dlog_alpha.add_(dlog_alpha_per_chunk.unsqueeze(-1))
+        dlog_alpha_chunk = dlog_alpha
 
         n_exec = NC * CHUNK_SIZE
-        dlog_view = torch.as_strided(
-            dlog_chunk,
+        dlog_alpha_view = torch.as_strided(
+            dlog_alpha_chunk,
             size=(B, n_exec, H),
             stride=(H * n_exec, 1, n_exec),
         )
-        dlog = dlog_view[:, :N, :]
+        dlog_alpha = dlog_alpha_view[:, :N, :].to(log_alpha_in.dtype)
 
         if initial_state_shape is None:
             d_init = None
@@ -2158,7 +2259,7 @@ class SsdSingleRank1Triton(torch.autograd.Function):
         else:
             d_init = d_init_f32.reshape(B, H, D).to(compute_dtype)
 
-        return dV, dlog, d_init, None, None
+        return dV, dlog_alpha, d_init, None, None
 
 
 def ssd_single_rank1_triton(
