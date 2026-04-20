@@ -2929,6 +2929,27 @@ def _ssd_rank1_dense_output_backward_impl(
     s0_was_flat: bool,
     return_s0_grad_fp32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Phase-3 backward for chunk-local dense replay/output.
+
+    Per `(BH, NC)` forward equations:
+      R = C @ W^T
+      L[i,j] = 1_{j<=i} * prod_{u=j+1..i} alpha_u, alpha_u = exp(log_alpha_u)
+      K = L * R
+      Y_diag = K @ V
+      Y_off  = p * (C @ S0), p_i = prod_{u=0..i} alpha_u
+      Y = Y_diag + Y_off
+
+    Backward decomposition used here:
+      1) Fused dense-path kernel computes `dV`, `dC_diag`, `dW`, `dlog_diag`.
+      2) Off-path kernels add the `Y_off` contributions:
+         - `dC_off` is accumulated in-place into `dC_diag`
+         - `dS0`
+         - `dlog_off` accumulated in-place into `dlog_diag`
+
+    Returned tensors are phase-3 contributions only:
+      - `dC`, `dW`, `dV`, `dlog_alpha`
+      - `dS0` (used by phase-2 backward), optionally kept in fp32.
+    """
     BH, NC, C_CHUNK, M = C.shape
     D = V.shape[-1]
     _require_supported_md(M, D, where="_ssd_rank1_dense_output_backward_impl")
@@ -2976,6 +2997,8 @@ def _ssd_rank1_dense_output_backward_impl(
     grad_out_c = grad_out.contiguous()
 
     grid_fused = (BH * NC,)
+    # Main dense replay/output path:
+    #   dV = K^T dY, dR = dK * L, dC_diag = dR W, dW = dR^T C, dlog_diag from Q=dK*R*L
     ssd_rank1_dense_output_bwd_fused_a1a2_kernel[grid_fused](
         C,
         W,
@@ -3015,6 +3038,7 @@ def _ssd_rank1_dense_output_backward_impl(
     if has_s0:
         dS0 = torch.empty((BH, NC, M, D), device=C.device, dtype=torch.float32)
         grid_off_dc = (BH * NC, n_m_tiles)
+        # Off-path `Y_off = p * (C @ S0)` contribution to dC.
         ssd_rank1_dense_output_bwd_off_dc_kernel[grid_off_dc](
             C,
             grad_out_c,
@@ -3042,6 +3066,7 @@ def _ssd_rank1_dense_output_backward_impl(
         )
 
         grid_off_ds0 = (BH * NC, n_m_tiles, n_d_tiles)
+        # Off-path contribution to dS0.
         ssd_rank1_dense_output_bwd_off_ds0_kernel[grid_off_ds0](
             C,
             grad_out_c,
@@ -3070,6 +3095,7 @@ def _ssd_rank1_dense_output_backward_impl(
             y_off_saved = (
                 torch.exp2(log_p * _INV_LN2).unsqueeze(-1) * torch.matmul(C.float(), S0_md.float())
             ).to(C.dtype).contiguous()
+        # Off-path contribution to dlog_alpha via prefix factors `p`.
         ssd_rank1_dense_output_bwd_logalpha_off_kernel[grid_off_log](
             y_off_saved,
             grad_out_c,
@@ -3445,6 +3471,28 @@ class SsdRank1Triton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_y_chunk, grad_S1_chunk):
+        """Backward pass for unified phase-1/2/3 SSD rank-1.
+
+        Input adjoints:
+          - grad_y_chunk  = dL/dY_chunk  [BH,NC,C,D]
+          - grad_S1_chunk = dL/dS_final  [BH,MD] (optional)
+
+        Chain-rule schedule:
+          1) Replay phase-1 and phase-2 forwards to recover `S_local_end`, `S0_chunk`.
+          2) Phase-3 backward:
+               (C, W, V, log_alpha, S0) + dY
+                 -> dC_p3, dW_p3, dV_p3, dlog_p3, dS0
+          3) Phase-2 backward:
+               (S_local_end, log_alpha_per_chunk, init) + (dS0, dS_final)
+                 -> dS_local_end, dlog_per_chunk, dinit
+          4) Phase-1 backward:
+               (W, V, log_alpha) + dS_local_end
+                 -> dW_p1, dV_p1, dlog_p1
+          5) Accumulate and reshape:
+               dW = dW_p3 + dW_p1
+               dV = dV_p3 + dV_p1
+               dlog = dlog_p3 + dlog_p1 + broadcast(dlog_per_chunk over chunk tokens)
+        """
         # Upstream gradients:
         #   grad_y_chunk  : dL/dy_chunk  [BH,NC,C,D]
         #   grad_S1_chunk : dL/dS1_chunk [BH,MD] or None
@@ -3544,6 +3592,9 @@ class SsdRank1Triton(torch.autograd.Function):
         # larger BH/NC shapes.
         block_nc = 32 if (NC >= 32 and NC % 32 == 0) else 16
         grid_bwd = lambda META: (BH,)
+        # Phase-2 reverse scan:
+        #   inputs  : dS0_chunk and dS1
+        #   outputs : dS_local_end, d(log_alpha_per_chunk), dinit
         ssd_rank1_prefix_scan_bwd_dense_kernel[grid_bwd](
             grad_chunk_start_f,
             grad_final_state_f,
@@ -3600,6 +3651,7 @@ class SsdRank1Triton(torch.autograd.Function):
         n_d_tiles = D // BLOCK_D
 
         grid_dw = (BH * NC, n_m_tiles)
+        # From dS_local_end, compute phase-1 contribution to dW.
         ssd_rank1_chunk_end_state_bwd_dw_chunk_kernel[grid_dw](
             grad_s_md, V_chunk, log_alpha_chunk, d_W_p1,
             BH, NC, CHUNK_SIZE, M, D,
@@ -3612,6 +3664,7 @@ class SsdRank1Triton(torch.autograd.Function):
 
         b_partials = torch.empty((BH, NC, n_d_tiles, CHUNK_SIZE), device=C_chunk.device, dtype=torch.float32)
         grid_dv = (BH * NC, n_d_tiles)
+        # Compute phase-1 contribution to dV and the intermediate `b` terms used for dlog_alpha_p1.
         ssd_rank1_chunk_end_state_bwd_dv_b_chunk_kernel[grid_dv](
             grad_s_md, W_chunk, V_chunk, log_alpha_chunk, d_V_p1, b_partials,
             BH, NC, CHUNK_SIZE, M, D, n_d_tiles,
@@ -3625,6 +3678,7 @@ class SsdRank1Triton(torch.autograd.Function):
         b_vals = torch.sum(b_partials, dim=2).contiguous()
 
         grid_dr = (BH * NC,)
+        # Convert reduced `b` terms into phase-1 dlog_alpha contribution.
         ssd_rank1_chunk_end_state_bwd_dr_kernel[grid_dr](
             b_vals, log_alpha_chunk, d_log_alpha_p1,
             BH, NC, CHUNK_SIZE,
@@ -3646,6 +3700,8 @@ class SsdRank1Triton(torch.autograd.Function):
         # plus for log_alpha an additional Phase 2 chunk-scale contribution.
         dW_chunk = dW_chunk + d_W_p1
         dV_chunk = dV_chunk + d_V_p1
+        # d_log_alpha_per_chunk is one scalar per chunk; broadcast over token index
+        # so each token in the chunk receives the same phase-2 contribution.
         dlog_alpha_chunk = dlog_alpha_chunk_p3 + d_log_alpha_p1 + d_log_alpha_per_chunk.unsqueeze(-1).to(log_alpha_chunk.dtype)
 
         # ---- Restore outer layout ----
