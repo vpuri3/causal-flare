@@ -397,23 +397,28 @@ def test_phase1_fused_backward_kernel_matches_split_path_fp32():
     dW_fused = dW_base.clone()
     dV_fused = dV_base.clone()
     dlog_fused = dlog_base.clone()
+    W_5d = W.unsqueeze(3)
+    V_5d = V.unsqueeze(3)
+    log_alpha_4d = log_alpha.unsqueeze(3)
     ssd_mod.ssd_rank1_chunk_end_state_bwd_fused_kernel[(BH * NC,)](
         grad_s,
-        W,
-        V,
-        log_alpha,
+        W_5d,
+        V_5d,
+        log_alpha_4d,
         dW_fused,
         dV_fused,
         dlog_fused,
+        BH,
+        1,
         BH,
         NC,
         C_CHUNK,
         M,
         D,
         *grad_s.stride(),
-        *W.stride(),
-        *V.stride(),
-        *log_alpha.stride(),
+        *W_5d.stride(),
+        *V_5d.stride(),
+        *log_alpha_4d.stride(),
         *dW_fused.stride(),
         *dV_fused.stride(),
         *dlog_fused.stride(),

@@ -23,6 +23,7 @@ _SUPPORTED_D_VALUES = {32, 64, 128}
 _SUPPORTED_CHUNK_SIZES = {32, 64, 128, 256}
 _SUPPORTED_BLOCK_X_VALUES = (128, 64, 32, 16)
 _INV_LN2 = 1.4426950408889634
+_USE_BF16_DOT_FOR_TENSOR_CORES = True
 
 _EXPERIMENTAL_TRITON_ALLOCATOR_SET = False
 _PHASE_BWD_WORKSPACE: dict[tuple, torch.Tensor] = {}
@@ -759,6 +760,7 @@ def ssd_single_rank1_phase3_fwd_un_kernel(
     D_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
     STORE_Y_OFF: tl.constexpr,
+    USE_BF16_DOT: tl.constexpr,
 ):
     pid_bhnc = tl.program_id(0)
     pid_d_tile = tl.program_id(1)
@@ -797,7 +799,10 @@ def ssd_single_rank1_phase3_fwd_un_kernel(
     )
     V_in = tl.load(v_ptrs, mask=mask_cd, other=0.0)
     V_f = V_in.to(tl.float32)
-    Y_diag = tl.dot(L, V_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+    if USE_BF16_DOT:
+        Y_diag = tl.dot(L.to(tl.bfloat16), V_f.to(tl.bfloat16), out_dtype=tl.float32)
+    else:
+        Y_diag = tl.dot(L, V_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
     s0_ptrs = S0_ptr + BH_IDX * stride_s0_bh + NC_IDX * stride_s0_nc + offs_d * stride_s0_d
     S0_tile = tl.load(s0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
@@ -887,6 +892,7 @@ def _phase3_forward_from_unchunked(
         D_STATIC=D,
         INPUT_PRECISION=input_precision,
         STORE_Y_OFF=RETURN_Y_OFF,
+        USE_BF16_DOT=_USE_BF16_DOT_FOR_TENSOR_CORES,
         num_warps=cfg.num_warps,
         num_stages=cfg.num_stages,
     )
@@ -939,6 +945,7 @@ def ssd_single_rank1_phase3_bwd_un_kernel(
     BLOCK_C: tl.constexpr,
     D_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
+    USE_BF16_DOT: tl.constexpr,
 ):
     pid_bhnc = tl.program_id(0)
     bh_size = b_size * h_size
@@ -991,7 +998,15 @@ def ssd_single_rank1_phase3_bwd_un_kernel(
         )
         G = tl.load(gy_ptrs, mask=mask_cd, other=0.0).to(tl.float32)
 
-        dV_tile = tl.dot(tl.trans(L), G, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if USE_BF16_DOT:
+            L_t_tc = tl.trans(L).to(tl.bfloat16)
+            G_tc = G.to(tl.bfloat16)
+            V_t_tc = tl.trans(V_f).to(tl.bfloat16)
+            dV_tile = tl.dot(L_t_tc, G_tc, out_dtype=tl.float32)
+            dL += tl.dot(G_tc, V_t_tc, out_dtype=tl.float32)
+        else:
+            dV_tile = tl.dot(tl.trans(L), G, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dL += tl.dot(G, tl.trans(V_f), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dv_ptrs = (
             out_dV_ptr
             + B_IDX * stride_dv_b
@@ -1000,8 +1015,6 @@ def ssd_single_rank1_phase3_bwd_un_kernel(
             + offs_d[None, :] * stride_dv_d
         )
         tl.store(dv_ptrs, dV_tile, mask=mask_cd)
-
-        dL += tl.dot(G, tl.trans(V_f), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
         s0_ptrs = S0_ptr + BH_IDX * stride_s0_bh + NC_IDX * stride_s0_nc + offs_d * stride_s0_d
         S0_tile = tl.load(s0_ptrs, mask=mask_d, other=0.0).to(tl.float32)
@@ -1099,6 +1112,7 @@ def _phase3_backward_from_unchunked(
         BLOCK_C=C,
         D_STATIC=D,
         INPUT_PRECISION=input_precision,
+        USE_BF16_DOT=_USE_BF16_DOT_FOR_TENSOR_CORES,
         num_warps=cfg.num_warps,
         num_stages=cfg.num_stages,
     )

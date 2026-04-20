@@ -233,7 +233,7 @@ def _ssd_rank1_prepare_unchunked_inputs(
     where: str,
     CHUNK_SIZE: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int, int, int]:
-    """Validate and chunk unchunked mode-0 tensors into `[BH, NC, C, *]` layouts."""
+    """Validate and chunk unchunked mode-0 tensors into `[B, NC, C, H, *]` views."""
     if C.ndim != 4 or W.ndim != 4 or V.ndim != 4 or log_alpha.ndim != 3:
         raise ValueError(
             f"{where} expects C=[B,N,H,M], W=[B,N,H,M], V=[B,N,H,D], log_alpha=[B,N,H]. "
@@ -257,54 +257,20 @@ def _ssd_rank1_prepare_unchunked_inputs(
     _require_supported_forward_contract(B * H, N, CHUNK_SIZE=CHUNK_SIZE, where=where)
     _require_nonpositive_log_alpha(log_alpha, where=where)
 
-    NC_data = triton.cdiv(N, CHUNK_SIZE)
-    padded_tokens = NC_data * CHUNK_SIZE
-    token_pad = padded_tokens - N
-    if token_pad > 0:
-        z_cm = torch.zeros((B, token_pad, H, M), device=C.device, dtype=C.dtype)
-        z_vd = torch.zeros((B, token_pad, H, D), device=V.device, dtype=V.dtype)
-        o_r = torch.zeros((B, token_pad, H), device=log_alpha.device, dtype=log_alpha.dtype)
-        C = torch.cat([C, z_cm], dim=1)
-        W = torch.cat([W, z_cm], dim=1)
-        V = torch.cat([V, z_vd], dim=1)
-        log_alpha = torch.cat([log_alpha, o_r], dim=1)
+    if N % CHUNK_SIZE != 0:
+        raise NotImplementedError(
+            f"{where} requires N divisible by CHUNK_SIZE without padding; got N={N}, CHUNK_SIZE={CHUNK_SIZE}."
+        )
+    NC_data = N // CHUNK_SIZE
+    _require_nc_descriptor_width(NC_data, where=where)
 
-    C_chunk = (
-        C.reshape(B, NC_data, CHUNK_SIZE, H, M)
-        .permute(0, 3, 1, 2, 4)
-        .contiguous()
-        .reshape(B * H, NC_data, CHUNK_SIZE, M)
-    )
-    W_chunk = (
-        W.reshape(B, NC_data, CHUNK_SIZE, H, M)
-        .permute(0, 3, 1, 2, 4)
-        .contiguous()
-        .reshape(B * H, NC_data, CHUNK_SIZE, M)
-    )
-    V_chunk = (
-        V.reshape(B, NC_data, CHUNK_SIZE, H, D)
-        .permute(0, 3, 1, 2, 4)
-        .contiguous()
-        .reshape(B * H, NC_data, CHUNK_SIZE, D)
-    )
-    log_alpha_chunk = (
-        log_alpha.reshape(B, NC_data, CHUNK_SIZE, H)
-        .permute(0, 3, 1, 2)
-        .contiguous()
-        .reshape(B * H, NC_data, CHUNK_SIZE)
-    )
+    # No-op chunk views over original [B,N,H,*] storage.
+    C_chunk = C.view(B, NC_data, CHUNK_SIZE, H, M)
+    W_chunk = W.view(B, NC_data, CHUNK_SIZE, H, M)
+    V_chunk = V.view(B, NC_data, CHUNK_SIZE, H, D)
+    log_alpha_chunk = log_alpha.view(B, NC_data, CHUNK_SIZE, H)
 
-    NC_exec = max(NC_data, 16)
-    NC_exec = triton.cdiv(NC_exec, 16) * 16
-    if NC_exec > NC_data:
-        pad_chunks = NC_exec - NC_data
-        z_c = torch.zeros((B * H, pad_chunks, CHUNK_SIZE, M), device=C.device, dtype=C.dtype)
-        z_v = torch.zeros((B * H, pad_chunks, CHUNK_SIZE, D), device=V.device, dtype=V.dtype)
-        o_r = torch.zeros((B * H, pad_chunks, CHUNK_SIZE), device=log_alpha.device, dtype=log_alpha.dtype)
-        C_chunk = torch.cat([C_chunk, z_c], dim=1)
-        W_chunk = torch.cat([W_chunk, z_c], dim=1)
-        V_chunk = torch.cat([V_chunk, z_v], dim=1)
-        log_alpha_chunk = torch.cat([log_alpha_chunk, o_r], dim=1)
+    NC_exec = NC_data
 
     BH = B * H
     MD = M * D
@@ -376,11 +342,17 @@ def ssd_rank1_pytorch(
         CHUNK_SIZE=CHUNK_SIZE,
     )
 
+    # Reference helpers still consume [BH,NC,C,*]; convert from [B,NC,C,H,*].
+    C_chunk_bh = C_chunk.permute(0, 3, 1, 2, 4).reshape(B * H, C_chunk.shape[1], C_chunk.shape[2], M)
+    W_chunk_bh = W_chunk.permute(0, 3, 1, 2, 4).reshape(B * H, W_chunk.shape[1], W_chunk.shape[2], M)
+    V_chunk_bh = V_chunk.permute(0, 3, 1, 2, 4).reshape(B * H, V_chunk.shape[1], V_chunk.shape[2], D)
+    log_alpha_chunk_bh = log_alpha_chunk.permute(0, 3, 1, 2).reshape(B * H, log_alpha_chunk.shape[1], log_alpha_chunk.shape[2])
+
     # =========================================
     # PHASE 1 local chunk end-state
     # =========================================
-    S_local_end = ssd_rank1_chunk_end_state_reference(W_chunk, V_chunk, log_alpha_chunk)
-    alpha_chunk = torch.exp2(torch.sum(log_alpha_chunk, dim=-1) * _INV_LN2)
+    S_local_end = ssd_rank1_chunk_end_state_reference(W_chunk_bh, V_chunk_bh, log_alpha_chunk_bh)
+    alpha_chunk = torch.exp2(torch.sum(log_alpha_chunk_bh, dim=-1) * _INV_LN2)
 
     # =========================================
     # PHASE 2 prefix scan over chunks
@@ -390,7 +362,7 @@ def ssd_rank1_pytorch(
     # =========================================
     # PHASE 3 dense chunk-local output
     # =========================================
-    y_chunk = ssd_rank1_dense_output_reference(C_chunk, W_chunk, V_chunk, log_alpha_chunk, S0_chunk)
+    y_chunk = ssd_rank1_dense_output_reference(C_chunk_bh, W_chunk_bh, V_chunk_bh, log_alpha_chunk_bh, S0_chunk)
 
     return _ssd_rank1_restore_output_layout(y_chunk, S1_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
 
@@ -651,26 +623,31 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
     V_ptr,
     log_alpha_ptr,
     out_s_local_end_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    d_size,
-    stride_w_bh,
-    stride_w_nc,
-    stride_w_c,
-    stride_w_m,
-    stride_v_bh,
-    stride_v_nc,
-    stride_v_c,
-    stride_v_d,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_out_s_local_end_bh,
-    stride_out_s_local_end_nc,
-    stride_out_s_local_end_m,
-    stride_out_s_local_end_d,
+    b_size: tl.constexpr,
+    h_size: tl.constexpr,
+    bh_size: tl.constexpr,
+    nc_size: tl.constexpr,
+    c_size: tl.constexpr,
+    m_size: tl.constexpr,
+    d_size: tl.constexpr,
+    stride_w_b: tl.constexpr,
+    stride_w_nc: tl.constexpr,
+    stride_w_c: tl.constexpr,
+    stride_w_h: tl.constexpr,
+    stride_w_m: tl.constexpr,
+    stride_v_b: tl.constexpr,
+    stride_v_nc: tl.constexpr,
+    stride_v_c: tl.constexpr,
+    stride_v_h: tl.constexpr,
+    stride_v_d: tl.constexpr,
+    stride_r_b: tl.constexpr,
+    stride_r_nc: tl.constexpr,
+    stride_r_c: tl.constexpr,
+    stride_r_h: tl.constexpr,
+    stride_out_s_local_end_bh: tl.constexpr,
+    stride_out_s_local_end_nc: tl.constexpr,
+    stride_out_s_local_end_m: tl.constexpr,
+    stride_out_s_local_end_d: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -719,6 +696,8 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
 
     BH_IDX = pid_bhnc // nc_size
     NC_IDX = pid_bhnc % nc_size
+    B_IDX = BH_IDX // h_size
+    H_IDX = BH_IDX % h_size
 
     m_start = pid_m_tile * BLOCK_M
     d_start = pid_d_tile * BLOCK_D
@@ -727,21 +706,15 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
 
     w_desc = tl.make_tensor_descriptor(
         W_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_w_bh, stride_w_nc, stride_w_c, stride_w_m],
-        block_shape=[1, 1, BLOCK_T, BLOCK_M],
+        shape=[b_size, nc_size, c_size, h_size, m_size],
+        strides=[stride_w_b, stride_w_nc, stride_w_c, stride_w_h, stride_w_m],
+        block_shape=[1, 1, BLOCK_T, 1, BLOCK_M],
     )
     v_desc = tl.make_tensor_descriptor(
         V_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_v_bh, stride_v_nc, stride_v_c, stride_v_d],
-        block_shape=[1, 1, BLOCK_T, BLOCK_D],
-    )
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
+        shape=[b_size, nc_size, c_size, h_size, d_size],
+        strides=[stride_v_b, stride_v_nc, stride_v_c, stride_v_h, stride_v_d],
+        block_shape=[1, 1, BLOCK_T, 1, BLOCK_D],
     )
     out_s_desc = tl.make_tensor_descriptor(
         out_s_local_end_ptr,
@@ -749,7 +722,9 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
         strides=[stride_out_s_local_end_bh, stride_out_s_local_end_nc, stride_out_s_local_end_m, stride_out_s_local_end_d],
         block_shape=[1, 1, BLOCK_M, BLOCK_D],
     )
-    log_alpha_in = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,))
+    offs_c = tl.arange(0, BLOCK_C)
+    r_base = B_IDX * stride_r_b + NC_IDX * stride_r_nc + H_IDX * stride_r_h
+    log_alpha_in = tl.load(log_alpha_ptr + r_base + offs_c * stride_r_c)
     log_alpha_vals = log_alpha_in.to(tl.float32)
     INV_LN2 = 1.4426950408889634
     log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
@@ -763,8 +738,8 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
             tl.where(offs_t_full[None, :] == offs_tb[:, None], r_factors[None, :], 0.0),
             axis=1,
         )
-        W_blk = tl.reshape(w_desc.load([BH_IDX, NC_IDX, t_start, m_start]), (BLOCK_T, BLOCK_M))
-        V_blk = tl.reshape(v_desc.load([BH_IDX, NC_IDX, t_start, d_start]), (BLOCK_T, BLOCK_D))
+        W_blk = tl.reshape(w_desc.load([B_IDX, NC_IDX, t_start, H_IDX, m_start]), (BLOCK_T, BLOCK_M))
+        V_blk = tl.reshape(v_desc.load([B_IDX, NC_IDX, t_start, H_IDX, d_start]), (BLOCK_T, BLOCK_D))
         sqrt_factors = tl.sqrt(factors)[:, None]
         # A^T @ B reproduces sum_t factor[t] * outer(W_t, V_t).
         A = (sqrt_factors * W_blk.to(tl.float32)).to(W_blk.dtype)
@@ -1079,37 +1054,42 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
     out_dw_ptr,
     out_dv_ptr,
     out_dlog_alpha_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    d_size,
-    stride_grad_s_bh,
-    stride_grad_s_nc,
-    stride_grad_s_m,
-    stride_grad_s_d,
-    stride_w_bh,
-    stride_w_nc,
-    stride_w_c,
-    stride_w_m,
-    stride_v_bh,
-    stride_v_nc,
-    stride_v_c,
-    stride_v_d,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_out_dw_bh,
-    stride_out_dw_nc,
-    stride_out_dw_c,
-    stride_out_dw_m,
-    stride_out_dv_bh,
-    stride_out_dv_nc,
-    stride_out_dv_c,
-    stride_out_dv_d,
-    stride_out_dlog_alpha_bh,
-    stride_out_dlog_alpha_nc,
-    stride_out_dlog_alpha_c,
+    b_size: tl.constexpr,
+    h_size: tl.constexpr,
+    bh_size: tl.constexpr,
+    nc_size: tl.constexpr,
+    c_size: tl.constexpr,
+    m_size: tl.constexpr,
+    d_size: tl.constexpr,
+    stride_grad_s_bh: tl.constexpr,
+    stride_grad_s_nc: tl.constexpr,
+    stride_grad_s_m: tl.constexpr,
+    stride_grad_s_d: tl.constexpr,
+    stride_w_b: tl.constexpr,
+    stride_w_nc: tl.constexpr,
+    stride_w_c: tl.constexpr,
+    stride_w_h: tl.constexpr,
+    stride_w_m: tl.constexpr,
+    stride_v_b: tl.constexpr,
+    stride_v_nc: tl.constexpr,
+    stride_v_c: tl.constexpr,
+    stride_v_h: tl.constexpr,
+    stride_v_d: tl.constexpr,
+    stride_r_b: tl.constexpr,
+    stride_r_nc: tl.constexpr,
+    stride_r_c: tl.constexpr,
+    stride_r_h: tl.constexpr,
+    stride_out_dw_bh: tl.constexpr,
+    stride_out_dw_nc: tl.constexpr,
+    stride_out_dw_c: tl.constexpr,
+    stride_out_dw_m: tl.constexpr,
+    stride_out_dv_bh: tl.constexpr,
+    stride_out_dv_nc: tl.constexpr,
+    stride_out_dv_c: tl.constexpr,
+    stride_out_dv_d: tl.constexpr,
+    stride_out_dlog_alpha_bh: tl.constexpr,
+    stride_out_dlog_alpha_nc: tl.constexpr,
+    stride_out_dlog_alpha_c: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -1126,13 +1106,9 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
 
     BH_IDX = pid_bhnc // nc_size
     NC_IDX = pid_bhnc % nc_size
+    B_IDX = BH_IDX // h_size
+    H_IDX = BH_IDX % h_size
 
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
-    )
     grad_s_desc = tl.make_tensor_descriptor(
         grad_s_local_end_ptr,
         shape=[bh_size, nc_size, m_size, d_size],
@@ -1141,15 +1117,15 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
     )
     w_desc = tl.make_tensor_descriptor(
         W_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_w_bh, stride_w_nc, stride_w_c, stride_w_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
+        shape=[b_size, nc_size, c_size, h_size, m_size],
+        strides=[stride_w_b, stride_w_nc, stride_w_c, stride_w_h, stride_w_m],
+        block_shape=[1, 1, BLOCK_C, 1, BLOCK_M],
     )
     v_desc = tl.make_tensor_descriptor(
         V_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_v_bh, stride_v_nc, stride_v_c, stride_v_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
+        shape=[b_size, nc_size, c_size, h_size, d_size],
+        strides=[stride_v_b, stride_v_nc, stride_v_c, stride_v_h, stride_v_d],
+        block_shape=[1, 1, BLOCK_C, 1, BLOCK_D],
     )
     out_dw_desc = tl.make_tensor_descriptor(
         out_dw_ptr,
@@ -1170,7 +1146,9 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
         block_shape=[1, 1, BLOCK_C],
     )
 
-    log_alpha_in = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,))
+    offs_c = tl.arange(0, BLOCK_C)
+    r_base = B_IDX * stride_r_b + NC_IDX * stride_r_nc + H_IDX * stride_r_h
+    log_alpha_in = tl.load(log_alpha_ptr + r_base + offs_c * stride_r_c)
     log_alpha_vals = log_alpha_in.to(tl.float32)
     INV_LN2 = 1.4426950408889634
     log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
@@ -1183,10 +1161,10 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
         for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
             d_start = d_blk * BLOCK_D
             g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-            v_tile = tl.reshape(v_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
+            v_tile = tl.reshape(v_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
             acc += tl.dot(v_tile, tl.trans(g_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dW_tile = factors[:, None] * acc
-        w_dtype_probe = tl.reshape(w_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M))
+        w_dtype_probe = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         if ACCUMULATE:
             old_dw = tl.reshape(out_dw_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
             dW_tile += old_dw
@@ -1200,17 +1178,17 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
         for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
             m_start = m_blk * BLOCK_M
             g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-            w_tile = tl.reshape(w_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+            w_tile = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
             acc += tl.dot(w_tile, g_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
         dV_tile = factors[:, None] * acc
-        v_dtype_probe = tl.reshape(v_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D))
+        v_dtype_probe = tl.reshape(v_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
         if ACCUMULATE:
             old_dv = tl.reshape(out_dv_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
             dV_tile += old_dv
         out_dv_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV_tile.to(v_dtype_probe.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
-        v_tile = tl.reshape(v_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
+        v_tile = tl.reshape(v_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
         b_vals += tl.sum(acc * v_tile, axis=1)
 
     g_vals = b_vals * factors
@@ -1231,30 +1209,47 @@ def _ssd_rank1_chunk_end_state_forward_impl(
     log_alpha: torch.Tensor,
     BLOCK_T: int = 32,
 ) -> torch.Tensor:
-    if W.ndim != 4 or V.ndim != 4 or log_alpha.ndim != 3:
-        raise ValueError(
-            "_ssd_rank1_chunk_end_state_forward_impl expects "
-            "W=[BH,NC,C,M], V=[BH,NC,C,D], log_alpha=[BH,NC,C]. "
-            f"Got W={tuple(W.shape)}, V={tuple(V.shape)}, log_alpha={tuple(log_alpha.shape)}."
-        )
-    BH, NC, C, _ = W.shape
-    if V.shape[:3] != (BH, NC, C):
-        raise ValueError(
-            "V must match [BH,NC,C,*] from W. "
-            f"Got V={tuple(V.shape)}, W={tuple(W.shape)}."
-        )
-    if log_alpha.shape != (BH, NC, C):
-        raise ValueError(
-            "log_alpha must match [BH,NC,C] from W/V. "
-            f"Got log_alpha={tuple(log_alpha.shape)}, W={tuple(W.shape)}, V={tuple(V.shape)}."
-        )
     if W.device != V.device or W.device != log_alpha.device:
         raise ValueError("W, V, log_alpha must be on the same device.")
     if W.dtype != V.dtype or W.dtype != log_alpha.dtype:
         raise ValueError("W, V, log_alpha must share dtype.")
+    if W.ndim == 5 and V.ndim == 5 and log_alpha.ndim == 4:
+        B, NC, C, H, M = W.shape
+        if V.shape[:4] != (B, NC, C, H):
+            raise ValueError(f"V must be [B,NC,C,H,D] with leading dims {(B, NC, C, H)}; got {tuple(V.shape)}.")
+        D = V.shape[-1]
+        if log_alpha.shape != (B, NC, C, H):
+            raise ValueError(
+                "log_alpha must match [B,NC,C,H] from W/V. "
+                f"Got log_alpha={tuple(log_alpha.shape)}, W={tuple(W.shape)}, V={tuple(V.shape)}."
+            )
+        W_5d, V_5d, log_alpha_4d = W, V, log_alpha
+    elif W.ndim == 4 and V.ndim == 4 and log_alpha.ndim == 3:
+        BH, NC, C, M = W.shape
+        if V.shape[:3] != (BH, NC, C):
+            raise ValueError(
+                "V must match [BH,NC,C,*] from W. "
+                f"Got V={tuple(V.shape)}, W={tuple(W.shape)}."
+            )
+        D = V.shape[-1]
+        if log_alpha.shape != (BH, NC, C):
+            raise ValueError(
+                "log_alpha must match [BH,NC,C] from W/V. "
+                f"Got log_alpha={tuple(log_alpha.shape)}, W={tuple(W.shape)}, V={tuple(V.shape)}."
+            )
+        B, H = BH, 1
+        W_5d = W.unsqueeze(3)
+        V_5d = V.unsqueeze(3)
+        log_alpha_4d = log_alpha.unsqueeze(3)
+    else:
+        raise ValueError(
+            "_ssd_rank1_chunk_end_state_forward_impl expects either "
+            "W=[B,NC,C,H,M], V=[B,NC,C,H,D], log_alpha=[B,NC,C,H] "
+            "or legacy W=[BH,NC,C,M], V=[BH,NC,C,D], log_alpha=[BH,NC,C]. "
+            f"Got W={tuple(W.shape)}, V={tuple(V.shape)}, log_alpha={tuple(log_alpha.shape)}."
+        )
 
-    M = W.shape[-1]
-    D = V.shape[-1]
+    BH = B * H
     _require_supported_md(M, D, where="_ssd_rank1_chunk_end_state_forward_impl")
     _require_chunk_size_multiple_of_16(C, where="_ssd_rank1_chunk_end_state_forward_impl")
     BLOCK_T = _select_largest_block_size(
@@ -1265,12 +1260,12 @@ def _ssd_rank1_chunk_end_state_forward_impl(
     )
     _require_nc_descriptor_width(NC, where="_ssd_rank1_chunk_end_state_forward_impl")
     _require_phase1_block_t(BLOCK_T, C, where="_ssd_rank1_chunk_end_state_forward_impl")
-    _require_nonpositive_log_alpha(log_alpha, where="_ssd_rank1_chunk_end_state_forward_impl")
-    if not W.is_cuda:
+    _require_nonpositive_log_alpha(log_alpha_4d, where="_ssd_rank1_chunk_end_state_forward_impl")
+    if not W_5d.is_cuda:
             raise NotImplementedError("_ssd_rank1_chunk_end_state_forward_impl requires CUDA tensors.")
     _ensure_triton_allocator()
 
-    s_local_end_md = torch.empty((BH, NC, M, D), device=W.device, dtype=torch.float32)
+    s_local_end_md = torch.empty((BH, NC, M, D), device=W_5d.device, dtype=torch.float32)
     BLOCK_M = _select_largest_block_size(
         M,
         _SUPPORTED_BLOCK_X_VALUES,
@@ -1291,25 +1286,27 @@ def _ssd_rank1_chunk_end_state_forward_impl(
     )
     grid = (BH * NC, M // BLOCK_M, D // BLOCK_D)
     ssd_rank1_chunk_end_state_fwd_kernel[grid](
-        W,
-        V,
-        log_alpha,
+        W_5d,
+        V_5d,
+        log_alpha_4d,
         s_local_end_md,
+        B,
+        H,
         BH,
         NC,
         C,
         M,
         D,
-        *W.stride(),
-        *V.stride(),
-        *log_alpha.stride(),
+        *W_5d.stride(),
+        *V_5d.stride(),
+        *log_alpha_4d.stride(),
         *s_local_end_md.stride(),
         BLOCK_M=BLOCK_M,
         BLOCK_D=BLOCK_D,
         BLOCK_T=BLOCK_T,
         BLOCK_C=C,
         C_STATIC=C,
-        INPUT_PRECISION="ieee" if W.dtype == torch.float32 else "tf32",
+        INPUT_PRECISION="ieee" if W_5d.dtype == torch.float32 else "tf32",
     )
     return s_local_end_md.reshape(BH, NC, M * D)
 
@@ -1968,38 +1965,44 @@ def ssd_rank1_dense_output_fwd_kernel(
     S0_ptr,
     out_y_ptr,
     out_y_off_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    d_size,
-    stride_c_bh,
-    stride_c_nc,
-    stride_c_c,
-    stride_c_m,
-    stride_w_bh,
-    stride_w_nc,
-    stride_w_c,
-    stride_w_m,
-    stride_v_bh,
-    stride_v_nc,
-    stride_v_c,
-    stride_v_d,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_s0_bh,
-    stride_s0_nc,
-    stride_s0_m,
-    stride_s0_d,
-    stride_out_y_bh,
-    stride_out_y_nc,
-    stride_out_y_c,
-    stride_out_y_d,
-    stride_out_y_off_bh,
-    stride_out_y_off_nc,
-    stride_out_y_off_c,
-    stride_out_y_off_d,
+    b_size: tl.constexpr,
+    h_size: tl.constexpr,
+    bh_size: tl.constexpr,
+    nc_size: tl.constexpr,
+    c_size: tl.constexpr,
+    m_size: tl.constexpr,
+    d_size: tl.constexpr,
+    stride_c_b: tl.constexpr,
+    stride_c_nc: tl.constexpr,
+    stride_c_c: tl.constexpr,
+    stride_c_h: tl.constexpr,
+    stride_c_m: tl.constexpr,
+    stride_w_b: tl.constexpr,
+    stride_w_nc: tl.constexpr,
+    stride_w_c: tl.constexpr,
+    stride_w_h: tl.constexpr,
+    stride_w_m: tl.constexpr,
+    stride_v_b: tl.constexpr,
+    stride_v_nc: tl.constexpr,
+    stride_v_c: tl.constexpr,
+    stride_v_h: tl.constexpr,
+    stride_v_d: tl.constexpr,
+    stride_r_b: tl.constexpr,
+    stride_r_nc: tl.constexpr,
+    stride_r_c: tl.constexpr,
+    stride_r_h: tl.constexpr,
+    stride_s0_bh: tl.constexpr,
+    stride_s0_nc: tl.constexpr,
+    stride_s0_m: tl.constexpr,
+    stride_s0_d: tl.constexpr,
+    stride_out_y_bh: tl.constexpr,
+    stride_out_y_nc: tl.constexpr,
+    stride_out_y_c: tl.constexpr,
+    stride_out_y_d: tl.constexpr,
+    stride_out_y_off_bh: tl.constexpr,
+    stride_out_y_off_nc: tl.constexpr,
+    stride_out_y_off_c: tl.constexpr,
+    stride_out_y_off_d: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -2029,30 +2032,26 @@ def ssd_rank1_dense_output_fwd_kernel(
 
     BH_IDX = pid_bhnc // nc_size
     NC_IDX = pid_bhnc % nc_size
+    B_IDX = BH_IDX // h_size
+    H_IDX = BH_IDX % h_size
 
     c_desc = tl.make_tensor_descriptor(
         C_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_c_bh, stride_c_nc, stride_c_c, stride_c_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
+        shape=[b_size, nc_size, c_size, h_size, m_size],
+        strides=[stride_c_b, stride_c_nc, stride_c_c, stride_c_h, stride_c_m],
+        block_shape=[1, 1, BLOCK_C, 1, BLOCK_M],
     )
     w_desc = tl.make_tensor_descriptor(
         W_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_w_bh, stride_w_nc, stride_w_c, stride_w_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
+        shape=[b_size, nc_size, c_size, h_size, m_size],
+        strides=[stride_w_b, stride_w_nc, stride_w_c, stride_w_h, stride_w_m],
+        block_shape=[1, 1, BLOCK_C, 1, BLOCK_M],
     )
     v_desc = tl.make_tensor_descriptor(
         V_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_v_bh, stride_v_nc, stride_v_c, stride_v_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
+        shape=[b_size, nc_size, c_size, h_size, d_size],
+        strides=[stride_v_b, stride_v_nc, stride_v_c, stride_v_h, stride_v_d],
+        block_shape=[1, 1, BLOCK_C, 1, BLOCK_D],
     )
     s0_desc = tl.make_tensor_descriptor(
         S0_ptr,
@@ -2070,7 +2069,8 @@ def ssd_rank1_dense_output_fwd_kernel(
     offs_c = tl.arange(0, BLOCK_C)
 
     # Step 1: build dense causal factor matrix L[t, tau] in log space.
-    log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
+    r_base = B_IDX * stride_r_b + NC_IDX * stride_r_nc + H_IDX * stride_r_h
+    log_alpha_vals = tl.load(log_alpha_ptr + r_base + offs_c * stride_r_c).to(tl.float32)
     log_p_incl = tl.cumsum(log_alpha_vals, axis=0)
     row_idx = offs_c[:, None]
     col_idx = offs_c[None, :]
@@ -2085,8 +2085,8 @@ def ssd_rank1_dense_output_fwd_kernel(
     R = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
-        C = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        W = tl.reshape(w_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+        C = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+        W = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
         R += tl.dot(C, tl.trans(W), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
     # Step 3: form K = L * R.
@@ -2094,7 +2094,7 @@ def ssd_rank1_dense_output_fwd_kernel(
 
     # Step 4: compute Y_diag = K @ V in FP32.
     d_start = pid_d_tile * BLOCK_D
-    V_in = tl.reshape(v_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D))
+    V_in = tl.reshape(v_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
     V_f = V_in.to(tl.float32)
     Y_diag = tl.dot(K, V_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
@@ -2102,7 +2102,7 @@ def ssd_rank1_dense_output_fwd_kernel(
     Y_off_base = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
-        C_blk = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
         S0_blk = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
         Y_off_base += tl.dot(C_blk, S0_blk, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     p = tl.exp2(log_p_incl * INV_LN2)
@@ -2427,53 +2427,59 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
     out_dW_ptr,
     out_dlog_ptr,
     out_dS0_ptr,
-    bh_size,
-    nc_size,
-    c_size,
-    m_size,
-    d_size,
-    stride_c_bh,
-    stride_c_nc,
-    stride_c_c,
-    stride_c_m,
-    stride_w_bh,
-    stride_w_nc,
-    stride_w_c,
-    stride_w_m,
-    stride_v_bh,
-    stride_v_nc,
-    stride_v_c,
-    stride_v_d,
-    stride_r_bh,
-    stride_r_nc,
-    stride_r_c,
-    stride_gy_bh,
-    stride_gy_nc,
-    stride_gy_c,
-    stride_gy_d,
-    stride_s0_bh,
-    stride_s0_nc,
-    stride_s0_m,
-    stride_s0_d,
-    stride_dv_bh,
-    stride_dv_nc,
-    stride_dv_c,
-    stride_dv_d,
-    stride_dc_bh,
-    stride_dc_nc,
-    stride_dc_c,
-    stride_dc_m,
-    stride_dw_bh,
-    stride_dw_nc,
-    stride_dw_c,
-    stride_dw_m,
-    stride_dlog_bh,
-    stride_dlog_nc,
-    stride_dlog_c,
-    stride_ds0_bh,
-    stride_ds0_nc,
-    stride_ds0_m,
-    stride_ds0_d,
+    b_size: tl.constexpr,
+    h_size: tl.constexpr,
+    bh_size: tl.constexpr,
+    nc_size: tl.constexpr,
+    c_size: tl.constexpr,
+    m_size: tl.constexpr,
+    d_size: tl.constexpr,
+    stride_c_b: tl.constexpr,
+    stride_c_nc: tl.constexpr,
+    stride_c_c: tl.constexpr,
+    stride_c_h: tl.constexpr,
+    stride_c_m: tl.constexpr,
+    stride_w_b: tl.constexpr,
+    stride_w_nc: tl.constexpr,
+    stride_w_c: tl.constexpr,
+    stride_w_h: tl.constexpr,
+    stride_w_m: tl.constexpr,
+    stride_v_b: tl.constexpr,
+    stride_v_nc: tl.constexpr,
+    stride_v_c: tl.constexpr,
+    stride_v_h: tl.constexpr,
+    stride_v_d: tl.constexpr,
+    stride_r_b: tl.constexpr,
+    stride_r_nc: tl.constexpr,
+    stride_r_c: tl.constexpr,
+    stride_r_h: tl.constexpr,
+    stride_gy_bh: tl.constexpr,
+    stride_gy_nc: tl.constexpr,
+    stride_gy_c: tl.constexpr,
+    stride_gy_d: tl.constexpr,
+    stride_s0_bh: tl.constexpr,
+    stride_s0_nc: tl.constexpr,
+    stride_s0_m: tl.constexpr,
+    stride_s0_d: tl.constexpr,
+    stride_dv_bh: tl.constexpr,
+    stride_dv_nc: tl.constexpr,
+    stride_dv_c: tl.constexpr,
+    stride_dv_d: tl.constexpr,
+    stride_dc_bh: tl.constexpr,
+    stride_dc_nc: tl.constexpr,
+    stride_dc_c: tl.constexpr,
+    stride_dc_m: tl.constexpr,
+    stride_dw_bh: tl.constexpr,
+    stride_dw_nc: tl.constexpr,
+    stride_dw_c: tl.constexpr,
+    stride_dw_m: tl.constexpr,
+    stride_dlog_bh: tl.constexpr,
+    stride_dlog_nc: tl.constexpr,
+    stride_dlog_c: tl.constexpr,
+    stride_ds0_bh: tl.constexpr,
+    stride_ds0_nc: tl.constexpr,
+    stride_ds0_m: tl.constexpr,
+    stride_ds0_d: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -2512,30 +2518,26 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
 
     BH_IDX = pid_bhnc // nc_size
     NC_IDX = pid_bhnc % nc_size
+    B_IDX = BH_IDX // h_size
+    H_IDX = BH_IDX % h_size
 
     c_desc = tl.make_tensor_descriptor(
         C_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_c_bh, stride_c_nc, stride_c_c, stride_c_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
+        shape=[b_size, nc_size, c_size, h_size, m_size],
+        strides=[stride_c_b, stride_c_nc, stride_c_c, stride_c_h, stride_c_m],
+        block_shape=[1, 1, BLOCK_C, 1, BLOCK_M],
     )
     w_desc = tl.make_tensor_descriptor(
         W_ptr,
-        shape=[bh_size, nc_size, c_size, m_size],
-        strides=[stride_w_bh, stride_w_nc, stride_w_c, stride_w_m],
-        block_shape=[1, 1, BLOCK_C, BLOCK_M],
+        shape=[b_size, nc_size, c_size, h_size, m_size],
+        strides=[stride_w_b, stride_w_nc, stride_w_c, stride_w_h, stride_w_m],
+        block_shape=[1, 1, BLOCK_C, 1, BLOCK_M],
     )
     v_desc = tl.make_tensor_descriptor(
         V_ptr,
-        shape=[bh_size, nc_size, c_size, d_size],
-        strides=[stride_v_bh, stride_v_nc, stride_v_c, stride_v_d],
-        block_shape=[1, 1, BLOCK_C, BLOCK_D],
-    )
-    r_desc = tl.make_tensor_descriptor(
-        log_alpha_ptr,
-        shape=[bh_size, nc_size, c_size],
-        strides=[stride_r_bh, stride_r_nc, stride_r_c],
-        block_shape=[1, 1, BLOCK_C],
+        shape=[b_size, nc_size, c_size, h_size, d_size],
+        strides=[stride_v_b, stride_v_nc, stride_v_c, stride_v_h, stride_v_d],
+        block_shape=[1, 1, BLOCK_C, 1, BLOCK_D],
     )
     gy_desc = tl.make_tensor_descriptor(
         grad_y_ptr,
@@ -2582,7 +2584,8 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
 
     # ---- Step 1: Build L ----
     offs_c = tl.arange(0, BLOCK_C)
-    log_alpha_vals = tl.reshape(r_desc.load([BH_IDX, NC_IDX, 0]), (BLOCK_C,)).to(tl.float32)
+    r_base = B_IDX * stride_r_b + NC_IDX * stride_r_nc + H_IDX * stride_r_h
+    log_alpha_vals = tl.load(log_alpha_ptr + r_base + offs_c * stride_r_c).to(tl.float32)
     log_p_incl = tl.cumsum(log_alpha_vals, axis=0)
     row_idx = offs_c[:, None]
     col_idx = offs_c[None, :]
@@ -2596,8 +2599,8 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
     R = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
-        C_blk = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        W_blk = tl.reshape(w_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+        W_blk = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
         R += tl.dot(C_blk, tl.trans(W_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
 
     # ---- Step 3: K = L * R ----
@@ -2608,7 +2611,7 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
     for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
         d_start = d_blk * BLOCK_D
         G_in = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D))
-        V_in = tl.reshape(v_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D))
+        V_in = tl.reshape(v_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
         G = G_in.to(tl.float32)
         V_f = V_in.to(tl.float32)
 
@@ -2623,8 +2626,8 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
     # ---- Step 7 & 8: dC_diag and dW per M-tile ----
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
-        W_in = tl.reshape(w_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M))
-        C_in = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M))
+        W_in = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        C_in = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         W_tile = W_in.to(tl.float32)
         C_tile = C_in.to(tl.float32)
 
@@ -2650,7 +2653,7 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
         for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
             m_start = m_blk * BLOCK_M
             dC_off = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
-            C_tile = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+            C_tile = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
             for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
                 d_start = d_blk * BLOCK_D
                 G_tile = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
@@ -2662,7 +2665,7 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
                 dS0_tile = tl.dot(tl.trans(C_tile), dB_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
                 ds0_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(dS0_tile, (1, 1, BLOCK_M, BLOCK_D)))
 
-            c_probe = tl.reshape(c_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M))
+            c_probe = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             dc_prev = tl.reshape(dc_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
             dc_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape((dc_prev + dC_off).to(c_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
 
@@ -3117,51 +3120,68 @@ def _ssd_rank1_dense_output_forward_impl(
     INPUT_PRECISION: str = "tf32",
     RETURN_Y_OFF: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    if C.ndim != 4 or W.ndim != 4 or V.ndim != 4 or log_alpha.ndim != 3:
-        raise ValueError(
-            "_ssd_rank1_dense_output_forward_impl expects C=[BH,NC,C,M], "
-            "W=[BH,NC,C,M], V=[BH,NC,C,D], log_alpha=[BH,NC,C]. "
-            f"Got C={tuple(C.shape)}, W={tuple(W.shape)}, "
-            f"V={tuple(V.shape)}, log_alpha={tuple(log_alpha.shape)}."
-        )
-    BH, NC, C_CHUNK, M = C.shape
-    if W.shape != (BH, NC, C_CHUNK, M):
-        raise ValueError(f"W must be [BH,NC,C,M]={BH, NC, C_CHUNK, M}; got {tuple(W.shape)}.")
-    if V.shape[:3] != (BH, NC, C_CHUNK):
-        raise ValueError(f"V must match [BH,NC,C,*]={BH, NC, C_CHUNK}; got {tuple(V.shape)}.")
-    D = V.shape[-1]
-    if log_alpha.shape != (BH, NC, C_CHUNK):
-        raise ValueError(f"log_alpha must be [BH,NC,C]={BH, NC, C_CHUNK}; got {tuple(log_alpha.shape)}.")
     if C.device != W.device or C.device != V.device or C.device != log_alpha.device:
         raise ValueError("C, W, V, log_alpha must be on the same device.")
     if C.dtype != W.dtype or C.dtype != V.dtype or C.dtype != log_alpha.dtype:
         raise ValueError("C, W, V, log_alpha must share dtype.")
+    if C.ndim == 5 and W.ndim == 5 and V.ndim == 5 and log_alpha.ndim == 4:
+        B, NC, C_CHUNK, H, M = C.shape
+        if W.shape != (B, NC, C_CHUNK, H, M):
+            raise ValueError(f"W must be [B,NC,C,H,M]={B, NC, C_CHUNK, H, M}; got {tuple(W.shape)}.")
+        if V.shape[:4] != (B, NC, C_CHUNK, H):
+            raise ValueError(f"V must match [B,NC,C,H,*]={B, NC, C_CHUNK, H}; got {tuple(V.shape)}.")
+        D = V.shape[-1]
+        if log_alpha.shape != (B, NC, C_CHUNK, H):
+            raise ValueError(f"log_alpha must be [B,NC,C,H]={B, NC, C_CHUNK, H}; got {tuple(log_alpha.shape)}.")
+        C_5d, W_5d, V_5d, log_alpha_4d = C, W, V, log_alpha
+    elif C.ndim == 4 and W.ndim == 4 and V.ndim == 4 and log_alpha.ndim == 3:
+        BH, NC, C_CHUNK, M = C.shape
+        if W.shape != (BH, NC, C_CHUNK, M):
+            raise ValueError(f"W must be [BH,NC,C,M]={BH, NC, C_CHUNK, M}; got {tuple(W.shape)}.")
+        if V.shape[:3] != (BH, NC, C_CHUNK):
+            raise ValueError(f"V must match [BH,NC,C,*]={BH, NC, C_CHUNK}; got {tuple(V.shape)}.")
+        D = V.shape[-1]
+        if log_alpha.shape != (BH, NC, C_CHUNK):
+            raise ValueError(f"log_alpha must be [BH,NC,C]={BH, NC, C_CHUNK}; got {tuple(log_alpha.shape)}.")
+        B, H = BH, 1
+        C_5d = C.unsqueeze(3)
+        W_5d = W.unsqueeze(3)
+        V_5d = V.unsqueeze(3)
+        log_alpha_4d = log_alpha.unsqueeze(3)
+    else:
+        raise ValueError(
+            "_ssd_rank1_dense_output_forward_impl expects either "
+            "C/W=[B,NC,C,H,M], V=[B,NC,C,H,D], log_alpha=[B,NC,C,H] "
+            "or legacy C/W=[BH,NC,C,M], V=[BH,NC,C,D], log_alpha=[BH,NC,C]. "
+            f"Got C={tuple(C.shape)}, W={tuple(W.shape)}, V={tuple(V.shape)}, log_alpha={tuple(log_alpha.shape)}."
+        )
+    BH = B * H
     _require_supported_md(M, D, where="_ssd_rank1_dense_output_forward_impl")
     _require_chunk_size_multiple_of_16(C_CHUNK, where="_ssd_rank1_dense_output_forward_impl")
-    _require_nonpositive_log_alpha(log_alpha, where="_ssd_rank1_dense_output_forward_impl")
-    if not C.is_cuda:
+    _require_nonpositive_log_alpha(log_alpha_4d, where="_ssd_rank1_dense_output_forward_impl")
+    if not C_5d.is_cuda:
         raise NotImplementedError("_ssd_rank1_dense_output_forward_impl requires CUDA tensors.")
     _ensure_triton_allocator()
 
     if S0 is None:
-        S0_md = torch.zeros((BH, NC, M, D), device=C.device, dtype=C.dtype)
+        S0_md = torch.zeros((BH, NC, M, D), device=C_5d.device, dtype=C_5d.dtype)
     else:
         if S0.ndim == 3 and S0.shape == (BH, NC, M * D):
             S0_md = S0.reshape(BH, NC, M, D)
-            if S0.dtype != C.dtype:
-                S0_md = S0_md.to(C.dtype)
+            if S0.dtype != C_5d.dtype:
+                S0_md = S0_md.to(C_5d.dtype)
         elif S0.ndim == 4 and S0.shape == (BH, NC, M, D):
-            S0_md = S0 if S0.dtype == C.dtype else S0.to(C.dtype)
+            S0_md = S0 if S0.dtype == C_5d.dtype else S0.to(C_5d.dtype)
         else:
             raise ValueError(
                 f"S0 must be [BH,NC,MD]=({BH},{NC},{M * D}) or [BH,NC,M,D]=({BH},{NC},{M},{D}); "
                 f"got {tuple(S0.shape)}."
             )
-        if S0_md.device != C.device:
+        if S0_md.device != C_5d.device:
             raise ValueError("S0 must be on the same device as C/W/V/log_alpha.")
 
-    out = torch.empty((BH, NC, C_CHUNK, D), device=C.device, dtype=C.dtype)
-    y_off_saved = torch.empty((BH, NC, C_CHUNK, D), device=C.device, dtype=C.dtype) if RETURN_Y_OFF else out
+    out = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
+    y_off_saved = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype) if RETURN_Y_OFF else out
     phase3_fwd_cfg = _select_phase3_forward_launch_config(
         BH=BH,
         NC=NC,
@@ -3172,22 +3192,24 @@ def _ssd_rank1_dense_output_forward_impl(
     )
     grid = (BH * NC, D // phase3_fwd_cfg.block_d)
     ssd_rank1_dense_output_fwd_kernel[grid](
-        C,
-        W,
-        V,
-        log_alpha,
+        C_5d,
+        W_5d,
+        V_5d,
+        log_alpha_4d,
         S0_md,
         out,
         y_off_saved,
+        B,
+        H,
         BH,
         NC,
         C_CHUNK,
         M,
         D,
-        *C.stride(),
-        *W.stride(),
-        *V.stride(),
-        *log_alpha.stride(),
+        *C_5d.stride(),
+        *W_5d.stride(),
+        *V_5d.stride(),
+        *log_alpha_4d.stride(),
         *S0_md.stride(),
         *out.stride(),
         *y_off_saved.stride(),
@@ -3240,18 +3262,53 @@ def _ssd_rank1_dense_output_backward_impl(
       - `dC`, `dW`, `dV`, `dlog_alpha`
       - `dS0` (used by phase-2 backward), optionally kept in fp32.
     """
-    BH, NC, C_CHUNK, M = C.shape
-    D = V.shape[-1]
+    if C.ndim == 5 and W.ndim == 5 and V.ndim == 5 and log_alpha.ndim == 4:
+        B, NC, C_CHUNK, H, M = C.shape
+        if W.shape != (B, NC, C_CHUNK, H, M):
+            raise ValueError(f"W must be [B,NC,C,H,M]={B, NC, C_CHUNK, H, M}; got {tuple(W.shape)}.")
+        if V.shape[:4] != (B, NC, C_CHUNK, H):
+            raise ValueError(f"V must match [B,NC,C,H,*]={B, NC, C_CHUNK, H}; got {tuple(V.shape)}.")
+        D = V.shape[-1]
+        if log_alpha.shape != (B, NC, C_CHUNK, H):
+            raise ValueError(f"log_alpha must be [B,NC,C,H]={B, NC, C_CHUNK, H}; got {tuple(log_alpha.shape)}.")
+        C_5d, W_5d, V_5d, log_alpha_4d = C, W, V, log_alpha
+    elif C.ndim == 4 and W.ndim == 4 and V.ndim == 4 and log_alpha.ndim == 3:
+        BH, NC, C_CHUNK, M = C.shape
+        if W.shape != (BH, NC, C_CHUNK, M):
+            raise ValueError(f"W must be [BH,NC,C,M]={BH, NC, C_CHUNK, M}; got {tuple(W.shape)}.")
+        if V.shape[:3] != (BH, NC, C_CHUNK):
+            raise ValueError(f"V must match [BH,NC,C,*]={BH, NC, C_CHUNK}; got {tuple(V.shape)}.")
+        D = V.shape[-1]
+        if log_alpha.shape != (BH, NC, C_CHUNK):
+            raise ValueError(f"log_alpha must be [BH,NC,C]={BH, NC, C_CHUNK}; got {tuple(log_alpha.shape)}.")
+        B, H = BH, 1
+        C_5d = C.unsqueeze(3)
+        W_5d = W.unsqueeze(3)
+        V_5d = V.unsqueeze(3)
+        log_alpha_4d = log_alpha.unsqueeze(3)
+    else:
+        raise ValueError(
+            "_ssd_rank1_dense_output_backward_impl expects either "
+            "C/W=[B,NC,C,H,M], V=[B,NC,C,H,D], log_alpha=[B,NC,C,H] "
+            "or legacy C/W=[BH,NC,C,M], V=[BH,NC,C,D], log_alpha=[BH,NC,C]. "
+            f"Got C={tuple(C.shape)}, W={tuple(W.shape)}, V={tuple(V.shape)}, log_alpha={tuple(log_alpha.shape)}."
+        )
+    BH = B * H
     _require_supported_md(M, D, where="_ssd_rank1_dense_output_backward_impl")
 
     if grad_out is None:
-        grad_out = torch.zeros((BH, NC, C_CHUNK, D), device=C.device, dtype=C.dtype)
-    if grad_out.shape != (BH, NC, C_CHUNK, D):
+        grad_out_c = torch.zeros((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
+    elif grad_out.ndim == 4 and grad_out.shape == (BH, NC, C_CHUNK, D):
+        grad_out_c = grad_out
+    elif grad_out.ndim == 5 and grad_out.shape == (B, NC, C_CHUNK, H, D):
+        grad_out_c = grad_out.permute(0, 3, 1, 2, 4).reshape(BH, NC, C_CHUNK, D)
+    else:
         raise ValueError(
-            f"grad_out must be [BH,NC,C,D]=({BH},{NC},{C_CHUNK},{D}); got {tuple(grad_out.shape)}."
+            "grad_out must be [BH,NC,C,D] or [B,NC,C,H,D]. "
+            f"Got {tuple(grad_out.shape)} for expected BH={BH}, B={B}, H={H}, NC={NC}, C={C_CHUNK}, D={D}."
         )
     _require_chunk_size_multiple_of_16(C_CHUNK, where="_ssd_rank1_dense_output_backward_impl")
-    if not C.is_cuda:
+    if not C_5d.is_cuda:
         raise NotImplementedError("_ssd_rank1_dense_output_backward_impl requires CUDA tensors.")
     _ensure_triton_allocator()
 
@@ -3279,19 +3336,22 @@ def _ssd_rank1_dense_output_backward_impl(
             f"_ssd_rank1_dense_output_backward_impl requires M%BLOCK_M==0 and D%BLOCK_D==0; "
             f"got M={M}, D={D}, BLOCK_M={BLOCK_M}, BLOCK_D={BLOCK_D}."
         )
-    dV = torch.empty_like(V)
-    dC = torch.empty_like(C)
-    dW = torch.empty_like(W)
+    dV = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
+    dC = torch.empty((BH, NC, C_CHUNK, M), device=C_5d.device, dtype=C_5d.dtype)
+    dW = torch.empty((BH, NC, C_CHUNK, M), device=C_5d.device, dtype=C_5d.dtype)
     dlog = _ssd_rank1_bwd_workspace_tensor(
         "dlog_diag",
         (BH, NC, C_CHUNK),
-        device=C.device,
+        device=C_5d.device,
         dtype=torch.float32,
     )
-    grad_out_c = grad_out if grad_out.is_contiguous() else grad_out.contiguous()
 
     has_s0 = S0_md.numel() > 0
-    dS0 = torch.empty((BH, NC, M, D), device=C.device, dtype=torch.float32) if has_s0 else torch.empty((1, 1, 1, 1), device=C.device, dtype=torch.float32)
+    dS0 = (
+        torch.empty((BH, NC, M, D), device=C_5d.device, dtype=torch.float32)
+        if has_s0
+        else torch.empty((1, 1, 1, 1), device=C_5d.device, dtype=torch.float32)
+    )
 
     grid_fused = (BH * NC,)
     # Unified phase-3 backward:
@@ -3299,10 +3359,10 @@ def _ssd_rank1_dense_output_backward_impl(
     #   Optional off path: dC_off accumulation, dS0, dlog_off accumulation.
     phase3_bwd_num_warps = max(phase3_bwd_cfg.fused_a1a2_num_warps, phase3_bwd_cfg.fused_off_num_warps)
     ssd_rank1_dense_output_bwd_fused_kernel[grid_fused](
-        C,
-        W,
-        V,
-        log_alpha,
+        C_5d,
+        W_5d,
+        V_5d,
+        log_alpha_4d,
         grad_out_c,
         S0_md,
         dV,
@@ -3310,15 +3370,17 @@ def _ssd_rank1_dense_output_backward_impl(
         dW,
         dlog,
         dS0,
+        B,
+        H,
         BH,
         NC,
         C_CHUNK,
         M,
         D,
-        *C.stride(),
-        *W.stride(),
-        *V.stride(),
-        *log_alpha.stride(),
+        *C_5d.stride(),
+        *W_5d.stride(),
+        *V_5d.stride(),
+        *log_alpha_4d.stride(),
         *grad_out_c.stride(),
         *S0_md.stride(),
         *dV.stride(),
@@ -3341,11 +3403,11 @@ def _ssd_rank1_dense_output_backward_impl(
     if has_s0:
         dS0_out = dS0.reshape(BH, NC, M * D) if s0_was_flat else dS0
         if not return_s0_grad_fp32:
-            dS0_out = dS0_out.to(C.dtype)
+            dS0_out = dS0_out.to(C_5d.dtype)
     else:
         dS0_out = None
 
-    return dC, dW, dV, dlog.to(log_alpha.dtype), dS0_out
+    return dC, dW, dV, dlog.to(log_alpha_4d.dtype), dS0_out
 
 
 def ssd_rank1_dense_output_backward_kernel_profile(
@@ -3438,16 +3500,22 @@ def ssd_rank1_dense_output_backward_kernel_profile(
     dW = torch.empty_like(W)
     dlog = torch.empty((BH, NC, C_CHUNK), device=C.device, dtype=torch.float32)
     dS0 = torch.empty((BH, NC, M, D), device=C.device, dtype=torch.float32)
+    C_5d = C.unsqueeze(3)
+    W_5d = W.unsqueeze(3)
+    V_5d = V.unsqueeze(3)
+    log_alpha_4d = log_alpha.unsqueeze(3)
+    B = BH
+    H = 1
 
     FUSED_NUM_WARPS = max(FUSED_A1A2_NUM_WARPS, OFF_NUM_WARPS)
 
     def _run_fused():
         grid_fused = (BH * NC,)
         ssd_rank1_dense_output_bwd_fused_kernel[grid_fused](
-            C,
-            W,
-            V,
-            log_alpha,
+            C_5d,
+            W_5d,
+            V_5d,
+            log_alpha_4d,
             grad_out_c,
             S0_md,
             dV,
@@ -3455,15 +3523,17 @@ def ssd_rank1_dense_output_backward_kernel_profile(
             dW,
             dlog,
             dS0,
+            B,
+            H,
             BH,
             NC,
             C_CHUNK,
             M,
             D,
-            *C.stride(),
-            *W.stride(),
-            *V.stride(),
-            *log_alpha.stride(),
+            *C_5d.stride(),
+            *W_5d.stride(),
+            *V_5d.stride(),
+            *log_alpha_4d.stride(),
             *grad_out_c.stride(),
             *S0_md.stride(),
             *dV.stride(),
@@ -3578,7 +3648,7 @@ class SsdRank1Triton(torch.autograd.Function):
         # =========================================
         # Prefix-scan local chunk summaries to produce
         # chunk-start state S0 per chunk and final state S1 at end of sequence.
-        log_alpha_per_chunk = torch.sum(log_alpha_chunk.float(), dim=-1)
+        log_alpha_per_chunk = log_alpha_chunk.float().sum(dim=2).permute(0, 2, 1).reshape(B * H, NC_exec)
         S0_chunk, S1_chunk = _ssd_rank1_prefix_scan_forward_impl(
             S_local_end, log_alpha_per_chunk, init_flat, V_chunk.dtype,
         )
@@ -3662,7 +3732,7 @@ class SsdRank1Triton(torch.autograd.Function):
         # =========================================
         # Phase 1/2 forward replay for full-sequence backward.
         S_local_end = _ssd_rank1_chunk_end_state_forward_impl(W_chunk, V_chunk, log_alpha_chunk, 32)
-        log_alpha_per_chunk = torch.sum(log_alpha_chunk.float(), dim=-1)
+        log_alpha_per_chunk = log_alpha_chunk.float().sum(dim=2).permute(0, 2, 1).reshape(BH, NC)
         S0_chunk, _ = _ssd_rank1_prefix_scan_forward_impl(
             S_local_end, log_alpha_per_chunk, init_flat, compute_dtype,
         )
@@ -3767,6 +3837,8 @@ class SsdRank1Triton(torch.autograd.Function):
             dW_chunk,
             dV_chunk,
             dlog_chunk,
+            B,
+            H,
             BH,
             NC,
             CHUNK_SIZE,
