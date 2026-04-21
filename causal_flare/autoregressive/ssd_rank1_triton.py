@@ -379,8 +379,11 @@ def _validate_static_hot_path_contract(
             f"Static SSD rank1 path requires RETURN_FINAL_STATE={cfg.return_final_state}; got {RETURN_FINAL_STATE}."
         )
     if CHUNK_SIZE is None:
-        pass
-    elif CHUNK_SIZE != cfg.chunk_size:
+        raise ValueError(
+            "Static SSD rank1 path requires explicit CHUNK_SIZE so launch/shape constants remain fixed. "
+            f"Expected CHUNK_SIZE={cfg.chunk_size}."
+        )
+    if CHUNK_SIZE != cfg.chunk_size:
         raise ValueError(
             f"Static SSD rank1 path requires CHUNK_SIZE={cfg.chunk_size} for this shape; got CHUNK_SIZE={CHUNK_SIZE}."
         )
@@ -3738,6 +3741,17 @@ def _ssd_rank1_phase2_forward_static(
     init_dummy = ws.phase2_init_dummy
     chunk_start = ws.phase2_chunk_start
     phase2_cfg = cfg.phase2_launch
+    if cfg.input_dtype == torch.float32:
+        use_fp32_compute = True
+        use_bf16_compute = False
+    elif cfg.input_dtype == torch.bfloat16:
+        use_fp32_compute = False
+        use_bf16_compute = True
+    else:
+        raise NotImplementedError(
+            "_ssd_rank1_phase2_forward_static only supports cfg.input_dtype in {torch.float32, torch.bfloat16}; "
+            f"got {cfg.input_dtype}."
+        )
     grid = (BH,)
     ssd_rank1_prefix_scan_fwd_kernel[grid](
         S_local_end,
@@ -3758,10 +3772,10 @@ def _ssd_rank1_phase2_forward_static(
         NC_STATIC=NC,
         BLOCK_NC=cfg.phase2_block_nc,
         BLOCK_MD=phase2_cfg.block_md,
-        USE_FP32_COMPUTE=False,
-        USE_BF16_COMPUTE=True,
-        HAS_INITIAL_STATE=False,
-        RETURN_FINAL_STATE=True,
+        USE_FP32_COMPUTE=use_fp32_compute,
+        USE_BF16_COMPUTE=use_bf16_compute,
+        HAS_INITIAL_STATE=cfg.has_initial_state,
+        RETURN_FINAL_STATE=cfg.return_final_state,
         num_warps=phase2_cfg.num_warps,
         num_stages=phase2_cfg.num_stages,
     )
@@ -3934,6 +3948,17 @@ def _ssd_rank1_phase2_backward_static(
     d_log_per_chunk = ws.phase2_dlog_per_chunk
     d_init = ws.phase2_dinit
     phase2_cfg = cfg.phase2_launch
+    if cfg.input_dtype == torch.float32:
+        use_fp32_compute = True
+        use_bf16_compute = False
+    elif cfg.input_dtype == torch.bfloat16:
+        use_fp32_compute = False
+        use_bf16_compute = True
+    else:
+        raise NotImplementedError(
+            "_ssd_rank1_phase2_backward_static only supports cfg.input_dtype in {torch.float32, torch.bfloat16}; "
+            f"got {cfg.input_dtype}."
+        )
     grid = (BH,)
     ssd_rank1_prefix_scan_bwd_dense_kernel[grid](
         grad_chunk_start_f,
@@ -3958,8 +3983,8 @@ def _ssd_rank1_phase2_backward_static(
         BLOCK_NC=cfg.phase2_block_nc,
         BLOCK_MD=phase2_cfg.block_md,
         NC_STATIC=NC,
-        USE_FP32_COMPUTE=False,
-        USE_BF16_COMPUTE=True,
+        USE_FP32_COMPUTE=use_fp32_compute,
+        USE_BF16_COMPUTE=use_bf16_compute,
         HAS_GRAD_FINAL=True,
         WRITE_D_INIT=True,
         num_warps=phase2_cfg.num_warps,
