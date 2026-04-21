@@ -2,24 +2,26 @@
 
 # -----------------------------------------------------------------------------------------------
 # Phase Timing Snapshot (ms) for ssd_rank4_triton, averaged over 20 iterations (5 warmup)
-# Shape: B=32, H=32, N=2048, M=64, D=64, dtype=bf16, CHUNK_SIZE=64
+# Shape: B=32, H=32, N=2048, M=64, D=64, CHUNK_SIZE=64
+# Dtype: bf16 forward, fp32 backward (with bf16 tensor-core dot inputs)
 #
 # rank | fwd_p1 | fwd_p2 | fwd_p3 | fwd_total | bwd_p3 | bwd_p2 | bwd_p1 | bwd_total | step_total
-# 1    | 0.742  | 0.448  | 0.867  | 2.058     | 4.277  | 0.671  | 1.063  | 6.011     | 8.069
-# 2    | 1.167  | 0.452  | 1.159  | 2.778     | 6.310  | 0.679  | 2.650  | 9.638     | 12.416
-# 3    | 1.717  | 0.451  | 1.761  | 3.928     | 8.630  | 0.670  | 4.846  | 14.146    | 18.074
-# 4    | 2.173  | 0.460  | 2.957  | 5.590     | 11.364 | 0.685  | 6.815  | 18.864    | 24.454
+# 1    | 0.734  | 0.452  | 0.862  | 2.049     | 4.223  | 0.617  | 1.000  | 5.840     | 7.889
+# 2    | 1.153  | 0.444  | 1.145  | 2.742     | 6.288  | 0.616  | 2.563  | 9.467     | 12.209
+# 3    | 1.706  | 0.449  | 1.751  | 3.906     | 8.610  | 0.617  | 4.758  | 13.985    | 17.891
+# 4    | 2.142  | 0.446  | 2.933  | 5.520     | 11.343 | 0.617  | 6.740  | 18.700    | 24.220
 # -----------------------------------------------------------------------------------------------
 #
 # Global Relative Error Snapshot (L2): ||ref - test|| / ||ref||
-# Shape: B=1, H=8, N=1024, M=64, D=64, dtype=bf16, CHUNK_SIZE=64
+# Shape: B=1, H=8, N=1024, M=64, D=64, CHUNK_SIZE=64
+# Dtype: bf16 forward, fp32 backward (with bf16 tensor-core dot inputs)
 # Oracle: ssd_rank4_token_loop_oracle, Test: ssd_rank4_triton
 #
 # rank | y_rel_l2  | state_rel_l2 | grad_rel_l2_global | dlog_rel_l2
-# 1    | 0.00455429| 0.00388407   | 0.00499266         | 0.00625425
-# 2    | 0.00487035| 0.00413396   | 0.00512618         | 0.00650736
-# 3    | 0.00508103| 0.00438509   | 0.00525072         | 0.00670655
-# 4    | 0.00527060| 0.00466738   | 0.00531327         | 0.00682887
+# 1    | 0.00421742| 0.00353327   | 0.00444811         | 0.00620205
+# 2    | 0.00454906| 0.00373064   | 0.00456165         | 0.00620682
+# 3    | 0.00477912| 0.00374408   | 0.00464256         | 0.00655972
+# 4    | 0.00498050| 0.00433443   | 0.00471568         | 0.00660884
 # -----------------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -567,23 +569,6 @@ def _ssd_rank1_bwd_workspace_tensor(
     return t
 
 
-def _prefer_bf16_dot_inputs(
-    *,
-    device: torch.device,
-    input_precision: str,
-    input_dtype: torch.dtype | None = None,
-) -> bool:
-    """Use BF16 dot inputs on tensor-core path when hardware supports BF16."""
-    if input_precision == "ieee":
-        return False
-    if input_dtype is not None and input_dtype != torch.bfloat16:
-        return False
-    if device.type != "cuda":
-        return False
-    dev_index = device.index if device.index is not None else torch.cuda.current_device()
-    return bool(torch.cuda.is_bf16_supported(dev_index))
-
-
 def _require_supported_md(m_size: int, d_size: int, *, where: str) -> None:
     if m_size not in _SUPPORTED_M_VALUES:
         raise NotImplementedError(f"{where} requires M in {sorted(_SUPPORTED_M_VALUES)}; got M={m_size}.")
@@ -677,16 +662,13 @@ def _select_phase3_forward_launch_config(
     M: int,
     D: int,
     where: str,
-    use_bf16_dot_inputs: bool = False,
 ) -> _Phase3ForwardLaunchConfig:
     block_m = _select_largest_block_size(M, _SUPPORTED_BLOCK_X_VALUES, where=where, label="M")
     block_d = _select_largest_block_size(D, _SUPPORTED_BLOCK_X_VALUES, where=where, label="D")
 
     work_items = BH * NC
     if C_CHUNK == 64 and block_m == 64 and block_d == 64 and work_items >= 4096:
-        if use_bf16_dot_inputs:
-            return _Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=4, num_stages=4)
-        return _Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=2, num_stages=3)
+        return _Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=4, num_stages=4)
     if block_m >= 64 and block_d >= 64:
         return _Phase3ForwardLaunchConfig(block_m=block_m, block_d=block_d, num_warps=4, num_stages=2)
     return _Phase3ForwardLaunchConfig(block_m=block_m, block_d=block_d, num_warps=2, num_stages=2)
@@ -699,13 +681,12 @@ def _select_phase3_backward_launch_config(
     C_CHUNK: int,
     M: int,
     D: int,
-    use_bf16_dot_inputs: bool = False,
 ) -> _Phase3BackwardLaunchConfig:
     block_m = 64 if M % 64 == 0 else _select_largest_block_size(M, (32, 16), where="phase3_bwd", label="M")
     block_d = 64 if D % 64 == 0 else _select_largest_block_size(D, (32, 16), where="phase3_bwd", label="D")
 
     # Best-known setting for the common BF16 trainer shape (M=D=C=64).
-    if C_CHUNK == 64 and block_m == 64 and block_d == 64 and BH * NC >= 4096 and use_bf16_dot_inputs:
+    if C_CHUNK == 64 and block_m == 64 and block_d == 64 and BH * NC >= 4096:
         return _Phase3BackwardLaunchConfig(
             block_m=64,
             block_d=64,
@@ -734,9 +715,8 @@ def _select_phase1_backward_launch_config(
     *,
     M: int,
     D: int,
-    use_bf16_dot_inputs: bool = False,
 ) -> _Phase1BackwardLaunchConfig:
-    if use_bf16_dot_inputs and M == 64 and D == 64:
+    if M == 64 and D == 64:
         return _Phase1BackwardLaunchConfig(num_warps=4, num_stages=3)
     if M >= 128 or D >= 128:
         return _Phase1BackwardLaunchConfig(num_warps=4, num_stages=2)
@@ -1647,7 +1627,6 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
     BLOCK_C: tl.constexpr,
     C_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    USE_BF16_DOT_INPUTS: tl.constexpr,
 ):
     """Phase-1 Triton forward for factorized writes.
 
@@ -1680,7 +1659,7 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
     Notes:
     - `BLOCK_C` is padded to next power-of-two so token-lane vector ops are legal.
     - Masked token loads use `other=1.0` so padded lanes are multiplicative identity.
-    - Internal accumulation is FP32 for stability across fp16/bf16/fp32 inputs.
+    - Internal accumulation is FP32 for stability.
     """
     pid_bhnc = tl.program_id(0)
     pid_m_tile = tl.program_id(1)
@@ -1695,9 +1674,6 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
 
     m_start = pid_m_tile * BLOCK_M
     d_start = pid_d_tile * BLOCK_D
-    offs_m = pid_m_tile * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = pid_d_tile * BLOCK_D + tl.arange(0, BLOCK_D)
-
     w_desc = tl.make_tensor_descriptor(
         W_ptr,
         shape=[b_size, nc_size, c_size, h_size, m_size],
@@ -1737,20 +1713,13 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
         sqrt_factors = tl.sqrt(factors)[:, None]
         A_f32 = sqrt_factors * W_blk.to(tl.float32)
         B_f32 = sqrt_factors * V_blk.to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            # A^T @ B reproduces sum_t factor[t] * outer(W_t, V_t).
-            S += tl.dot(
-                tl.trans(A_f32.to(tl.bfloat16)),
-                B_f32.to(tl.bfloat16),
-                out_dtype=tl.float32,
-                input_precision=INPUT_PRECISION,
-            )
-        else:
-            # Keep fp32-accumulate path unchanged for IEEE fp32.
-            A = A_f32.to(W_blk.dtype)
-            B = B_f32.to(V_blk.dtype)
-            S += tl.dot(tl.trans(A), B, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+        # A^T @ B reproduces sum_t factor[t] * outer(W_t, V_t).
+        S += tl.dot(
+            tl.trans(A_f32.to(tl.bfloat16)),
+            B_f32.to(tl.bfloat16),
+            out_dtype=tl.float32,
+            input_precision=INPUT_PRECISION,
+        )
     out_s_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(S, (1, 1, BLOCK_M, BLOCK_D)))
 
     # alpha_chunk belongs to phase-1 scope but is computed outside this kernel.
@@ -1808,7 +1777,6 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
     M_STATIC: tl.constexpr,
     D_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    USE_BF16_DOT_INPUTS: tl.constexpr,
     ACCUMULATE: tl.constexpr,
 ):
     """Phase-1 backward fused kernel for dW, dV, and dlog_alpha per `(BH,NC)` chunk."""
@@ -1874,17 +1842,14 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
             d_start = d_blk * BLOCK_D
             g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
             v_tile = tl.reshape(v_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                g_tile_tc = g_tile.to(tl.bfloat16)
-                v_tile_tc = v_tile.to(tl.bfloat16)
-                acc += tl.dot(
-                    v_tile_tc,
-                    tl.trans(g_tile_tc),
-                    out_dtype=tl.float32,
-                    input_precision=INPUT_PRECISION,
-                )
-            else:
-                acc += tl.dot(v_tile, tl.trans(g_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            g_tile_tc = g_tile.to(tl.bfloat16)
+            v_tile_tc = v_tile.to(tl.bfloat16)
+            acc += tl.dot(
+                v_tile_tc,
+                tl.trans(g_tile_tc),
+                out_dtype=tl.float32,
+                input_precision=INPUT_PRECISION,
+            )
         dW_tile = factors[:, None] * acc
         w_dtype_probe = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         if ACCUMULATE:
@@ -1901,18 +1866,14 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
             m_start = m_blk * BLOCK_M
             g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
             w_tile = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                g_tile_tc = g_tile.to(tl.bfloat16)
-                w_tile_tc = w_tile.to(tl.bfloat16)
-                acc += tl.dot(
-                    w_tile_tc,
-                    g_tile_tc,
-                    out_dtype=tl.float32,
-                    input_precision=INPUT_PRECISION,
-                )
-            else:
-                acc += tl.dot(w_tile, g_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+            g_tile_tc = g_tile.to(tl.bfloat16)
+            w_tile_tc = w_tile.to(tl.bfloat16)
+            acc += tl.dot(
+                w_tile_tc,
+                g_tile_tc,
+                out_dtype=tl.float32,
+                input_precision=INPUT_PRECISION,
+            )
         dV_tile = factors[:, None] * acc
         v_dtype_probe = tl.reshape(v_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
         if ACCUMULATE:
@@ -1974,7 +1935,6 @@ def ssd_rank4_chunk_end_state_fwd_kernel(
     BLOCK_C: tl.constexpr,
     C_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    USE_BF16_DOT_INPUTS: tl.constexpr,
     HAS_RANK2: tl.constexpr,
     HAS_RANK3: tl.constexpr,
     HAS_RANK4: tl.constexpr,
@@ -2071,81 +2031,45 @@ def ssd_rank4_chunk_end_state_fwd_kernel(
         V1_blk = tl.reshape(v1_desc.load([B_IDX, NC_IDX, t_start, H_IDX, d_start]), (BLOCK_T, BLOCK_D))
         A1_f32 = sqrt_factors * W1_blk.to(tl.float32)
         B1_f32 = sqrt_factors * V1_blk.to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            S += tl.dot(
-                tl.trans(A1_f32.to(tl.bfloat16)),
-                B1_f32.to(tl.bfloat16),
-                out_dtype=tl.float32,
-                input_precision=INPUT_PRECISION,
-            )
-        else:
-            S += tl.dot(
-                tl.trans(A1_f32.to(W1_blk.dtype)),
-                B1_f32.to(V1_blk.dtype),
-                out_dtype=tl.float32,
-                input_precision=INPUT_PRECISION,
-            )
-
+        S += tl.dot(
+            tl.trans(A1_f32.to(tl.bfloat16)),
+            B1_f32.to(tl.bfloat16),
+            out_dtype=tl.float32,
+            input_precision=INPUT_PRECISION,
+        )
         if HAS_RANK2:
             W2_blk = tl.reshape(w2_desc.load([B_IDX, NC_IDX, t_start, H_IDX, m_start]), (BLOCK_T, BLOCK_M))
             V2_blk = tl.reshape(v2_desc.load([B_IDX, NC_IDX, t_start, H_IDX, d_start]), (BLOCK_T, BLOCK_D))
             A2_f32 = sqrt_factors * W2_blk.to(tl.float32)
             B2_f32 = sqrt_factors * V2_blk.to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                S += tl.dot(
-                    tl.trans(A2_f32.to(tl.bfloat16)),
-                    B2_f32.to(tl.bfloat16),
-                    out_dtype=tl.float32,
-                    input_precision=INPUT_PRECISION,
-                )
-            else:
-                S += tl.dot(
-                    tl.trans(A2_f32.to(W2_blk.dtype)),
-                    B2_f32.to(V2_blk.dtype),
-                    out_dtype=tl.float32,
-                    input_precision=INPUT_PRECISION,
-                )
-
+            S += tl.dot(
+                tl.trans(A2_f32.to(tl.bfloat16)),
+                B2_f32.to(tl.bfloat16),
+                out_dtype=tl.float32,
+                input_precision=INPUT_PRECISION,
+            )
         if HAS_RANK3:
             W3_blk = tl.reshape(w3_desc.load([B_IDX, NC_IDX, t_start, H_IDX, m_start]), (BLOCK_T, BLOCK_M))
             V3_blk = tl.reshape(v3_desc.load([B_IDX, NC_IDX, t_start, H_IDX, d_start]), (BLOCK_T, BLOCK_D))
             A3_f32 = sqrt_factors * W3_blk.to(tl.float32)
             B3_f32 = sqrt_factors * V3_blk.to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                S += tl.dot(
-                    tl.trans(A3_f32.to(tl.bfloat16)),
-                    B3_f32.to(tl.bfloat16),
-                    out_dtype=tl.float32,
-                    input_precision=INPUT_PRECISION,
-                )
-            else:
-                S += tl.dot(
-                    tl.trans(A3_f32.to(W3_blk.dtype)),
-                    B3_f32.to(V3_blk.dtype),
-                    out_dtype=tl.float32,
-                    input_precision=INPUT_PRECISION,
-                )
-
+            S += tl.dot(
+                tl.trans(A3_f32.to(tl.bfloat16)),
+                B3_f32.to(tl.bfloat16),
+                out_dtype=tl.float32,
+                input_precision=INPUT_PRECISION,
+            )
         if HAS_RANK4:
             W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, t_start, H_IDX, m_start]), (BLOCK_T, BLOCK_M))
             V4_blk = tl.reshape(v4_desc.load([B_IDX, NC_IDX, t_start, H_IDX, d_start]), (BLOCK_T, BLOCK_D))
             A4_f32 = sqrt_factors * W4_blk.to(tl.float32)
             B4_f32 = sqrt_factors * V4_blk.to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                S += tl.dot(
-                    tl.trans(A4_f32.to(tl.bfloat16)),
-                    B4_f32.to(tl.bfloat16),
-                    out_dtype=tl.float32,
-                    input_precision=INPUT_PRECISION,
-                )
-            else:
-                S += tl.dot(
-                    tl.trans(A4_f32.to(W4_blk.dtype)),
-                    B4_f32.to(V4_blk.dtype),
-                    out_dtype=tl.float32,
-                    input_precision=INPUT_PRECISION,
-                )
-
+            S += tl.dot(
+                tl.trans(A4_f32.to(tl.bfloat16)),
+                B4_f32.to(tl.bfloat16),
+                out_dtype=tl.float32,
+                input_precision=INPUT_PRECISION,
+            )
     out_s_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(S, (1, 1, BLOCK_M, BLOCK_D)))
 
 
@@ -2213,7 +2137,6 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
     M_STATIC: tl.constexpr,
     D_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    USE_BF16_DOT_INPUTS: tl.constexpr,
     ACCUMULATE: tl.constexpr,
     HAS_RANK2: tl.constexpr,
     HAS_RANK3: tl.constexpr,
@@ -2356,32 +2279,18 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
         for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
             d_start = d_blk * BLOCK_D
             g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                g_tile_tc = g_tile.to(tl.bfloat16)
-                v1_tile = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                acc1 += tl.dot(v1_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK2:
-                    v2_tile = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                    acc2 += tl.dot(v2_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK3:
-                    v3_tile = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                    acc3 += tl.dot(v3_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK4:
-                    v4_tile = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                    acc4 += tl.dot(v4_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            else:
-                v1_tile = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                acc1 += tl.dot(v1_tile, tl.trans(g_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK2:
-                    v2_tile = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                    acc2 += tl.dot(v2_tile, tl.trans(g_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK3:
-                    v3_tile = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                    acc3 += tl.dot(v3_tile, tl.trans(g_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK4:
-                    v4_tile = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                    acc4 += tl.dot(v4_tile, tl.trans(g_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+            g_tile_tc = g_tile.to(tl.bfloat16)
+            v1_tile = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
+            acc1 += tl.dot(v1_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if HAS_RANK2:
+                v2_tile = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
+                acc2 += tl.dot(v2_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if HAS_RANK3:
+                v3_tile = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
+                acc3 += tl.dot(v3_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if HAS_RANK4:
+                v4_tile = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
+                acc4 += tl.dot(v4_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dW1_tile = factors[:, None] * acc1
         w1_probe = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         if ACCUMULATE:
@@ -2419,32 +2328,18 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
         for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
             m_start = m_blk * BLOCK_M
             g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                g_tile_tc = g_tile.to(tl.bfloat16)
-                w1_tile = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                acc1 += tl.dot(w1_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK2:
-                    w2_tile = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                    acc2 += tl.dot(w2_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK3:
-                    w3_tile = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                    acc3 += tl.dot(w3_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK4:
-                    w4_tile = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                    acc4 += tl.dot(w4_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            else:
-                w1_tile = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                acc1 += tl.dot(w1_tile, g_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK2:
-                    w2_tile = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                    acc2 += tl.dot(w2_tile, g_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK3:
-                    w3_tile = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                    acc3 += tl.dot(w3_tile, g_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                if HAS_RANK4:
-                    w4_tile = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                    acc4 += tl.dot(w4_tile, g_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+            g_tile_tc = g_tile.to(tl.bfloat16)
+            w1_tile = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+            acc1 += tl.dot(w1_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if HAS_RANK2:
+                w2_tile = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+                acc2 += tl.dot(w2_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if HAS_RANK3:
+                w3_tile = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+                acc3 += tl.dot(w3_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if HAS_RANK4:
+                w4_tile = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+                acc4 += tl.dot(w4_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dV1_tile = factors[:, None] * acc1
         v1_probe = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
         if ACCUMULATE:
@@ -2595,11 +2490,6 @@ def _ssd_rank1_chunk_end_state_forward_impl(
         BLOCK_C=C,
         C_STATIC=C,
         INPUT_PRECISION="ieee" if W_5d.dtype == torch.float32 else "tf32",
-        USE_BF16_DOT_INPUTS=_prefer_bf16_dot_inputs(
-            device=W_5d.device,
-            input_precision=("ieee" if W_5d.dtype == torch.float32 else "tf32"),
-            input_dtype=W_5d.dtype,
-        ),
     )
     return s_local_end_md.reshape(BH, NC, M * D)
 
@@ -2636,7 +2526,6 @@ def ssd_rank1_prefix_scan_fwd_kernel(
     BLOCK_MD: tl.constexpr,
     NC_STATIC: tl.constexpr,
     USE_FP32_COMPUTE: tl.constexpr,
-    USE_BF16_COMPUTE: tl.constexpr,
     HAS_INITIAL_STATE: tl.constexpr,
     RETURN_FINAL_STATE: tl.constexpr,
 ):
@@ -2713,10 +2602,7 @@ def ssd_rank1_prefix_scan_fwd_kernel(
         if USE_FP32_COMPUTE:
             l0_tc = l0_f32
         else:
-            if USE_BF16_COMPUTE:
-                l0_tc = l0_f32.to(tl.bfloat16)
-            else:
-                l0_tc = l0_f32.to(tl.float16)
+            l0_tc = l0_f32.to(tl.bfloat16)
 
         md0 = 0
         while md0 < md_size:
@@ -2732,10 +2618,7 @@ def ssd_rank1_prefix_scan_fwd_kernel(
             if USE_FP32_COMPUTE:
                 y0 = tl.dot(l0_tc, s_tile_f32, out_dtype=tl.float32, input_precision="ieee")
             else:
-                if USE_BF16_COMPUTE:
-                    s_tile_tc = s_tile_f32.to(tl.bfloat16)
-                else:
-                    s_tile_tc = s_tile_f32.to(tl.float16)
+                s_tile_tc = s_tile_f32.to(tl.bfloat16)
                 y0 = tl.dot(l0_tc, s_tile_tc, out_dtype=tl.float32, input_precision="tf32")
 
             acc = y0 + tl.expand_dims(p, axis=1) * tl.expand_dims(S_in, axis=0)
@@ -2786,7 +2669,6 @@ def ssd_rank1_prefix_scan_bwd_dense_kernel(
     BLOCK_NC: tl.constexpr,
     NC_STATIC: tl.constexpr,
     USE_FP32_COMPUTE: tl.constexpr,
-    USE_BF16_COMPUTE: tl.constexpr,
     HAS_GRAD_FINAL: tl.constexpr,
     WRITE_D_INIT: tl.constexpr,
 ):
@@ -2972,10 +2854,10 @@ def _ssd_rank1_prefix_scan_forward_impl(
 
     if compute_dtype is None:
         compute_dtype = torch.float32
-    if compute_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+    if compute_dtype not in (torch.bfloat16, torch.float32):
         raise NotImplementedError(
             "_ssd_rank1_prefix_scan_forward_impl supports compute_dtype in "
-            "{torch.float16, torch.bfloat16, torch.float32}. "
+            "{torch.bfloat16, torch.float32}. "
             f"Got compute_dtype={compute_dtype}."
         )
 
@@ -2997,7 +2879,8 @@ def _ssd_rank1_prefix_scan_forward_impl(
 
     block_nc = _select_phase2_block_nc(NC=NC)
     phase2_cfg = _select_phase2_launch_config(MD=MD, NC=NC, where="_ssd_rank1_prefix_scan_forward_impl")
-    grid_fwd = lambda META: (BH,)
+    def grid_fwd(_meta):
+        return (BH,)
     ssd_rank1_prefix_scan_fwd_kernel[grid_fwd](
         S_local_end_in,
         log_alpha_chunk_f,
@@ -3018,7 +2901,6 @@ def _ssd_rank1_prefix_scan_forward_impl(
         BLOCK_NC=block_nc,
         BLOCK_MD=phase2_cfg.block_md,
         USE_FP32_COMPUTE=(compute_dtype == torch.float32),
-        USE_BF16_COMPUTE=(compute_dtype == torch.bfloat16),
         HAS_INITIAL_STATE=has_initial_state,
         RETURN_FINAL_STATE=return_final_state,
         num_warps=phase2_cfg.num_warps,
@@ -3328,7 +3210,6 @@ def ssd_rank1_dense_output_fwd_kernel(
     C_STATIC: tl.constexpr,
     M_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    USE_BF16_DOT_INPUTS: tl.constexpr,
     WRITE_Y_OFF: tl.constexpr,
 ):
     """Phase-3 Triton forward following the dense CxC reference structure.
@@ -3405,56 +3286,44 @@ def ssd_rank1_dense_output_fwd_kernel(
     R = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
-        C = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        W = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            C_tc = C.to(tl.bfloat16)
-            W_tc = W.to(tl.bfloat16)
-            R += tl.dot(
-                C_tc,
-                tl.trans(W_tc),
-                out_dtype=tl.float32,
-                input_precision=INPUT_PRECISION,
-            )
-        else:
-            R += tl.dot(C, tl.trans(W), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+        C = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        W = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        C_tc = C.to(tl.bfloat16)
+        W_tc = W.to(tl.bfloat16)
+        R += tl.dot(
+            C_tc,
+            tl.trans(W_tc),
+            out_dtype=tl.float32,
+            input_precision=INPUT_PRECISION,
+        )
     # Step 3: form K = L * R.
     K = L * R
 
     # Step 4: compute Y_diag = K @ V in FP32.
     d_start = pid_d_tile * BLOCK_D
     V_in = tl.reshape(v_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-    V_f = V_in.to(tl.float32)
-    if USE_BF16_DOT_INPUTS:
-        K_tc = K.to(tl.bfloat16)
-        V_tc = V_f.to(tl.bfloat16)
-        Y_diag = tl.dot(
-            K_tc,
-            V_tc,
-            out_dtype=tl.float32,
-            input_precision=INPUT_PRECISION,
-        )
-    else:
-        Y_diag = tl.dot(K, V_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+    K_tc = K.to(tl.bfloat16)
+    V_tc = V_in.to(tl.bfloat16)
+    Y_diag = tl.dot(
+        K_tc,
+        V_tc,
+        out_dtype=tl.float32,
+        input_precision=INPUT_PRECISION,
+    )
     # Step 5: compute Y_off = prefix_incl * (C @ S0).
     Y_off_base = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
-        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        S0_blk = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            C_blk_tc = C_blk.to(tl.bfloat16)
-            S0_blk_tc = S0_blk.to(tl.bfloat16)
-            Y_off_base += tl.dot(
-                C_blk_tc,
-                S0_blk_tc,
-                out_dtype=tl.float32,
-                input_precision=INPUT_PRECISION,
-            )
-        else:
-            Y_off_base += tl.dot(C_blk, S0_blk, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        S0_blk = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D))
+        C_blk_tc = C_blk.to(tl.bfloat16)
+        S0_blk_tc = S0_blk.to(tl.bfloat16)
+        Y_off_base += tl.dot(
+            C_blk_tc,
+            S0_blk_tc,
+            out_dtype=tl.float32,
+            input_precision=INPUT_PRECISION,
+        )
     p = tl.exp2(log_p_incl * INV_LN2)
     Y_off = p[:, None] * Y_off_base
     Y = Y_diag + Y_off
@@ -3543,7 +3412,6 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
     M_STATIC: tl.constexpr,
     D_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    USE_BF16_DOT_INPUTS: tl.constexpr,
     HAS_S0: tl.constexpr,
 ):
     """Fused Phase-3 backward: per (BH,NC) compute dV/dC/dW/dlog_alpha, and optional dS0.
@@ -3656,24 +3524,19 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
     R = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
-        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        W_blk = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            C_blk_tc = C_blk.to(tl.bfloat16)
-            W_blk_tc = W_blk.to(tl.bfloat16)
-            R += tl.dot(
-                C_blk_tc,
-                tl.trans(W_blk_tc),
-                out_dtype=tl.float32,
-                input_precision=INPUT_PRECISION,
-            )
-        else:
-            R += tl.dot(C_blk, tl.trans(W_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        W_blk = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        C_blk_tc = C_blk.to(tl.bfloat16)
+        W_blk_tc = W_blk.to(tl.bfloat16)
+        R += tl.dot(
+            C_blk_tc,
+            tl.trans(W_blk_tc),
+            out_dtype=tl.float32,
+            input_precision=INPUT_PRECISION,
+        )
     # ---- Step 3: K = L * R ----
     K = L * R
-    if USE_BF16_DOT_INPUTS:
-        K_tc = K.to(tl.bfloat16)
+    K_tc = K.to(tl.bfloat16)
 
     # ---- Step 4 & 5: dV per D-tile, accumulate dK in registers ----
     dK = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
@@ -3681,63 +3544,45 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
         d_start = d_blk * BLOCK_D
         G_in = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D))
         V_in = tl.reshape(v_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-        G = G_in.to(tl.float32)
-        V_f = V_in.to(tl.float32)
-
-        if USE_BF16_DOT_INPUTS:
-            G_tc = G.to(tl.bfloat16)
-            V_tc = V_f.to(tl.bfloat16)
-            dV_tile = tl.dot(
-                tl.trans(K_tc),
-                G_tc,
-                out_dtype=tl.float32,
-                input_precision=INPUT_PRECISION,
-            )
-        else:
-            dV_tile = tl.dot(tl.trans(K), G, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        G_tc = G_in.to(tl.bfloat16)
+        V_tc = V_in.to(tl.bfloat16)
+        dV_tile = tl.dot(
+            tl.trans(K_tc),
+            G_tc,
+            out_dtype=tl.float32,
+            input_precision=INPUT_PRECISION,
+        )
         dv_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV_tile.to(V_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
-        if USE_BF16_DOT_INPUTS:
-            dK += tl.dot(
-                G_tc,
-                tl.trans(V_tc),
-                out_dtype=tl.float32,
-                input_precision=INPUT_PRECISION,
-            )
-        else:
-            dK += tl.dot(G, tl.trans(V_f), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+        dK += tl.dot(
+            G_tc,
+            tl.trans(V_tc),
+            out_dtype=tl.float32,
+            input_precision=INPUT_PRECISION,
+        )
     # ---- Step 6: dR = dK * L ----
     dR = dK * L
-    if USE_BF16_DOT_INPUTS:
-        dR_tc = dR.to(tl.bfloat16)
+    dR_tc = dR.to(tl.bfloat16)
 
     # ---- Step 7 & 8: dC_diag and dW per M-tile ----
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
         W_in = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         C_in = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-        W_tile = W_in.to(tl.float32)
-        C_tile = C_in.to(tl.float32)
-
-        if USE_BF16_DOT_INPUTS:
-            W_tile_tc = W_tile.to(tl.bfloat16)
-            C_tile_tc = C_tile.to(tl.bfloat16)
-            dC_diag_tile = tl.dot(
-                dR_tc,
-                W_tile_tc,
-                out_dtype=tl.float32,
-                input_precision=INPUT_PRECISION,
-            )
-            dW_tile = tl.dot(
-                tl.trans(dR_tc),
-                C_tile_tc,
-                out_dtype=tl.float32,
-                input_precision=INPUT_PRECISION,
-            )
-        else:
-            dC_diag_tile = tl.dot(dR, W_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            dW_tile = tl.dot(tl.trans(dR), C_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        W_tile_tc = W_in.to(tl.bfloat16)
+        C_tile_tc = C_in.to(tl.bfloat16)
+        dC_diag_tile = tl.dot(
+            dR_tc,
+            W_tile_tc,
+            out_dtype=tl.float32,
+            input_precision=INPUT_PRECISION,
+        )
+        dW_tile = tl.dot(
+            tl.trans(dR_tc),
+            C_tile_tc,
+            out_dtype=tl.float32,
+            input_precision=INPUT_PRECISION,
+        )
         dc_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dC_diag_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
         dw_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
 
@@ -3758,42 +3603,34 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
         for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
             m_start = m_blk * BLOCK_M
             dC_off = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
-            C_tile = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                C_tile_tc = C_tile.to(tl.bfloat16)
+            C_tile_in = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            C_tile_tc = C_tile_in.to(tl.bfloat16)
             for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
                 d_start = d_blk * BLOCK_D
                 G_tile = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
                 dB_tile = p[:, None] * G_tile
-                S0_tile = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-                if USE_BF16_DOT_INPUTS:
-                    dB_tile_tc = dB_tile.to(tl.bfloat16)
-                    S0_tile_tc = S0_tile.to(tl.bfloat16)
-                    y_off_part = p[:, None] * tl.dot(
-                        C_tile_tc,
-                        S0_tile_tc,
-                        out_dtype=tl.float32,
-                        input_precision=INPUT_PRECISION,
-                    )
-                else:
-                    y_off_part = p[:, None] * tl.dot(C_tile, S0_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+                S0_tile = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D))
+                dB_tile_tc = dB_tile.to(tl.bfloat16)
+                S0_tile_tc = S0_tile.to(tl.bfloat16)
+                y_off_part = p[:, None] * tl.dot(
+                    C_tile_tc,
+                    S0_tile_tc,
+                    out_dtype=tl.float32,
+                    input_precision=INPUT_PRECISION,
+                )
                 src += tl.sum(G_tile * y_off_part, axis=1)
-                if USE_BF16_DOT_INPUTS:
-                    dC_off += tl.dot(
-                        dB_tile_tc,
-                        tl.trans(S0_tile_tc),
-                        out_dtype=tl.float32,
-                        input_precision=INPUT_PRECISION,
-                    )
-                    dS0_tile = tl.dot(
-                        tl.trans(C_tile_tc),
-                        dB_tile_tc,
-                        out_dtype=tl.float32,
-                        input_precision=INPUT_PRECISION,
-                    )
-                else:
-                    dC_off += tl.dot(dB_tile, tl.trans(S0_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                    dS0_tile = tl.dot(tl.trans(C_tile), dB_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+                dC_off += tl.dot(
+                    dB_tile_tc,
+                    tl.trans(S0_tile_tc),
+                    out_dtype=tl.float32,
+                    input_precision=INPUT_PRECISION,
+                )
+                dS0_tile = tl.dot(
+                    tl.trans(C_tile_tc),
+                    dB_tile_tc,
+                    out_dtype=tl.float32,
+                    input_precision=INPUT_PRECISION,
+                )
                 ds0_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(dS0_tile, (1, 1, BLOCK_M, BLOCK_D)))
 
             c_probe = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
@@ -3864,7 +3701,6 @@ def ssd_rank4_dense_output_fwd_kernel(
     C_STATIC: tl.constexpr,
     M_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    USE_BF16_DOT_INPUTS: tl.constexpr,
     WRITE_Y_OFF: tl.constexpr,
     HAS_RANK2: tl.constexpr,
     HAS_RANK3: tl.constexpr,
@@ -3969,33 +3805,19 @@ def ssd_rank4_dense_output_fwd_kernel(
         R4 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
-        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            C_tc = C_blk.to(tl.bfloat16)
-            W1_blk = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-            R1 += tl.dot(C_tc, tl.trans(W1_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK2:
-                W2_blk = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R2 += tl.dot(C_tc, tl.trans(W2_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK3:
-                W3_blk = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R3 += tl.dot(C_tc, tl.trans(W3_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK4:
-                W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R4 += tl.dot(C_tc, tl.trans(W4_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        else:
-            W1_blk = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-            R1 += tl.dot(C_blk, tl.trans(W1_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK2:
-                W2_blk = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R2 += tl.dot(C_blk, tl.trans(W2_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK3:
-                W3_blk = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R3 += tl.dot(C_blk, tl.trans(W3_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK4:
-                W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R4 += tl.dot(C_blk, tl.trans(W4_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        C_tc = C_blk.to(tl.bfloat16)
+        W1_blk = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        R1 += tl.dot(C_tc, tl.trans(W1_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if HAS_RANK2:
+            W2_blk = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            R2 += tl.dot(C_tc, tl.trans(W2_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if HAS_RANK3:
+            W3_blk = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            R3 += tl.dot(C_tc, tl.trans(W3_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if HAS_RANK4:
+            W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            R4 += tl.dot(C_tc, tl.trans(W4_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     K1 = L * R1
     if HAS_RANK2:
         K2 = L * R2
@@ -4005,43 +3827,22 @@ def ssd_rank4_dense_output_fwd_kernel(
         K4 = L * R4
     d_start = pid_d_tile * BLOCK_D
     V1_in = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-    V1_f = V1_in.to(tl.float32)
-    if USE_BF16_DOT_INPUTS:
-        Y_diag = tl.dot(K1.to(tl.bfloat16), V1_f.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    else:
-        Y_diag = tl.dot(K1, V1_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+    Y_diag = tl.dot(K1.to(tl.bfloat16), V1_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     if HAS_RANK2:
         V2_in = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-        V2_f = V2_in.to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            Y_diag += tl.dot(K2.to(tl.bfloat16), V2_f.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        else:
-            Y_diag += tl.dot(K2, V2_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        Y_diag += tl.dot(K2.to(tl.bfloat16), V2_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     if HAS_RANK3:
         V3_in = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-        V3_f = V3_in.to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            Y_diag += tl.dot(K3.to(tl.bfloat16), V3_f.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        else:
-            Y_diag += tl.dot(K3, V3_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        Y_diag += tl.dot(K3.to(tl.bfloat16), V3_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     if HAS_RANK4:
         V4_in = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-        V4_f = V4_in.to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            Y_diag += tl.dot(K4.to(tl.bfloat16), V4_f.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        else:
-            Y_diag += tl.dot(K4, V4_f, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+        Y_diag += tl.dot(K4.to(tl.bfloat16), V4_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     Y_off_base = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
-        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        S0_blk = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            Y_off_base += tl.dot(C_blk.to(tl.bfloat16), S0_blk.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        else:
-            Y_off_base += tl.dot(C_blk, S0_blk, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        S0_blk = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D))
+        Y_off_base += tl.dot(C_blk.to(tl.bfloat16), S0_blk.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     p = tl.exp2(log_p_incl * INV_LN2)
     Y_off = p[:, None] * Y_off_base
     Y = Y_diag + Y_off
@@ -4142,7 +3943,6 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
     M_STATIC: tl.constexpr,
     D_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    USE_BF16_DOT_INPUTS: tl.constexpr,
     HAS_S0: tl.constexpr,
     HAS_RANK2: tl.constexpr,
     HAS_RANK3: tl.constexpr,
@@ -4312,33 +4112,19 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
         R4 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
-        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            C_tc = C_blk.to(tl.bfloat16)
-            W1_blk = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-            R1 += tl.dot(C_tc, tl.trans(W1_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK2:
-                W2_blk = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R2 += tl.dot(C_tc, tl.trans(W2_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK3:
-                W3_blk = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R3 += tl.dot(C_tc, tl.trans(W3_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK4:
-                W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R4 += tl.dot(C_tc, tl.trans(W4_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        else:
-            W1_blk = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-            R1 += tl.dot(C_blk, tl.trans(W1_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK2:
-                W2_blk = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R2 += tl.dot(C_blk, tl.trans(W2_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK3:
-                W3_blk = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R3 += tl.dot(C_blk, tl.trans(W3_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK4:
-                W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                R4 += tl.dot(C_blk, tl.trans(W4_blk), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+        C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        C_tc = C_blk.to(tl.bfloat16)
+        W1_blk = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        R1 += tl.dot(C_tc, tl.trans(W1_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if HAS_RANK2:
+            W2_blk = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            R2 += tl.dot(C_tc, tl.trans(W2_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if HAS_RANK3:
+            W3_blk = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            R3 += tl.dot(C_tc, tl.trans(W3_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if HAS_RANK4:
+            W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            R4 += tl.dot(C_tc, tl.trans(W4_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     K1 = L * R1
     if HAS_RANK2:
         K2 = L * R2
@@ -4346,14 +4132,13 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
         K3 = L * R3
     if HAS_RANK4:
         K4 = L * R4
-    if USE_BF16_DOT_INPUTS:
-        K1_tc = K1.to(tl.bfloat16)
-        if HAS_RANK2:
-            K2_tc = K2.to(tl.bfloat16)
-        if HAS_RANK3:
-            K3_tc = K3.to(tl.bfloat16)
-        if HAS_RANK4:
-            K4_tc = K4.to(tl.bfloat16)
+    K1_tc = K1.to(tl.bfloat16)
+    if HAS_RANK2:
+        K2_tc = K2.to(tl.bfloat16)
+    if HAS_RANK3:
+        K3_tc = K3.to(tl.bfloat16)
+    if HAS_RANK4:
+        K4_tc = K4.to(tl.bfloat16)
     dK1 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     if HAS_RANK2:
         dK2 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
@@ -4364,49 +4149,27 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
     for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
         d_start = d_blk * BLOCK_D
         G_in = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D))
-        G = G_in.to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            G_tc = G.to(tl.bfloat16)
+        G_tc = G_in.to(tl.bfloat16)
         V1_in = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-        V1_f = V1_in.to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            dV1_tile = tl.dot(tl.trans(K1_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            dK1 += tl.dot(G_tc, tl.trans(V1_f.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        else:
-            dV1_tile = tl.dot(tl.trans(K1), G, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            dK1 += tl.dot(G, tl.trans(V1_f), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        dV1_tile = tl.dot(tl.trans(K1_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        dK1 += tl.dot(G_tc, tl.trans(V1_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dv1_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV1_tile.to(V1_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
         if HAS_RANK2:
             V2_in = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-            V2_f = V2_in.to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                dV2_tile = tl.dot(tl.trans(K2_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dK2 += tl.dot(G_tc, tl.trans(V2_f.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            else:
-                dV2_tile = tl.dot(tl.trans(K2), G, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dK2 += tl.dot(G, tl.trans(V2_f), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dV2_tile = tl.dot(tl.trans(K2_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dK2 += tl.dot(G_tc, tl.trans(V2_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dv2_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV2_tile.to(V2_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
         if HAS_RANK3:
             V3_in = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-            V3_f = V3_in.to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                dV3_tile = tl.dot(tl.trans(K3_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dK3 += tl.dot(G_tc, tl.trans(V3_f.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            else:
-                dV3_tile = tl.dot(tl.trans(K3), G, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dK3 += tl.dot(G, tl.trans(V3_f), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dV3_tile = tl.dot(tl.trans(K3_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dK3 += tl.dot(G_tc, tl.trans(V3_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dv3_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV3_tile.to(V3_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
         if HAS_RANK4:
             V4_in = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-            V4_f = V4_in.to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                dV4_tile = tl.dot(tl.trans(K4_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dK4 += tl.dot(G_tc, tl.trans(V4_f.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            else:
-                dV4_tile = tl.dot(tl.trans(K4), G, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dK4 += tl.dot(G, tl.trans(V4_f), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dV4_tile = tl.dot(tl.trans(K4_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dK4 += tl.dot(G_tc, tl.trans(V4_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dv4_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV4_tile.to(V4_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
     dR1 = dK1 * L
@@ -4416,60 +4179,36 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
         dR3 = dK3 * L
     if HAS_RANK4:
         dR4 = dK4 * L
-    if USE_BF16_DOT_INPUTS:
-        dR1_tc = dR1.to(tl.bfloat16)
-        if HAS_RANK2:
-            dR2_tc = dR2.to(tl.bfloat16)
-        if HAS_RANK3:
-            dR3_tc = dR3.to(tl.bfloat16)
-        if HAS_RANK4:
-            dR4_tc = dR4.to(tl.bfloat16)
+    dR1_tc = dR1.to(tl.bfloat16)
+    if HAS_RANK2:
+        dR2_tc = dR2.to(tl.bfloat16)
+    if HAS_RANK3:
+        dR3_tc = dR3.to(tl.bfloat16)
+    if HAS_RANK4:
+        dR4_tc = dR4.to(tl.bfloat16)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
         C_in = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-        C_tile = C_in.to(tl.float32)
-        if USE_BF16_DOT_INPUTS:
-            C_tc = C_tile.to(tl.bfloat16)
-            W1_in = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-            W1_tile = W1_in.to(tl.float32)
-            dC_tile = tl.dot(dR1_tc, W1_tile.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            dW1_tile = tl.dot(tl.trans(dR1_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK2:
-                W2_in = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-                W2_tile = W2_in.to(tl.float32)
-                dC_tile += tl.dot(dR2_tc, W2_tile.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dW2_tile = tl.dot(tl.trans(dR2_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK3:
-                W3_in = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-                W3_tile = W3_in.to(tl.float32)
-                dC_tile += tl.dot(dR3_tc, W3_tile.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dW3_tile = tl.dot(tl.trans(dR3_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK4:
-                W4_in = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-                W4_tile = W4_in.to(tl.float32)
-                dC_tile += tl.dot(dR4_tc, W4_tile.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dW4_tile = tl.dot(tl.trans(dR4_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        else:
-            W1_in = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-            W1_tile = W1_in.to(tl.float32)
-            dC_tile = tl.dot(dR1, W1_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            dW1_tile = tl.dot(tl.trans(dR1), C_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK2:
-                W2_in = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-                W2_tile = W2_in.to(tl.float32)
-                dC_tile += tl.dot(dR2, W2_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dW2_tile = tl.dot(tl.trans(dR2), C_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK3:
-                W3_in = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-                W3_tile = W3_in.to(tl.float32)
-                dC_tile += tl.dot(dR3, W3_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dW3_tile = tl.dot(tl.trans(dR3), C_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK4:
-                W4_in = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-                W4_tile = W4_in.to(tl.float32)
-                dC_tile += tl.dot(dR4, W4_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dW4_tile = tl.dot(tl.trans(dR4), C_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-
+        C_tc = C_in.to(tl.bfloat16)
+        W1_in = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+        W1_tc = W1_in.to(tl.bfloat16)
+        dC_tile = tl.dot(dR1_tc, W1_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        dW1_tile = tl.dot(tl.trans(dR1_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if HAS_RANK2:
+            W2_in = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            W2_tc = W2_in.to(tl.bfloat16)
+            dC_tile += tl.dot(dR2_tc, W2_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dW2_tile = tl.dot(tl.trans(dR2_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if HAS_RANK3:
+            W3_in = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            W3_tc = W3_in.to(tl.bfloat16)
+            dC_tile += tl.dot(dR3_tc, W3_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dW3_tile = tl.dot(tl.trans(dR3_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if HAS_RANK4:
+            W4_in = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            W4_tc = W4_in.to(tl.bfloat16)
+            dC_tile += tl.dot(dR4_tc, W4_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dW4_tile = tl.dot(tl.trans(dR4_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dc_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dC_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
         dw1_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW1_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
         if HAS_RANK2:
@@ -4500,24 +4239,18 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
         for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
             m_start = m_blk * BLOCK_M
             dC_off = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
-            C_tile = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-            if USE_BF16_DOT_INPUTS:
-                C_tile_tc = C_tile.to(tl.bfloat16)
+            C_tile_in = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
+            C_tile_tc = C_tile_in.to(tl.bfloat16)
             for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
                 d_start = d_blk * BLOCK_D
                 G_tile = tl.reshape(gy_desc.load([BH_IDX, NC_IDX, 0, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
                 dB_tile = p[:, None] * G_tile
-                S0_tile = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
-                if USE_BF16_DOT_INPUTS:
-                    dB_tc = dB_tile.to(tl.bfloat16)
-                    S0_tc = S0_tile.to(tl.bfloat16)
-                    y_off_part = p[:, None] * tl.dot(C_tile_tc, S0_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                    dC_off += tl.dot(dB_tc, tl.trans(S0_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                    dS0_tile = tl.dot(tl.trans(C_tile_tc), dB_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                else:
-                    y_off_part = p[:, None] * tl.dot(C_tile, S0_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                    dC_off += tl.dot(dB_tile, tl.trans(S0_tile), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                    dS0_tile = tl.dot(tl.trans(C_tile), dB_tile, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+                S0_tile = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D))
+                dB_tc = dB_tile.to(tl.bfloat16)
+                S0_tc = S0_tile.to(tl.bfloat16)
+                y_off_part = p[:, None] * tl.dot(C_tile_tc, S0_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+                dC_off += tl.dot(dB_tc, tl.trans(S0_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+                dS0_tile = tl.dot(tl.trans(C_tile_tc), dB_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
                 src += tl.sum(G_tile * y_off_part, axis=1)
                 ds0_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(dS0_tile, (1, 1, BLOCK_M, BLOCK_D)))
 
@@ -4606,11 +4339,6 @@ def _ssd_rank1_dense_output_forward_impl(
 
     out = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
     y_off_saved = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype) if RETURN_Y_OFF else out
-    use_bf16_dot_inputs = _prefer_bf16_dot_inputs(
-        device=C_5d.device,
-        input_precision=INPUT_PRECISION,
-        input_dtype=C_5d.dtype,
-    )
     phase3_fwd_cfg = _select_phase3_forward_launch_config(
         BH=BH,
         NC=NC,
@@ -4618,7 +4346,6 @@ def _ssd_rank1_dense_output_forward_impl(
         M=M,
         D=D,
         where="_ssd_rank1_dense_output_forward_impl",
-        use_bf16_dot_inputs=use_bf16_dot_inputs,
     )
     grid = (BH * NC, D // phase3_fwd_cfg.block_d)
     ssd_rank1_dense_output_fwd_kernel[grid](
@@ -4649,7 +4376,6 @@ def _ssd_rank1_dense_output_forward_impl(
         C_STATIC=C_CHUNK,
         M_STATIC=M,
         INPUT_PRECISION=INPUT_PRECISION,
-        USE_BF16_DOT_INPUTS=use_bf16_dot_inputs,
         WRITE_Y_OFF=RETURN_Y_OFF,
         num_warps=phase3_fwd_cfg.num_warps,
         num_stages=phase3_fwd_cfg.num_stages,
@@ -4753,18 +4479,12 @@ def _ssd_rank1_dense_output_backward_impl(
             f"got {tuple(S0_saved.shape)}."
         )
 
-    use_bf16_dot_inputs = _prefer_bf16_dot_inputs(
-        device=C_5d.device,
-        input_precision=input_precision,
-        input_dtype=C_5d.dtype,
-    )
     phase3_bwd_cfg = _select_phase3_backward_launch_config(
         BH=BH,
         NC=NC,
         C_CHUNK=C_CHUNK,
         M=M,
         D=D,
-        use_bf16_dot_inputs=use_bf16_dot_inputs,
     )
     BLOCK_M = phase3_bwd_cfg.block_m
     BLOCK_D = phase3_bwd_cfg.block_d
@@ -4832,7 +4552,6 @@ def _ssd_rank1_dense_output_backward_impl(
         M_STATIC=M,
         D_STATIC=D,
         INPUT_PRECISION=input_precision,
-        USE_BF16_DOT_INPUTS=use_bf16_dot_inputs,
         HAS_S0=has_s0,
         num_warps=phase3_bwd_num_warps,
         num_stages=phase3_bwd_cfg.num_stages,
@@ -4897,11 +4616,6 @@ def ssd_rank1_dense_output_forward_kernel_profile(
         else:
             raise ValueError("S0 shape mismatch.")
 
-    use_bf16_dot_inputs = _prefer_bf16_dot_inputs(
-        device=C.device,
-        input_precision=INPUT_PRECISION,
-        input_dtype=C.dtype,
-    )
     default_cfg = _select_phase3_forward_launch_config(
         BH=BH,
         NC=NC,
@@ -4909,7 +4623,6 @@ def ssd_rank1_dense_output_forward_kernel_profile(
         M=M,
         D=D,
         where="ssd_rank1_dense_output_forward_kernel_profile",
-        use_bf16_dot_inputs=use_bf16_dot_inputs,
     )
     BLOCK_M = default_cfg.block_m if BLOCK_M is None else BLOCK_M
     BLOCK_D = default_cfg.block_d if BLOCK_D is None else BLOCK_D
@@ -4970,7 +4683,6 @@ def ssd_rank1_dense_output_forward_kernel_profile(
             C_STATIC=C_CHUNK,
             M_STATIC=M,
             INPUT_PRECISION=INPUT_PRECISION,
-            USE_BF16_DOT_INPUTS=use_bf16_dot_inputs,
             WRITE_Y_OFF=RETURN_Y_OFF,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
@@ -4985,7 +4697,6 @@ def ssd_rank1_dense_output_forward_kernel_profile(
     times["BLOCK_D"] = float(BLOCK_D)
     times["NUM_WARPS"] = float(NUM_WARPS)
     times["NUM_STAGES"] = float(NUM_STAGES)
-    times["USE_BF16_DOT_INPUTS"] = float(1 if use_bf16_dot_inputs else 0)
     return times
 
 
@@ -5042,18 +4753,12 @@ def ssd_rank1_dense_output_backward_kernel_profile(
             raise ValueError("S0 shape mismatch.")
         has_s0 = True
 
-    use_bf16_dot_inputs = _prefer_bf16_dot_inputs(
-        device=C.device,
-        input_precision=INPUT_PRECISION,
-        input_dtype=C.dtype,
-    )
     default_cfg = _select_phase3_backward_launch_config(
         BH=BH,
         NC=NC,
         C_CHUNK=C_CHUNK,
         M=M,
         D=D,
-        use_bf16_dot_inputs=use_bf16_dot_inputs,
     )
     BLOCK_M = default_cfg.block_m if BLOCK_M is None else BLOCK_M
     BLOCK_D = default_cfg.block_d if BLOCK_D is None else BLOCK_D
@@ -5133,7 +4838,6 @@ def ssd_rank1_dense_output_backward_kernel_profile(
             M_STATIC=M,
             D_STATIC=D,
             INPUT_PRECISION=INPUT_PRECISION,
-            USE_BF16_DOT_INPUTS=use_bf16_dot_inputs,
             HAS_S0=has_s0,
             num_warps=FUSED_NUM_WARPS,
             num_stages=NUM_STAGES,
@@ -5370,7 +5074,8 @@ class SsdRank1TritonDebug(torch.autograd.Function):
         )
         block_nc = _select_phase2_block_nc(NC=NC)
         phase2_cfg = _select_phase2_launch_config(MD=MD, NC=NC, where="SsdRank1TritonDebug.backward")
-        grid_bwd = lambda META: (BH,)
+        def grid_bwd(_meta):
+            return (BH,)
         ssd_rank1_prefix_scan_bwd_dense_kernel[grid_bwd](
             grad_chunk_start_f,
             grad_final_f,
@@ -5395,7 +5100,6 @@ class SsdRank1TritonDebug(torch.autograd.Function):
             BLOCK_MD=phase2_cfg.block_md,
             NC_STATIC=NC,
             USE_FP32_COMPUTE=(compute_dtype == torch.float32),
-            USE_BF16_COMPUTE=(compute_dtype == torch.bfloat16),
             HAS_GRAD_FINAL=has_grad_final,
             WRITE_D_INIT=write_d_init,
             num_warps=phase2_cfg.num_warps,
@@ -5417,15 +5121,9 @@ class SsdRank1TritonDebug(torch.autograd.Function):
             label="D",
         )
         phase1_input_precision = "ieee" if input_dtype == torch.float32 else "tf32"
-        phase1_use_bf16_dot_inputs = _prefer_bf16_dot_inputs(
-            device=V_chunk.device,
-            input_precision=phase1_input_precision,
-            input_dtype=input_dtype,
-        )
         phase1_bwd_cfg = _select_phase1_backward_launch_config(
             M=M,
             D=D,
-            use_bf16_dot_inputs=phase1_use_bf16_dot_inputs,
         )
 
         grad_s_md = dS_local_end.reshape(BH, NC, M, D)
@@ -5459,7 +5157,6 @@ class SsdRank1TritonDebug(torch.autograd.Function):
             M_STATIC=M,
             D_STATIC=D,
             INPUT_PRECISION=phase1_input_precision,
-            USE_BF16_DOT_INPUTS=phase1_use_bf16_dot_inputs,
             ACCUMULATE=True,
             num_warps=phase1_bwd_cfg.num_warps,
             num_stages=phase1_bwd_cfg.num_stages,
@@ -5592,7 +5289,6 @@ def _ssd_rank1_chunk_end_state_forward_impl_static(
         BLOCK_C=C_CHUNK,
         C_STATIC=C_CHUNK,
         INPUT_PRECISION=cfg.input_precision,
-        USE_BF16_DOT_INPUTS=True,
     )
     return s_local_end_md.reshape(BH, NC, M * D)
 
@@ -5619,10 +5315,8 @@ def _ssd_rank1_phase2_forward_static(
     phase2_cfg = cfg.phase2_launch
     if cfg.input_dtype == torch.float32:
         use_fp32_compute = True
-        use_bf16_compute = False
     elif cfg.input_dtype == torch.bfloat16:
         use_fp32_compute = False
-        use_bf16_compute = True
     else:
         raise NotImplementedError(
             "_ssd_rank1_phase2_forward_static only supports cfg.input_dtype in {torch.float32, torch.bfloat16}; "
@@ -5649,7 +5343,6 @@ def _ssd_rank1_phase2_forward_static(
         BLOCK_NC=cfg.phase2_block_nc,
         BLOCK_MD=phase2_cfg.block_md,
         USE_FP32_COMPUTE=use_fp32_compute,
-        USE_BF16_COMPUTE=use_bf16_compute,
         HAS_INITIAL_STATE=cfg.has_initial_state,
         RETURN_FINAL_STATE=cfg.return_final_state,
         num_warps=phase2_cfg.num_warps,
@@ -5711,7 +5404,6 @@ def _ssd_rank1_dense_output_forward_impl_static(
         C_STATIC=C_CHUNK,
         M_STATIC=M,
         INPUT_PRECISION=cfg.input_precision,
-        USE_BF16_DOT_INPUTS=True,
         WRITE_Y_OFF=False,
         num_warps=cfg.phase3_forward.num_warps,
         num_stages=cfg.phase3_forward.num_stages,
@@ -5791,7 +5483,6 @@ def _ssd_rank1_dense_output_backward_impl_static(
         M_STATIC=M,
         D_STATIC=D,
         INPUT_PRECISION=cfg.input_precision,
-        USE_BF16_DOT_INPUTS=True,
         HAS_S0=True,
         num_warps=phase3_bwd_num_warps,
         num_stages=cfg.phase3_backward.num_stages,
@@ -5826,10 +5517,8 @@ def _ssd_rank1_phase2_backward_static(
     phase2_cfg = cfg.phase2_launch
     if cfg.input_dtype == torch.float32:
         use_fp32_compute = True
-        use_bf16_compute = False
     elif cfg.input_dtype == torch.bfloat16:
         use_fp32_compute = False
-        use_bf16_compute = True
     else:
         raise NotImplementedError(
             "_ssd_rank1_phase2_backward_static only supports cfg.input_dtype in {torch.float32, torch.bfloat16}; "
@@ -5860,7 +5549,6 @@ def _ssd_rank1_phase2_backward_static(
         BLOCK_MD=phase2_cfg.block_md,
         NC_STATIC=NC,
         USE_FP32_COMPUTE=use_fp32_compute,
-        USE_BF16_COMPUTE=use_bf16_compute,
         HAS_GRAD_FINAL=True,
         WRITE_D_INIT=True,
         num_warps=phase2_cfg.num_warps,
@@ -6041,7 +5729,6 @@ class SsdRank1TritonStatic(torch.autograd.Function):
             M_STATIC=M,
             D_STATIC=D,
             INPUT_PRECISION=cfg.input_precision,
-            USE_BF16_DOT_INPUTS=True,
             ACCUMULATE=True,
             num_warps=cfg.phase1_backward.num_warps,
             num_stages=cfg.phase1_backward.num_stages,
@@ -6156,7 +5843,6 @@ def _ssd_rank4_chunk_end_state_forward_impl_static(
         BLOCK_C=C_CHUNK,
         C_STATIC=C_CHUNK,
         INPUT_PRECISION=cfg.input_precision,
-        USE_BF16_DOT_INPUTS=True,
         HAS_RANK2=has_rank2,
         HAS_RANK3=has_rank3,
         HAS_RANK4=has_rank4,
@@ -6223,7 +5909,6 @@ def _ssd_rank4_dense_output_forward_impl_static(
         C_STATIC=C_CHUNK,
         M_STATIC=M,
         INPUT_PRECISION=cfg.input_precision,
-        USE_BF16_DOT_INPUTS=True,
         WRITE_Y_OFF=False,
         HAS_RANK2=has_rank2,
         HAS_RANK3=has_rank3,
@@ -6344,7 +6029,6 @@ def _ssd_rank4_dense_output_backward_impl_static(
         M_STATIC=M,
         D_STATIC=D,
         INPUT_PRECISION=cfg.input_precision,
-        USE_BF16_DOT_INPUTS=True,
         HAS_S0=True,
         HAS_RANK2=has_rank2,
         HAS_RANK3=has_rank3,
@@ -6426,7 +6110,6 @@ def _ssd_rank4_chunk_end_state_backward_impl_static(
         M_STATIC=M,
         D_STATIC=D,
         INPUT_PRECISION=cfg.input_precision,
-        USE_BF16_DOT_INPUTS=True,
         ACCUMULATE=True,
         HAS_RANK2=has_rank2,
         HAS_RANK3=has_rank3,
