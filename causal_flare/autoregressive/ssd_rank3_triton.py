@@ -8,7 +8,6 @@ import torch
 
 import triton
 import triton.language as tl
-from .ssd_rank1_triton import ssd_rank1_triton as _ssd_rank1_triton_baseline
 
 _SUPPORTED_M_VALUES = {16, 32, 64, 128}
 _SUPPORTED_D_VALUES = {32, 64, 128}
@@ -86,179 +85,287 @@ class _StaticSsdRank1Workspace:
     phase2_grad_final_zero: torch.Tensor
 
 
-_STATIC_SSD_RANK1_SHAPE_CONFIGS: dict[tuple[int, int, int, int], _StaticSsdRank1ShapeConfig] = {
-    # key: (BH, N, M, D)
-    (512, 2048, 64, 64): _StaticSsdRank1ShapeConfig(
-        chunk_size=64,
+def _make_static_cfg(
+    *,
+    chunk_size: int,
+    phase1_block_t: int,
+    phase1_block_m: int,
+    phase1_block_d: int,
+    phase2_block_nc: int,
+    phase2_block_md: int,
+    phase2_num_warps: int,
+    phase2_num_stages: int,
+    phase3_fwd_block_m: int,
+    phase3_fwd_block_d: int,
+    phase3_fwd_num_warps: int,
+    phase3_fwd_num_stages: int,
+    phase3_bwd_block_m: int,
+    phase3_bwd_block_d: int,
+    phase3_bwd_num_warps: int,
+    phase3_bwd_num_stages: int,
+    phase1_bwd_num_warps: int,
+    phase1_bwd_num_stages: int,
+) -> _StaticSsdRank1ShapeConfig:
+    return _StaticSsdRank1ShapeConfig(
+        chunk_size=chunk_size,
         input_dtype=torch.bfloat16,
         input_precision="tf32",
         has_initial_state=False,
         return_final_state=True,
+        phase1_block_t=phase1_block_t,
+        phase1_block_m=phase1_block_m,
+        phase1_block_d=phase1_block_d,
+        phase2_block_nc=phase2_block_nc,
+        phase2_launch=_Phase2LaunchConfig(
+            block_md=phase2_block_md,
+            num_warps=phase2_num_warps,
+            num_stages=phase2_num_stages,
+        ),
+        phase3_forward=_Phase3ForwardLaunchConfig(
+            block_m=phase3_fwd_block_m,
+            block_d=phase3_fwd_block_d,
+            num_warps=phase3_fwd_num_warps,
+            num_stages=phase3_fwd_num_stages,
+        ),
+        phase3_backward=_Phase3BackwardLaunchConfig(
+            block_m=phase3_bwd_block_m,
+            block_d=phase3_bwd_block_d,
+            fused_a1a2_num_warps=phase3_bwd_num_warps,
+            fused_off_num_warps=phase3_bwd_num_warps,
+            num_stages=phase3_bwd_num_stages,
+        ),
+        phase1_backward=_Phase1BackwardLaunchConfig(
+            num_warps=phase1_bwd_num_warps,
+            num_stages=phase1_bwd_num_stages,
+        ),
+    )
+
+
+_STATIC_SSD_RANK1_SHAPE_CONFIGS: dict[tuple[int, int, int], _StaticSsdRank1ShapeConfig] = {
+    # key: (N, M, D). BH is intentionally ignored for static launch-config selection.
+    (2048, 64, 64): _make_static_cfg(
+        chunk_size=64,
         phase1_block_t=16,
         phase1_block_m=64,
         phase1_block_d=64,
         phase2_block_nc=32,
-        phase2_launch=_Phase2LaunchConfig(block_md=256, num_warps=4, num_stages=3),
-        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=4, num_stages=4),
-        phase3_backward=_Phase3BackwardLaunchConfig(
-            block_m=64,
-            block_d=64,
-            fused_a1a2_num_warps=4,
-            fused_off_num_warps=4,
-            num_stages=3,
-        ),
-        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=3),
+        phase2_block_md=256,
+        phase2_num_warps=4,
+        phase2_num_stages=2,
+        phase3_fwd_block_m=64,
+        phase3_fwd_block_d=64,
+        phase3_fwd_num_warps=4,
+        phase3_fwd_num_stages=4,
+        phase3_bwd_block_m=64,
+        phase3_bwd_block_d=64,
+        phase3_bwd_num_warps=4,
+        phase3_bwd_num_stages=3,
+        phase1_bwd_num_warps=4,
+        phase1_bwd_num_stages=3,
     ),
-    (512, 2048, 64, 128): _StaticSsdRank1ShapeConfig(
+    (2048, 64, 128): _make_static_cfg(
         chunk_size=64,
-        input_dtype=torch.bfloat16,
-        input_precision="tf32",
-        has_initial_state=False,
-        return_final_state=True,
         phase1_block_t=16,
         phase1_block_m=64,
         phase1_block_d=128,
         phase2_block_nc=32,
-        phase2_launch=_Phase2LaunchConfig(block_md=512, num_warps=8, num_stages=3),
-        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=128, num_warps=4, num_stages=2),
-        phase3_backward=_Phase3BackwardLaunchConfig(
-            block_m=64,
-            block_d=64,
-            fused_a1a2_num_warps=4,
-            fused_off_num_warps=4,
-            num_stages=3,
-        ),
-        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=2),
+        phase2_block_md=512,
+        phase2_num_warps=8,
+        phase2_num_stages=3,
+        phase3_fwd_block_m=64,
+        phase3_fwd_block_d=128,
+        phase3_fwd_num_warps=4,
+        phase3_fwd_num_stages=2,
+        phase3_bwd_block_m=64,
+        phase3_bwd_block_d=64,
+        phase3_bwd_num_warps=4,
+        phase3_bwd_num_stages=3,
+        phase1_bwd_num_warps=4,
+        phase1_bwd_num_stages=2,
     ),
-    (512, 1024, 64, 64): _StaticSsdRank1ShapeConfig(
+    (1024, 64, 64): _make_static_cfg(
         chunk_size=64,
-        input_dtype=torch.bfloat16,
-        input_precision="tf32",
-        has_initial_state=False,
-        return_final_state=True,
         phase1_block_t=16,
         phase1_block_m=64,
         phase1_block_d=64,
         phase2_block_nc=16,
-        phase2_launch=_Phase2LaunchConfig(block_md=256, num_warps=4, num_stages=3),
-        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=4, num_stages=4),
-        phase3_backward=_Phase3BackwardLaunchConfig(
-            block_m=64,
-            block_d=64,
-            fused_a1a2_num_warps=4,
-            fused_off_num_warps=4,
-            num_stages=3,
-        ),
-        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=3),
+        phase2_block_md=256,
+        phase2_num_warps=4,
+        phase2_num_stages=3,
+        phase3_fwd_block_m=64,
+        phase3_fwd_block_d=64,
+        phase3_fwd_num_warps=4,
+        phase3_fwd_num_stages=4,
+        phase3_bwd_block_m=64,
+        phase3_bwd_block_d=64,
+        phase3_bwd_num_warps=4,
+        phase3_bwd_num_stages=3,
+        phase1_bwd_num_warps=4,
+        phase1_bwd_num_stages=3,
     ),
-    (512, 1024, 64, 128): _StaticSsdRank1ShapeConfig(
+    (1024, 64, 128): _make_static_cfg(
         chunk_size=64,
-        input_dtype=torch.bfloat16,
-        input_precision="tf32",
-        has_initial_state=False,
-        return_final_state=True,
         phase1_block_t=16,
         phase1_block_m=64,
         phase1_block_d=128,
         phase2_block_nc=16,
-        phase2_launch=_Phase2LaunchConfig(block_md=512, num_warps=8, num_stages=3),
-        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=128, num_warps=4, num_stages=2),
-        phase3_backward=_Phase3BackwardLaunchConfig(
-            block_m=64,
-            block_d=64,
-            fused_a1a2_num_warps=4,
-            fused_off_num_warps=4,
-            num_stages=3,
-        ),
-        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=2),
+        phase2_block_md=512,
+        phase2_num_warps=8,
+        phase2_num_stages=3,
+        phase3_fwd_block_m=64,
+        phase3_fwd_block_d=128,
+        phase3_fwd_num_warps=4,
+        phase3_fwd_num_stages=2,
+        phase3_bwd_block_m=64,
+        phase3_bwd_block_d=64,
+        phase3_bwd_num_warps=4,
+        phase3_bwd_num_stages=3,
+        phase1_bwd_num_warps=4,
+        phase1_bwd_num_stages=2,
     ),
-    (1024, 2048, 64, 64): _StaticSsdRank1ShapeConfig(
+    (2048, 32, 32): _make_static_cfg(
         chunk_size=64,
-        input_dtype=torch.bfloat16,
-        input_precision="tf32",
-        has_initial_state=False,
-        return_final_state=True,
         phase1_block_t=16,
-        phase1_block_m=64,
+        phase1_block_m=32,
+        phase1_block_d=32,
+        phase2_block_nc=32,
+        phase2_block_md=128,
+        phase2_num_warps=4,
+        phase2_num_stages=2,
+        phase3_fwd_block_m=32,
+        phase3_fwd_block_d=32,
+        phase3_fwd_num_warps=2,
+        phase3_fwd_num_stages=3,
+        phase3_bwd_block_m=32,
+        phase3_bwd_block_d=32,
+        phase3_bwd_num_warps=2,
+        phase3_bwd_num_stages=3,
+        phase1_bwd_num_warps=2,
+        phase1_bwd_num_stages=2,
+    ),
+    (2048, 32, 64): _make_static_cfg(
+        chunk_size=64,
+        phase1_block_t=16,
+        phase1_block_m=32,
         phase1_block_d=64,
         phase2_block_nc=32,
-        phase2_launch=_Phase2LaunchConfig(block_md=256, num_warps=4, num_stages=3),
-        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=4, num_stages=3),
-        phase3_backward=_Phase3BackwardLaunchConfig(
-            block_m=64,
-            block_d=64,
-            fused_a1a2_num_warps=4,
-            fused_off_num_warps=4,
-            num_stages=3,
-        ),
-        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=3),
+        phase2_block_md=256,
+        phase2_num_warps=4,
+        phase2_num_stages=3,
+        phase3_fwd_block_m=32,
+        phase3_fwd_block_d=64,
+        phase3_fwd_num_warps=4,
+        phase3_fwd_num_stages=3,
+        phase3_bwd_block_m=32,
+        phase3_bwd_block_d=64,
+        phase3_bwd_num_warps=4,
+        phase3_bwd_num_stages=2,
+        phase1_bwd_num_warps=4,
+        phase1_bwd_num_stages=2,
     ),
-    (1024, 2048, 64, 128): _StaticSsdRank1ShapeConfig(
+    (2048, 32, 128): _make_static_cfg(
         chunk_size=64,
-        input_dtype=torch.bfloat16,
-        input_precision="tf32",
-        has_initial_state=False,
-        return_final_state=True,
         phase1_block_t=16,
-        phase1_block_m=64,
+        phase1_block_m=32,
         phase1_block_d=128,
         phase2_block_nc=32,
-        phase2_launch=_Phase2LaunchConfig(block_md=512, num_warps=8, num_stages=3),
-        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=128, num_warps=4, num_stages=2),
-        phase3_backward=_Phase3BackwardLaunchConfig(
-            block_m=64,
-            block_d=64,
-            fused_a1a2_num_warps=4,
-            fused_off_num_warps=4,
-            num_stages=3,
-        ),
-        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=2),
+        phase2_block_md=512,
+        phase2_num_warps=8,
+        phase2_num_stages=3,
+        phase3_fwd_block_m=32,
+        phase3_fwd_block_d=128,
+        phase3_fwd_num_warps=4,
+        phase3_fwd_num_stages=2,
+        phase3_bwd_block_m=32,
+        phase3_bwd_block_d=64,
+        phase3_bwd_num_warps=4,
+        phase3_bwd_num_stages=3,
+        phase1_bwd_num_warps=4,
+        phase1_bwd_num_stages=2,
     ),
-    (1024, 1024, 64, 64): _StaticSsdRank1ShapeConfig(
+    (2048, 64, 32): _make_static_cfg(
         chunk_size=64,
-        input_dtype=torch.bfloat16,
-        input_precision="tf32",
-        has_initial_state=False,
-        return_final_state=True,
+        phase1_block_t=16,
+        phase1_block_m=64,
+        phase1_block_d=32,
+        phase2_block_nc=32,
+        phase2_block_md=256,
+        phase2_num_warps=4,
+        phase2_num_stages=3,
+        phase3_fwd_block_m=64,
+        phase3_fwd_block_d=32,
+        phase3_fwd_num_warps=4,
+        phase3_fwd_num_stages=4,
+        phase3_bwd_block_m=64,
+        phase3_bwd_block_d=32,
+        phase3_bwd_num_warps=4,
+        phase3_bwd_num_stages=3,
+        phase1_bwd_num_warps=4,
+        phase1_bwd_num_stages=3,
+    ),
+    (2048, 128, 32): _make_static_cfg(
+        chunk_size=64,
+        phase1_block_t=16,
+        phase1_block_m=64,
+        phase1_block_d=32,
+        phase2_block_nc=16,
+        phase2_block_md=512,
+        phase2_num_warps=8,
+        phase2_num_stages=3,
+        phase3_fwd_block_m=64,
+        phase3_fwd_block_d=32,
+        phase3_fwd_num_warps=4,
+        phase3_fwd_num_stages=3,
+        phase3_bwd_block_m=64,
+        phase3_bwd_block_d=32,
+        phase3_bwd_num_warps=4,
+        phase3_bwd_num_stages=3,
+        phase1_bwd_num_warps=4,
+        phase1_bwd_num_stages=3,
+    ),
+    (2048, 128, 64): _make_static_cfg(
+        chunk_size=64,
         phase1_block_t=16,
         phase1_block_m=64,
         phase1_block_d=64,
         phase2_block_nc=16,
-        phase2_launch=_Phase2LaunchConfig(block_md=256, num_warps=4, num_stages=3),
-        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=64, num_warps=4, num_stages=4),
-        phase3_backward=_Phase3BackwardLaunchConfig(
-            block_m=64,
-            block_d=64,
-            fused_a1a2_num_warps=4,
-            fused_off_num_warps=4,
-            num_stages=3,
-        ),
-        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=3),
+        phase2_block_md=512,
+        phase2_num_warps=8,
+        phase2_num_stages=3,
+        phase3_fwd_block_m=64,
+        phase3_fwd_block_d=64,
+        phase3_fwd_num_warps=4,
+        phase3_fwd_num_stages=3,
+        phase3_bwd_block_m=64,
+        phase3_bwd_block_d=64,
+        phase3_bwd_num_warps=4,
+        phase3_bwd_num_stages=3,
+        phase1_bwd_num_warps=4,
+        phase1_bwd_num_stages=3,
     ),
-    (1024, 1024, 64, 128): _StaticSsdRank1ShapeConfig(
+    (2048, 128, 128): _make_static_cfg(
         chunk_size=64,
-        input_dtype=torch.bfloat16,
-        input_precision="tf32",
-        has_initial_state=False,
-        return_final_state=True,
         phase1_block_t=16,
         phase1_block_m=64,
         phase1_block_d=128,
         phase2_block_nc=16,
-        phase2_launch=_Phase2LaunchConfig(block_md=512, num_warps=8, num_stages=3),
-        phase3_forward=_Phase3ForwardLaunchConfig(block_m=64, block_d=128, num_warps=4, num_stages=2),
-        phase3_backward=_Phase3BackwardLaunchConfig(
-            block_m=64,
-            block_d=64,
-            fused_a1a2_num_warps=4,
-            fused_off_num_warps=4,
-            num_stages=3,
-        ),
-        phase1_backward=_Phase1BackwardLaunchConfig(num_warps=4, num_stages=2),
+        phase2_block_md=512,
+        phase2_num_warps=8,
+        phase2_num_stages=2,
+        phase3_fwd_block_m=64,
+        phase3_fwd_block_d=128,
+        phase3_fwd_num_warps=4,
+        phase3_fwd_num_stages=2,
+        phase3_bwd_block_m=64,
+        phase3_bwd_block_d=64,
+        phase3_bwd_num_warps=4,
+        phase3_bwd_num_stages=3,
+        phase1_bwd_num_warps=4,
+        phase1_bwd_num_stages=2,
     ),
 }
 
-_ACTIVE_STATIC_SSD_RANK1_KEY: tuple[int, int, int, int] | None = None
+_ACTIVE_STATIC_SSD_RANK1_KEY: tuple[int, int, int] | None = None
 _ACTIVE_STATIC_SSD_RANK1_CONFIG: _StaticSsdRank1ShapeConfig | None = None
 _STATIC_SSD_RANK1_WORKSPACES: dict[tuple[tuple[int, int, int, int], tuple[str, int], bool], _StaticSsdRank1Workspace] = {}
 
@@ -304,23 +411,23 @@ def _get_static_workspace(
     return ws
 
 
-def _lookup_static_ssd_rank1_shape_config(*, BH: int, N: int, M: int, D: int) -> _StaticSsdRank1ShapeConfig:
-    key = (BH, N, M, D)
+def _lookup_static_ssd_rank1_shape_config(*, N: int, M: int, D: int) -> _StaticSsdRank1ShapeConfig:
+    key = (N, M, D)
     cfg = _STATIC_SSD_RANK1_SHAPE_CONFIGS.get(key)
     if cfg is None:
         supported = sorted(_STATIC_SSD_RANK1_SHAPE_CONFIGS.keys())
         raise NotImplementedError(
             "No static SSD rank1 launch config for shape "
-            f"(BH={BH}, N={N}, M={M}, D={D}). Supported keys: {supported}."
+            f"(N={N}, M={M}, D={D}). Supported keys: {supported}."
         )
     return cfg
 
 
-def set_ssd_rank1_static_shape(*, BH: int, N: int, M: int, D: int) -> None:
+def set_ssd_rank1_static_shape(*, N: int, M: int, D: int) -> None:
     """Bind a single static shape config for all subsequent hot-path calls."""
     global _ACTIVE_STATIC_SSD_RANK1_KEY, _ACTIVE_STATIC_SSD_RANK1_CONFIG
-    cfg = _lookup_static_ssd_rank1_shape_config(BH=BH, N=N, M=M, D=D)
-    _ACTIVE_STATIC_SSD_RANK1_KEY = (BH, N, M, D)
+    cfg = _lookup_static_ssd_rank1_shape_config(N=N, M=M, D=D)
+    _ACTIVE_STATIC_SSD_RANK1_KEY = (N, M, D)
     _ACTIVE_STATIC_SSD_RANK1_CONFIG = cfg
 
 
@@ -361,9 +468,9 @@ def _validate_static_hot_path_contract(
     if not C.is_contiguous() or not W.is_contiguous() or not V.is_contiguous() or not log_alpha.is_contiguous():
         raise ValueError("Static SSD rank1 path requires contiguous C/W/V/log_alpha.")
     global _ACTIVE_STATIC_SSD_RANK1_KEY, _ACTIVE_STATIC_SSD_RANK1_CONFIG
-    shape_key = (B * H, N, M, D)
+    shape_key = (N, M, D)
     if _ACTIVE_STATIC_SSD_RANK1_CONFIG is None:
-        set_ssd_rank1_static_shape(BH=shape_key[0], N=shape_key[1], M=shape_key[2], D=shape_key[3])
+        set_ssd_rank1_static_shape(N=shape_key[0], M=shape_key[1], D=shape_key[2])
     if _ACTIVE_STATIC_SSD_RANK1_KEY != shape_key:
         raise ValueError(
             "Static SSD rank1 path is bound to one shape per process. "
@@ -1101,18 +1208,6 @@ def ssd_rank3_triton(
         raise ValueError("ssd_rank3_triton: log_alpha must share dtype with C/W/V.")
     _require_nonpositive_log_alpha(log_alpha, where="ssd_rank3_triton")
     _require_supported_md(M, D, where="ssd_rank3_triton")
-
-    if len(terms) == 1:
-        return _ssd_rank1_triton_baseline(
-            C,
-            W1,
-            V1,
-            log_alpha,
-            initial_state=initial_state,
-            CHUNK_SIZE=CHUNK_SIZE,
-            INPUT_PRECISION=INPUT_PRECISION,
-            RETURN_FINAL_STATE=RETURN_FINAL_STATE,
-        )
 
     cfg = _validate_static_hot_path_contract(
         C,
@@ -5608,7 +5703,7 @@ class SsdRank1TritonStatic(torch.autograd.Function):
         NC = ctx.NC
         CHUNK_SIZE = ctx.CHUNK_SIZE
         BH = B * H
-        cfg = _lookup_static_ssd_rank1_shape_config(BH=BH, N=N, M=M, D=D)
+        cfg = _lookup_static_ssd_rank1_shape_config(N=N, M=M, D=D)
         ws = _get_static_workspace(device=C.device, cfg_key=(BH, N, M, D), cfg=cfg)
 
         C_chunk, W_chunk, V_chunk, log_alpha_chunk, _, _, _, _, _, _, _ = _ssd_rank1_prepare_unchunked_inputs_static(
@@ -6131,7 +6226,7 @@ class SsdRank3TritonStatic(torch.autograd.Function):
         BH = B * H
         has_rank2 = ctx.has_rank2
         has_rank3 = ctx.has_rank3
-        cfg = _lookup_static_ssd_rank1_shape_config(BH=BH, N=N, M=M, D=D)
+        cfg = _lookup_static_ssd_rank1_shape_config(N=N, M=M, D=D)
         ws = _get_static_workspace(device=C.device, cfg_key=(BH, N, M, D), cfg=cfg, allocate_phase3_s0=False)
 
         (
@@ -6282,7 +6377,7 @@ def ssd_rank1_triton_debug(
 
 def warmup_ssd_rank1_triton_static(
     *,
-    shape_keys: list[tuple[int, int, int, int]] | None = None,
+    shape_keys: list[tuple[int, int, int]] | None = None,
     device: torch.device | None = None,
     include_backward: bool = True,
 ) -> None:
@@ -6296,17 +6391,15 @@ def warmup_ssd_rank1_triton_static(
     _ensure_triton_allocator()
     keys = sorted(_STATIC_SSD_RANK1_SHAPE_CONFIGS.keys()) if shape_keys is None else shape_keys
     for key in keys:
-        BH, N, M, D = key
-        cfg = _lookup_static_ssd_rank1_shape_config(BH=BH, N=N, M=M, D=D)
+        N, M, D = key
+        cfg = _lookup_static_ssd_rank1_shape_config(N=N, M=M, D=D)
         B = 32
-        H = BH // B
-        if B * H != BH:
-            raise ValueError(f"warmup shape key {key} is not representable with fixed B={B}.")
+        H = 16
         C = torch.zeros((B, N, H, M), device=device, dtype=cfg.input_dtype)
         W = torch.zeros((B, N, H, M), device=device, dtype=cfg.input_dtype)
         V = torch.zeros((B, N, H, D), device=device, dtype=cfg.input_dtype)
         log_alpha = torch.full((B, N, H), -1.0, device=device, dtype=cfg.input_dtype)
-        set_ssd_rank1_static_shape(BH=BH, N=N, M=M, D=D)
+        set_ssd_rank1_static_shape(N=N, M=M, D=D)
         y, s = ssd_rank1_triton(
             C,
             W,

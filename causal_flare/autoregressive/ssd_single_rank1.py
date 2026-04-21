@@ -19,7 +19,7 @@ from causal_flare.autoregressive.ssd_rank1_triton import (
     ssd_rank1_prefix_scan_bwd_dense_kernel as ssd_single_rank1_phase2_prefix_scan_bwd_dense_kernel,
 )
 
-_SUPPORTED_D_VALUES = {32, 64, 128}
+_SUPPORTED_D_VALUES = {32, 64, 96, 128, 192, 256}
 _SUPPORTED_CHUNK_SIZES = {32, 64, 128, 256}
 _SUPPORTED_BLOCK_X_VALUES = (128, 64, 32, 16)
 _INV_LN2 = 1.4426950408889634
@@ -27,6 +27,51 @@ _USE_BF16_DOT_FOR_TENSOR_CORES = True
 
 _EXPERIMENTAL_TRITON_ALLOCATOR_SET = False
 _PHASE_BWD_WORKSPACE: dict[tuple, torch.Tensor] = {}
+
+_SSD_SINGLE_TUNED_2048: dict[int, dict[str, tuple[int, int, int] | int]] = {
+    32: {
+        "chunk_size": 64,
+        "phase1_fwd": (32, 2, 2),
+        "phase3_fwd": (32, 2, 2),
+        "phase3_bwd": (32, 2, 3),
+        "phase1_bwd": (32, 2, 2),
+    },
+    64: {
+        "chunk_size": 64,
+        "phase1_fwd": (64, 2, 2),
+        "phase3_fwd": (64, 2, 2),
+        "phase3_bwd": (64, 2, 3),
+        "phase1_bwd": (64, 2, 2),
+    },
+    96: {
+        "chunk_size": 64,
+        "phase1_fwd": (32, 4, 2),
+        "phase3_fwd": (32, 4, 3),
+        "phase3_bwd": (32, 2, 3),
+        "phase1_bwd": (32, 4, 2),
+    },
+    128: {
+        "chunk_size": 64,
+        "phase1_fwd": (128, 2, 2),
+        "phase3_fwd": (128, 4, 4),
+        "phase3_bwd": (32, 2, 3),
+        "phase1_bwd": (128, 4, 2),
+    },
+    192: {
+        "chunk_size": 64,
+        "phase1_fwd": (64, 4, 2),
+        "phase3_fwd": (64, 4, 2),
+        "phase3_bwd": (64, 4, 3),
+        "phase1_bwd": (64, 4, 2),
+    },
+    256: {
+        "chunk_size": 64,
+        "phase1_fwd": (128, 4, 2),
+        "phase3_fwd": (128, 4, 3),
+        "phase3_bwd": (64, 4, 3),
+        "phase1_bwd": (128, 4, 2),
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -122,15 +167,13 @@ def _select_largest_block_size(size: int, candidates: tuple[int, ...], *, where:
     )
 
 
-def _select_chunk_size_heuristic(*, N: int, D: int, BH: int) -> int:
+def _select_chunk_size_heuristic(*, N: int, D: int) -> int:
     """Heuristic CHUNK_SIZE picker for the supported contract."""
-    # Tuned hot-shape override:
-    #   B=32, H=16, N=2048, D=64/128 -> CHUNK_SIZE=64 gave the best e2e fwd+bwd.
-    if N == 2048 and BH == 512 and D in (64, 128):
-        return 64
+    if N == 2048 and D in _SSD_SINGLE_TUNED_2048:
+        return int(_SSD_SINGLE_TUNED_2048[D]["chunk_size"])
     if D >= 128:
         return 32
-    if D <= 32 and N >= 4096 and BH <= 2048:
+    if D <= 32 and N >= 4096:
         return 128
     return 64
 
@@ -144,25 +187,25 @@ def _select_phase2_block_nc(*, NC: int) -> int:
 
 def _select_phase2_md_launch(*, MD: int) -> tuple[int, int, int]:
     """Heuristic phase-2 BLOCK_MD/num_warps/num_stages for imported rank1 kernels."""
-    if MD % 64 != 0:
-        raise NotImplementedError(f"_select_phase2_md_launch requires MD divisible by 64; got MD={MD}.")
+    if MD % 32 != 0:
+        raise NotImplementedError(f"_select_phase2_md_launch requires MD divisible by 32; got MD={MD}.")
     if MD >= 8192:
         return (512 if MD % 512 == 0 else 256, 8, 3)
     if MD >= 4096:
         return (256, 4, 3)
     if MD >= 2048:
         return (128, 4, 2)
+    if MD >= 1024:
+        return (64 if MD % 64 == 0 else 32, 2, 2)
     if MD >= 128:
-        return (128, 4, 2)
-    return (64, 2, 2)
+        return (64 if MD % 64 == 0 else 32, 2, 2)
+    return (32, 2, 2)
 
 
 def _select_phase1_forward_launch_config(*, BH: int, NC: int, C_CHUNK: int, D: int) -> _Phase1ForwardLaunchConfig:
-    # Tuned hot-shape override for N=2048, BH=512, CHUNK=64.
-    if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 64:
-        return _Phase1ForwardLaunchConfig(block_d=64, num_warps=2, num_stages=2)
-    if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 128:
-        return _Phase1ForwardLaunchConfig(block_d=128, num_warps=2, num_stages=2)
+    if NC * C_CHUNK == 2048 and C_CHUNK == 64 and D in _SSD_SINGLE_TUNED_2048:
+        block_d, num_warps, num_stages = _SSD_SINGLE_TUNED_2048[D]["phase1_fwd"]
+        return _Phase1ForwardLaunchConfig(block_d=block_d, num_warps=num_warps, num_stages=num_stages)
 
     block_d = _select_largest_block_size(D, _SUPPORTED_BLOCK_X_VALUES, where="phase1_fwd", label="D")
     work_items = BH * NC
@@ -174,11 +217,9 @@ def _select_phase1_forward_launch_config(*, BH: int, NC: int, C_CHUNK: int, D: i
 
 
 def _select_phase3_forward_launch_config(*, BH: int, NC: int, C_CHUNK: int, D: int) -> _Phase3ForwardLaunchConfig:
-    # Tuned hot-shape override for N=2048, BH=512, CHUNK=64.
-    if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 64:
-        return _Phase3ForwardLaunchConfig(block_d=64, num_warps=2, num_stages=3)
-    if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 128:
-        return _Phase3ForwardLaunchConfig(block_d=128, num_warps=4, num_stages=2)
+    if NC * C_CHUNK == 2048 and C_CHUNK == 64 and D in _SSD_SINGLE_TUNED_2048:
+        block_d, num_warps, num_stages = _SSD_SINGLE_TUNED_2048[D]["phase3_fwd"]
+        return _Phase3ForwardLaunchConfig(block_d=block_d, num_warps=num_warps, num_stages=num_stages)
 
     block_d = _select_largest_block_size(D, _SUPPORTED_BLOCK_X_VALUES, where="phase3_fwd", label="D")
     work_items = BH * NC
@@ -190,12 +231,9 @@ def _select_phase3_forward_launch_config(*, BH: int, NC: int, C_CHUNK: int, D: i
 
 
 def _select_phase3_backward_launch_config(*, BH: int, NC: int, C_CHUNK: int, D: int) -> _Phase3BackwardLaunchConfig:
-    # Tuned hot-shape override for N=2048, BH=512, CHUNK=64.
-    if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 64:
-        return _Phase3BackwardLaunchConfig(block_d=64, num_warps=2, num_stages=3)
-    if C_CHUNK == 64 and BH == 512 and NC == 32 and D == 128:
-        # Retuned after enabling bf16 tensor-core dot path in phase-3 backward.
-        return _Phase3BackwardLaunchConfig(block_d=32, num_warps=2, num_stages=3)
+    if NC * C_CHUNK == 2048 and C_CHUNK == 64 and D in _SSD_SINGLE_TUNED_2048:
+        block_d, num_warps, num_stages = _SSD_SINGLE_TUNED_2048[D]["phase3_bwd"]
+        return _Phase3BackwardLaunchConfig(block_d=block_d, num_warps=num_warps, num_stages=num_stages)
 
     block_d = 64 if D % 64 == 0 else _select_largest_block_size(D, (32, 16), where="phase3_bwd", label="D")
     if C_CHUNK == 64 and block_d == 64 and BH * NC >= 4096:
@@ -206,11 +244,9 @@ def _select_phase3_backward_launch_config(*, BH: int, NC: int, C_CHUNK: int, D: 
 
 
 def _select_phase1_backward_launch_config(*, D: int) -> _Phase1BackwardLaunchConfig:
-    # Tuned hot-shape override for the N=2048 runs above.
-    if D == 64:
-        return _Phase1BackwardLaunchConfig(block_d=64, num_warps=2, num_stages=2)
-    if D == 128:
-        return _Phase1BackwardLaunchConfig(block_d=128, num_warps=4, num_stages=2)
+    if D in _SSD_SINGLE_TUNED_2048:
+        block_d, num_warps, num_stages = _SSD_SINGLE_TUNED_2048[D]["phase1_bwd"]
+        return _Phase1BackwardLaunchConfig(block_d=block_d, num_warps=num_warps, num_stages=num_stages)
 
     block_d = _select_largest_block_size(D, _SUPPORTED_BLOCK_X_VALUES, where="phase1_bwd", label="D")
     if D >= 128:
@@ -1579,8 +1615,8 @@ def ssd_single_rank1_triton(
     INPUT_PRECISION: str = "tf32",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if CHUNK_SIZE is None:
-        B0, N0, H0, D0 = V.shape
-        CHUNK_SIZE = _select_chunk_size_heuristic(N=N0, D=D0, BH=B0 * H0)
+        _, N0, _, D0 = V.shape
+        CHUNK_SIZE = _select_chunk_size_heuristic(N=N0, D=D0)
     y_chunk, S1_chunk = SsdSingleRank1Triton.apply(
         V, log_alpha, initial_state, CHUNK_SIZE, INPUT_PRECISION
     )
