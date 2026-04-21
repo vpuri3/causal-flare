@@ -225,6 +225,7 @@ def _prepare_triton_inputs(
     *,
     where: str,
     CHUNK_SIZE: int,
+    require_supported_d: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int, int]:
     if V.ndim != 4 or log_alpha.ndim != 3:
         raise ValueError(
@@ -238,7 +239,7 @@ def _prepare_triton_inputs(
         raise ValueError(f"{where}: V and log_alpha must be on the same device.")
     if V.dtype != log_alpha.dtype:
         raise ValueError(f"{where}: V and log_alpha must share dtype.")
-    if D not in _SUPPORTED_D_VALUES:
+    if require_supported_d and D not in _SUPPORTED_D_VALUES:
         raise NotImplementedError(f"{where} requires D in {sorted(_SUPPORTED_D_VALUES)}; got D={D}.")
     _require_supported_forward_contract(B * H, N, CHUNK_SIZE=CHUNK_SIZE, where=where)
     _require_nonpositive_log_alpha(log_alpha, where=where)
@@ -618,7 +619,12 @@ def ssd_single_rank1_pytorch(
     if CHUNK_SIZE is None:
         CHUNK_SIZE = 64
     V_chunk, log_alpha_chunk, init_flat, B, N, H, _D, _NC = _prepare_triton_inputs(
-        V, log_alpha, initial_state, where="ssd_single_rank1_pytorch", CHUNK_SIZE=CHUNK_SIZE
+        V,
+        log_alpha,
+        initial_state,
+        where="ssd_single_rank1_pytorch",
+        CHUNK_SIZE=CHUNK_SIZE,
+        require_supported_d=False,
     )
     S_local_end = ssd_single_rank1_chunk_end_state_reference(V_chunk, log_alpha_chunk)
     alpha_chunk = torch.exp2(torch.sum(log_alpha_chunk.float(), dim=-1) * _INV_LN2)
