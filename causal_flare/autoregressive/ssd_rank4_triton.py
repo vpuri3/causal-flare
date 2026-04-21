@@ -2264,28 +2264,16 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
     log_suffix_incl = tl.cumsum(log_alpha_vals, axis=0, reverse=True)
     factors = tl.exp2((log_suffix_incl - log_alpha_vals) * INV_LN2)
 
-    # dW for rank-1 (and optional rank-2/3) over M tiles.
+    # dW over M tiles, processed rank-by-rank to reduce live accumulator pressure.
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
         acc1 = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
-        acc2 = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
-        acc3 = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
-        acc4 = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
         for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
             d_start = d_blk * BLOCK_D
             g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
             g_tile_tc = g_tile.to(tl.bfloat16)
             v1_tile = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
             acc1 = acc1 + tl.dot(v1_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if RANK >= 2:
-                v2_tile = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                acc2 = acc2 + tl.dot(v2_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if RANK >= 3:
-                v3_tile = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                acc3 = acc3 + tl.dot(v3_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if RANK >= 4:
-                v4_tile = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                acc4 = acc4 + tl.dot(v4_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dW1_tile = factors[:, None] * acc1
         w1_probe = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         if ACCUMULATE:
@@ -2293,6 +2281,13 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
         out_dw1_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW1_tile.to(w1_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
 
         if RANK >= 2:
+            acc2 = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
+            for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
+                d_start = d_blk * BLOCK_D
+                g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
+                g_tile_tc = g_tile.to(tl.bfloat16)
+                v2_tile = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
+                acc2 = acc2 + tl.dot(v2_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dW2_tile = factors[:, None] * acc2
             w2_probe = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             if ACCUMULATE:
@@ -2300,41 +2295,43 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
             out_dw2_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW2_tile.to(w2_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
 
         if RANK >= 3:
+            acc3 = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
+            for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
+                d_start = d_blk * BLOCK_D
+                g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
+                g_tile_tc = g_tile.to(tl.bfloat16)
+                v3_tile = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
+                acc3 = acc3 + tl.dot(v3_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dW3_tile = factors[:, None] * acc3
             w3_probe = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             if ACCUMULATE:
                 dW3_tile += tl.reshape(out_dw3_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
             out_dw3_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW3_tile.to(w3_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
         if RANK >= 4:
+            acc4 = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
+            for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
+                d_start = d_blk * BLOCK_D
+                g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
+                g_tile_tc = g_tile.to(tl.bfloat16)
+                v4_tile = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
+                acc4 = acc4 + tl.dot(v4_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dW4_tile = factors[:, None] * acc4
             w4_probe = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             if ACCUMULATE:
                 dW4_tile += tl.reshape(out_dw4_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
             out_dw4_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW4_tile.to(w4_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
 
-    # dV and dlog ingredients.
+    # dV and dlog ingredients, likewise rank-by-rank.
     b_vals = tl.zeros((BLOCK_C,), dtype=tl.float32)
     for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
         d_start = d_blk * BLOCK_D
         acc1 = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
-        acc2 = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
-        acc3 = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
-        acc4 = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
         for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
             m_start = m_blk * BLOCK_M
             g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
             g_tile_tc = g_tile.to(tl.bfloat16)
             w1_tile = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
             acc1 = acc1 + tl.dot(w1_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if RANK >= 2:
-                w2_tile = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                acc2 = acc2 + tl.dot(w2_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if RANK >= 3:
-                w3_tile = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                acc3 = acc3 + tl.dot(w3_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if RANK >= 4:
-                w4_tile = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                acc4 = acc4 + tl.dot(w4_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dV1_tile = factors[:, None] * acc1
         v1_probe = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
         if ACCUMULATE:
@@ -2344,6 +2341,13 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
         b_vals += tl.sum(acc1 * v1_tile, axis=1)
 
         if RANK >= 2:
+            acc2 = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
+            for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
+                m_start = m_blk * BLOCK_M
+                g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
+                g_tile_tc = g_tile.to(tl.bfloat16)
+                w2_tile = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+                acc2 = acc2 + tl.dot(w2_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dV2_tile = factors[:, None] * acc2
             v2_probe = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
             if ACCUMULATE:
@@ -2353,6 +2357,13 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
             b_vals += tl.sum(acc2 * v2_tile, axis=1)
 
         if RANK >= 3:
+            acc3 = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
+            for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
+                m_start = m_blk * BLOCK_M
+                g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
+                g_tile_tc = g_tile.to(tl.bfloat16)
+                w3_tile = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+                acc3 = acc3 + tl.dot(w3_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dV3_tile = factors[:, None] * acc3
             v3_probe = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
             if ACCUMULATE:
@@ -2361,6 +2372,13 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
             v3_tile = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
             b_vals += tl.sum(acc3 * v3_tile, axis=1)
         if RANK >= 4:
+            acc4 = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
+            for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
+                m_start = m_blk * BLOCK_M
+                g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
+                g_tile_tc = g_tile.to(tl.bfloat16)
+                w4_tile = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
+                acc4 = acc4 + tl.dot(w4_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dV4_tile = factors[:, None] * acc4
             v4_probe = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
             if ACCUMULATE:
@@ -4116,20 +4134,13 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
         if RANK >= 4:
             W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             R4 = R4 + tl.dot(C_tc, tl.trans(W4_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    K1 = L * R1
+    K1_tc = (L * R1).to(tl.bfloat16)
     if RANK >= 2:
-        K2 = L * R2
+        K2_tc = (L * R2).to(tl.bfloat16)
     if RANK >= 3:
-        K3 = L * R3
+        K3_tc = (L * R3).to(tl.bfloat16)
     if RANK >= 4:
-        K4 = L * R4
-    K1_tc = K1.to(tl.bfloat16)
-    if RANK >= 2:
-        K2_tc = K2.to(tl.bfloat16)
-    if RANK >= 3:
-        K3_tc = K3.to(tl.bfloat16)
-    if RANK >= 4:
-        K4_tc = K4.to(tl.bfloat16)
+        K4_tc = (L * R4).to(tl.bfloat16)
     dK1 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     if RANK >= 2:
         dK2 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
@@ -4163,39 +4174,29 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
             dK4 = dK4 + tl.dot(G_tc, tl.trans(V4_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dv4_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV4_tile.to(V4_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
-    dR1 = dK1 * L
-    if RANK >= 2:
-        dR2 = dK2 * L
-    if RANK >= 3:
-        dR3 = dK3 * L
-    if RANK >= 4:
-        dR4 = dK4 * L
-    dR1_tc = dR1.to(tl.bfloat16)
-    if RANK >= 2:
-        dR2_tc = dR2.to(tl.bfloat16)
-    if RANK >= 3:
-        dR3_tc = dR3.to(tl.bfloat16)
-    if RANK >= 4:
-        dR4_tc = dR4.to(tl.bfloat16)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
         C_in = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         C_tc = C_in.to(tl.bfloat16)
+        dR1_tc = (dK1 * L).to(tl.bfloat16)
         W1_in = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         W1_tc = W1_in.to(tl.bfloat16)
         dC_tile = tl.dot(dR1_tc, W1_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dW1_tile = tl.dot(tl.trans(dR1_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         if RANK >= 2:
+            dR2_tc = (dK2 * L).to(tl.bfloat16)
             W2_in = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             W2_tc = W2_in.to(tl.bfloat16)
             dC_tile = dC_tile + tl.dot(dR2_tc, W2_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dW2_tile = tl.dot(tl.trans(dR2_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         if RANK >= 3:
+            dR3_tc = (dK3 * L).to(tl.bfloat16)
             W3_in = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             W3_tc = W3_in.to(tl.bfloat16)
             dC_tile = dC_tile + tl.dot(dR3_tc, W3_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dW3_tile = tl.dot(tl.trans(dR3_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         if RANK >= 4:
+            dR4_tc = (dK4 * L).to(tl.bfloat16)
             W4_in = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             W4_tc = W4_in.to(tl.bfloat16)
             dC_tile = dC_tile + tl.dot(dR4_tc, W4_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
@@ -4209,13 +4210,13 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
         if RANK >= 4:
             dw4_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW4_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
 
-    Q = dR1 * R1
+    Q = (dK1 * L) * R1
     if RANK >= 2:
-        Q += dR2 * R2
+        Q += (dK2 * L) * R2
     if RANK >= 3:
-        Q += dR3 * R3
+        Q += (dK3 * L) * R3
     if RANK >= 4:
-        Q += dR4 * R4
+        Q += (dK4 * L) * R4
     left_prefix = tl.cumsum(Q, axis=1)
     left_of = left_prefix - Q
     suffix_rows = tl.flip(tl.cumsum(tl.flip(left_of, 0), axis=0), 0)
