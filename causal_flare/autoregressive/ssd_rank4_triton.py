@@ -6,10 +6,10 @@
 # Dtype: bf16 forward, fp32 backward (with bf16 tensor-core dot inputs)
 #
 # rank | fwd_p1 | fwd_p2 | fwd_p3 | fwd_total | bwd_p3 | bwd_p2 | bwd_p1 | bwd_total | step_total
-# 1    | 0.734  | 0.452  | 0.862  | 2.049     | 4.223  | 0.617  | 1.000  | 5.840     | 7.889
-# 2    | 1.153  | 0.444  | 1.145  | 2.742     | 6.288  | 0.616  | 2.563  | 9.467     | 12.209
-# 3    | 1.706  | 0.449  | 1.751  | 3.906     | 8.610  | 0.617  | 4.758  | 13.985    | 17.891
-# 4    | 2.142  | 0.446  | 2.933  | 5.520     | 11.343 | 0.617  | 6.740  | 18.700    | 24.220
+# 1    | 0.745  | 0.457  | 0.876  | 2.078     | 3.269  | 0.617  | 1.001  | 4.888     | 6.966
+# 2    | 1.164  | 0.449  | 1.151  | 2.765     | 5.109  | 0.616  | 2.433  | 8.158     | 10.923
+# 3    | 1.694  | 0.451  | 1.755  | 3.900     | 7.499  | 0.616  | 3.761  | 11.877    | 15.777
+# 4    | 2.160  | 0.459  | 2.950  | 5.569     | 10.383 | 0.616  | 4.958  | 15.957    | 21.526
 # -----------------------------------------------------------------------------------------------
 #
 # Global Relative Error Snapshot (L2): ||ref - test|| / ||ref||
@@ -18,10 +18,10 @@
 # Oracle: ssd_rank4_token_loop_oracle, Test: ssd_rank4_triton
 #
 # rank | y_rel_l2  | state_rel_l2 | grad_rel_l2_global | dlog_rel_l2
-# 1    | 0.00421742| 0.00353327   | 0.00444811         | 0.00620205
-# 2    | 0.00454906| 0.00373064   | 0.00456165         | 0.00620682
-# 3    | 0.00477912| 0.00374408   | 0.00464256         | 0.00655972
-# 4    | 0.00498050| 0.00433443   | 0.00471568         | 0.00660884
+# 1    | 0.00425018| 0.00319833   | 0.00445858         | 0.00615416
+# 2    | 0.00458481| 0.00375236   | 0.00456373         | 0.00625915
+# 3    | 0.00478156| 0.00389224   | 0.00463168         | 0.00644606
+# 4    | 0.00498065| 0.00391202   | 0.00471828         | 0.00667743
 # -----------------------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -389,7 +389,13 @@ _STATIC_SSD_RANK1_SHAPE_CONFIGS: dict[tuple[int, int, int], _StaticSsdRank1Shape
     ),
 }
 
-_ACTIVE_STATIC_SSD_RANK1_KEY: tuple[int, int, int] | None = None
+_STATIC_SSD_SHAPE_RANK_CONFIGS: dict[tuple[int, int, int, int], _StaticSsdRank1ShapeConfig] = {
+    (N, M, D, rank): cfg
+    for (N, M, D), cfg in _STATIC_SSD_RANK1_SHAPE_CONFIGS.items()
+    for rank in (1, 2, 3, 4)
+}
+
+_ACTIVE_STATIC_SSD_RANK1_KEY: tuple[int, int, int, int] | None = None
 _ACTIVE_STATIC_SSD_RANK1_CONFIG: _StaticSsdRank1ShapeConfig | None = None
 _STATIC_SSD_RANK1_WORKSPACES: dict[tuple[tuple[int, int, int, int], tuple[str, int], bool], _StaticSsdRank1Workspace] = {}
 
@@ -447,12 +453,28 @@ def _lookup_static_ssd_rank1_shape_config(*, N: int, M: int, D: int) -> _StaticS
     return cfg
 
 
+def _lookup_static_ssd_shape_rank_config(*, N: int, M: int, D: int, RANK: int) -> _StaticSsdRank1ShapeConfig:
+    key = (N, M, D, RANK)
+    cfg = _STATIC_SSD_SHAPE_RANK_CONFIGS.get(key)
+    if cfg is None:
+        supported = sorted(_STATIC_SSD_SHAPE_RANK_CONFIGS.keys())
+        raise NotImplementedError(
+            "No static SSD launch config for shape+rank "
+            f"(N={N}, M={M}, D={D}, RANK={RANK}). Supported keys: {supported}."
+        )
+    return cfg
+
+
+def _set_active_static_shape_rank(*, N: int, M: int, D: int, RANK: int) -> None:
+    global _ACTIVE_STATIC_SSD_RANK1_KEY, _ACTIVE_STATIC_SSD_RANK1_CONFIG
+    cfg = _lookup_static_ssd_shape_rank_config(N=N, M=M, D=D, RANK=RANK)
+    _ACTIVE_STATIC_SSD_RANK1_KEY = (N, M, D, RANK)
+    _ACTIVE_STATIC_SSD_RANK1_CONFIG = cfg
+
+
 def set_ssd_rank1_static_shape(*, N: int, M: int, D: int) -> None:
     """Bind a single static shape config for all subsequent hot-path calls."""
-    global _ACTIVE_STATIC_SSD_RANK1_KEY, _ACTIVE_STATIC_SSD_RANK1_CONFIG
-    cfg = _lookup_static_ssd_rank1_shape_config(N=N, M=M, D=D)
-    _ACTIVE_STATIC_SSD_RANK1_KEY = (N, M, D)
-    _ACTIVE_STATIC_SSD_RANK1_CONFIG = cfg
+    _set_active_static_shape_rank(N=N, M=M, D=D, RANK=1)
 
 
 def clear_ssd_rank1_static_shape() -> None:
@@ -471,6 +493,7 @@ def _validate_static_hot_path_contract(
     CHUNK_SIZE: int | None,
     INPUT_PRECISION: str,
     RETURN_FINAL_STATE: bool,
+    RANK: int = 1,
 ) -> _StaticSsdRank1ShapeConfig:
     if C.ndim != 4 or W.ndim != 4 or V.ndim != 4 or log_alpha.ndim != 3:
         raise ValueError(
@@ -492,15 +515,18 @@ def _validate_static_hot_path_contract(
     if not C.is_contiguous() or not W.is_contiguous() or not V.is_contiguous() or not log_alpha.is_contiguous():
         raise ValueError("Static SSD rank1 path requires contiguous C/W/V/log_alpha.")
     global _ACTIVE_STATIC_SSD_RANK1_KEY, _ACTIVE_STATIC_SSD_RANK1_CONFIG
-    shape_key = (N, M, D)
+    shape_key = (N, M, D, RANK)
     if _ACTIVE_STATIC_SSD_RANK1_CONFIG is None:
-        set_ssd_rank1_static_shape(N=shape_key[0], M=shape_key[1], D=shape_key[2])
-    if _ACTIVE_STATIC_SSD_RANK1_KEY != shape_key:
+        _set_active_static_shape_rank(N=N, M=M, D=D, RANK=RANK)
+    assert _ACTIVE_STATIC_SSD_RANK1_KEY is not None
+    if _ACTIVE_STATIC_SSD_RANK1_KEY[:3] != shape_key[:3]:
         raise ValueError(
             "Static SSD rank1 path is bound to one shape per process. "
             f"Active={_ACTIVE_STATIC_SSD_RANK1_KEY}, requested={shape_key}. "
             "Call clear_ssd_rank1_static_shape() then set_ssd_rank1_static_shape(...) to switch."
         )
+    if _ACTIVE_STATIC_SSD_RANK1_KEY != shape_key:
+        _set_active_static_shape_rank(N=N, M=M, D=D, RANK=RANK)
     assert _ACTIVE_STATIC_SSD_RANK1_CONFIG is not None
     cfg = _ACTIVE_STATIC_SSD_RANK1_CONFIG
     if cfg.has_initial_state:
@@ -1233,16 +1259,6 @@ def ssd_rank4_triton(
     _require_nonpositive_log_alpha(log_alpha, where="ssd_rank4_triton")
     _require_supported_md(M, D, where="ssd_rank4_triton")
 
-    cfg = _validate_static_hot_path_contract(
-        C,
-        W1,
-        V1,
-        log_alpha,
-        initial_state,
-        CHUNK_SIZE,
-        INPUT_PRECISION,
-        RETURN_FINAL_STATE,
-    )
     rank = 1
     if W2 is not None and V2 is not None:
         rank = 2
@@ -1256,6 +1272,17 @@ def ssd_rank4_triton(
         rank = 4
         if not W4.is_contiguous() or not V4.is_contiguous():
             raise ValueError("ssd_rank4_triton requires contiguous W4/V4 on the static path.")
+    cfg = _validate_static_hot_path_contract(
+        C,
+        W1,
+        V1,
+        log_alpha,
+        initial_state,
+        CHUNK_SIZE,
+        INPUT_PRECISION,
+        RETURN_FINAL_STATE,
+        RANK=rank,
+    )
 
     W2_eff = W2 if rank >= 2 else W1.detach()
     V2_eff = V2 if rank >= 2 else V1.detach()
@@ -3603,7 +3630,7 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
     Q = dR * R
     left_prefix = tl.cumsum(Q, axis=1)
     left_of = left_prefix - Q
-    suffix_rows = tl.flip(tl.cumsum(tl.flip(left_of, 0), axis=0), 0)
+    suffix_rows = tl.cumsum(left_of, axis=0, reverse=True)
     is_diag = offs_c[:, None] == offs_c[None, :]
     dlog = tl.sum(tl.where(is_diag, suffix_rows, 0.0), axis=1)
     dlog_desc.store([BH_IDX, NC_IDX, 0], tl.reshape(dlog, (1, 1, BLOCK_C)))
@@ -4219,7 +4246,7 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
         Q += (dK4 * L) * R4
     left_prefix = tl.cumsum(Q, axis=1)
     left_of = left_prefix - Q
-    suffix_rows = tl.flip(tl.cumsum(tl.flip(left_of, 0), axis=0), 0)
+    suffix_rows = tl.cumsum(left_of, axis=0, reverse=True)
     is_diag = offs_c[:, None] == offs_c[None, :]
     dlog = tl.sum(tl.where(is_diag, suffix_rows, 0.0), axis=1)
     dlog_desc.store([BH_IDX, NC_IDX, 0], tl.reshape(dlog, (1, 1, BLOCK_C)))
@@ -6126,6 +6153,7 @@ class SsdRank4TritonStatic(torch.autograd.Function):
             CHUNK_SIZE,
             INPUT_PRECISION,
             RETURN_FINAL_STATE,
+            RANK=RANK,
         )
         _ensure_triton_allocator()
         (
@@ -6206,7 +6234,7 @@ class SsdRank4TritonStatic(torch.autograd.Function):
         CHUNK_SIZE = ctx.CHUNK_SIZE
         BH = B * H
         rank = ctx.rank
-        cfg = _lookup_static_ssd_rank1_shape_config(N=N, M=M, D=D)
+        cfg = _lookup_static_ssd_shape_rank_config(N=N, M=M, D=D, RANK=rank)
         ws = _get_static_workspace(device=C.device, cfg_key=(BH, N, M, D), cfg=cfg, allocate_phase3_s0=False)
 
         (
