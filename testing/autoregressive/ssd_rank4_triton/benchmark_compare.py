@@ -219,9 +219,7 @@ def _phase_timing_rank(
                 logc,
                 cfg=cfg,
                 ws=ws,
-                has_rank2=has_rank2,
-                has_rank3=has_rank3,
-                has_rank4=has_rank4,
+                rank=rank,
             )
         )
 
@@ -246,9 +244,7 @@ def _phase_timing_rank(
                 s0_chunk,
                 cfg=cfg,
                 ws=ws,
-                has_rank2=has_rank2,
-                has_rank3=has_rank3,
-                has_rank4=has_rank4,
+                rank=rank,
             )
         )
 
@@ -266,9 +262,7 @@ def _phase_timing_rank(
             s0_chunk,
             cfg=cfg,
             ws=ws,
-            has_rank2=has_rank2,
-            has_rank3=has_rank3,
-            has_rank4=has_rank4,
+            rank=rank,
         )
         grad_y = torch.randn_like(y_chunk)
 
@@ -288,9 +282,7 @@ def _phase_timing_rank(
                 s0_chunk,
                 cfg=cfg,
                 ws=ws,
-                has_rank2=has_rank2,
-                has_rank3=has_rank3,
-                has_rank4=has_rank4,
+                rank=rank,
             )
         )
         dC, dW1, dV1, dW2, dV2, dW3, dV3, dW4, dV4, dlog_phase3, dS0 = s4._ssd_rank4_dense_output_backward_impl_static(
@@ -308,9 +300,7 @@ def _phase_timing_rank(
             s0_chunk,
             cfg=cfg,
             ws=ws,
-            has_rank2=has_rank2,
-            has_rank3=has_rank3,
-            has_rank4=has_rank4,
+            rank=rank,
         )
         dlog_chunk = ws.dlog_chunk_accum
         dlog_chunk.copy_(dlog_phase3)
@@ -351,9 +341,7 @@ def _phase_timing_rank(
                 dV4,
                 dlog_chunk,
                 cfg=cfg,
-                has_rank2=has_rank2,
-                has_rank3=has_rank3,
-                has_rank4=has_rank4,
+                rank=rank,
             )
         )
 

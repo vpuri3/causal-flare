@@ -1243,25 +1243,26 @@ def ssd_rank4_triton(
         INPUT_PRECISION,
         RETURN_FINAL_STATE,
     )
-    has_rank2 = W2 is not None and V2 is not None
-    has_rank3 = W3 is not None and V3 is not None
-    has_rank4 = W4 is not None and V4 is not None
-    if has_rank2:
+    rank = 1
+    if W2 is not None and V2 is not None:
+        rank = 2
         if not W2.is_contiguous() or not V2.is_contiguous():
             raise ValueError("ssd_rank4_triton requires contiguous W2/V2 on the static path.")
-    if has_rank3:
+    if W3 is not None and V3 is not None:
+        rank = 3
         if not W3.is_contiguous() or not V3.is_contiguous():
             raise ValueError("ssd_rank4_triton requires contiguous W3/V3 on the static path.")
-    if has_rank4:
+    if W4 is not None and V4 is not None:
+        rank = 4
         if not W4.is_contiguous() or not V4.is_contiguous():
             raise ValueError("ssd_rank4_triton requires contiguous W4/V4 on the static path.")
 
-    W2_eff = W2 if has_rank2 else W1.detach()
-    V2_eff = V2 if has_rank2 else V1.detach()
-    W3_eff = W3 if has_rank3 else W1.detach()
-    V3_eff = V3 if has_rank3 else V1.detach()
-    W4_eff = W4 if has_rank4 else W1.detach()
-    V4_eff = V4 if has_rank4 else V1.detach()
+    W2_eff = W2 if rank >= 2 else W1.detach()
+    V2_eff = V2 if rank >= 2 else V1.detach()
+    W3_eff = W3 if rank >= 3 else W1.detach()
+    V3_eff = V3 if rank >= 3 else V1.detach()
+    W4_eff = W4 if rank >= 4 else W1.detach()
+    V4_eff = V4 if rank >= 4 else V1.detach()
 
     y_chunk, S1_chunk = SsdRank4TritonStatic.apply(
         C,
@@ -1278,9 +1279,7 @@ def ssd_rank4_triton(
         cfg.chunk_size,
         cfg.input_precision,
         cfg.return_final_state,
-        has_rank2,
-        has_rank3,
-        has_rank4,
+        rank,
     )
     return _ssd_rank1_restore_output_layout(y_chunk, S1_chunk, B=B, N=N, H=H, C=cfg.chunk_size)
 
@@ -1714,7 +1713,7 @@ def ssd_rank1_chunk_end_state_fwd_kernel(
         A_f32 = sqrt_factors * W_blk.to(tl.float32)
         B_f32 = sqrt_factors * V_blk.to(tl.float32)
         # A^T @ B reproduces sum_t factor[t] * outer(W_t, V_t).
-        S += tl.dot(
+        S = S + tl.dot(
             tl.trans(A_f32.to(tl.bfloat16)),
             B_f32.to(tl.bfloat16),
             out_dtype=tl.float32,
@@ -1844,7 +1843,7 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
             v_tile = tl.reshape(v_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
             g_tile_tc = g_tile.to(tl.bfloat16)
             v_tile_tc = v_tile.to(tl.bfloat16)
-            acc += tl.dot(
+            acc = acc + tl.dot(
                 v_tile_tc,
                 tl.trans(g_tile_tc),
                 out_dtype=tl.float32,
@@ -1868,7 +1867,7 @@ def ssd_rank1_chunk_end_state_bwd_fused_kernel(
             w_tile = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
             g_tile_tc = g_tile.to(tl.bfloat16)
             w_tile_tc = w_tile.to(tl.bfloat16)
-            acc += tl.dot(
+            acc = acc + tl.dot(
                 w_tile_tc,
                 g_tile_tc,
                 out_dtype=tl.float32,
@@ -1935,9 +1934,7 @@ def ssd_rank4_chunk_end_state_fwd_kernel(
     BLOCK_C: tl.constexpr,
     C_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
-    HAS_RANK2: tl.constexpr,
-    HAS_RANK3: tl.constexpr,
-    HAS_RANK4: tl.constexpr,
+    RANK: tl.constexpr,
 ):
     """Phase-1 rank-4 forward: fused write accumulation with static rank guards."""
     pid_bhnc = tl.program_id(0)
@@ -2031,40 +2028,40 @@ def ssd_rank4_chunk_end_state_fwd_kernel(
         V1_blk = tl.reshape(v1_desc.load([B_IDX, NC_IDX, t_start, H_IDX, d_start]), (BLOCK_T, BLOCK_D))
         A1_f32 = sqrt_factors * W1_blk.to(tl.float32)
         B1_f32 = sqrt_factors * V1_blk.to(tl.float32)
-        S += tl.dot(
+        S = S + tl.dot(
             tl.trans(A1_f32.to(tl.bfloat16)),
             B1_f32.to(tl.bfloat16),
             out_dtype=tl.float32,
             input_precision=INPUT_PRECISION,
         )
-        if HAS_RANK2:
+        if RANK >= 2:
             W2_blk = tl.reshape(w2_desc.load([B_IDX, NC_IDX, t_start, H_IDX, m_start]), (BLOCK_T, BLOCK_M))
             V2_blk = tl.reshape(v2_desc.load([B_IDX, NC_IDX, t_start, H_IDX, d_start]), (BLOCK_T, BLOCK_D))
             A2_f32 = sqrt_factors * W2_blk.to(tl.float32)
             B2_f32 = sqrt_factors * V2_blk.to(tl.float32)
-            S += tl.dot(
+            S = S + tl.dot(
                 tl.trans(A2_f32.to(tl.bfloat16)),
                 B2_f32.to(tl.bfloat16),
                 out_dtype=tl.float32,
                 input_precision=INPUT_PRECISION,
             )
-        if HAS_RANK3:
+        if RANK >= 3:
             W3_blk = tl.reshape(w3_desc.load([B_IDX, NC_IDX, t_start, H_IDX, m_start]), (BLOCK_T, BLOCK_M))
             V3_blk = tl.reshape(v3_desc.load([B_IDX, NC_IDX, t_start, H_IDX, d_start]), (BLOCK_T, BLOCK_D))
             A3_f32 = sqrt_factors * W3_blk.to(tl.float32)
             B3_f32 = sqrt_factors * V3_blk.to(tl.float32)
-            S += tl.dot(
+            S = S + tl.dot(
                 tl.trans(A3_f32.to(tl.bfloat16)),
                 B3_f32.to(tl.bfloat16),
                 out_dtype=tl.float32,
                 input_precision=INPUT_PRECISION,
             )
-        if HAS_RANK4:
+        if RANK >= 4:
             W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, t_start, H_IDX, m_start]), (BLOCK_T, BLOCK_M))
             V4_blk = tl.reshape(v4_desc.load([B_IDX, NC_IDX, t_start, H_IDX, d_start]), (BLOCK_T, BLOCK_D))
             A4_f32 = sqrt_factors * W4_blk.to(tl.float32)
             B4_f32 = sqrt_factors * V4_blk.to(tl.float32)
-            S += tl.dot(
+            S = S + tl.dot(
                 tl.trans(A4_f32.to(tl.bfloat16)),
                 B4_f32.to(tl.bfloat16),
                 out_dtype=tl.float32,
@@ -2138,9 +2135,7 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
     D_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
     ACCUMULATE: tl.constexpr,
-    HAS_RANK2: tl.constexpr,
-    HAS_RANK3: tl.constexpr,
-    HAS_RANK4: tl.constexpr,
+    RANK: tl.constexpr,
 ):
     """Phase-1 rank-4 backward fused kernel."""
     pid_bhnc = tl.program_id(0)
@@ -2281,36 +2276,36 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
             g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
             g_tile_tc = g_tile.to(tl.bfloat16)
             v1_tile = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-            acc1 += tl.dot(v1_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK2:
+            acc1 = acc1 + tl.dot(v1_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if RANK >= 2:
                 v2_tile = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                acc2 += tl.dot(v2_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK3:
+                acc2 = acc2 + tl.dot(v2_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if RANK >= 3:
                 v3_tile = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                acc3 += tl.dot(v3_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK4:
+                acc3 = acc3 + tl.dot(v3_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if RANK >= 4:
                 v4_tile = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
-                acc4 += tl.dot(v4_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+                acc4 = acc4 + tl.dot(v4_tile.to(tl.bfloat16), tl.trans(g_tile_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dW1_tile = factors[:, None] * acc1
         w1_probe = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         if ACCUMULATE:
             dW1_tile += tl.reshape(out_dw1_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
         out_dw1_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW1_tile.to(w1_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
 
-        if HAS_RANK2:
+        if RANK >= 2:
             dW2_tile = factors[:, None] * acc2
             w2_probe = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             if ACCUMULATE:
                 dW2_tile += tl.reshape(out_dw2_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
             out_dw2_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW2_tile.to(w2_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
 
-        if HAS_RANK3:
+        if RANK >= 3:
             dW3_tile = factors[:, None] * acc3
             w3_probe = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             if ACCUMULATE:
                 dW3_tile += tl.reshape(out_dw3_desc.load([BH_IDX, NC_IDX, 0, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
             out_dw3_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW3_tile.to(w3_probe.dtype), (1, 1, BLOCK_C, BLOCK_M)))
-        if HAS_RANK4:
+        if RANK >= 4:
             dW4_tile = factors[:, None] * acc4
             w4_probe = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             if ACCUMULATE:
@@ -2330,16 +2325,16 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
             g_tile = tl.reshape(grad_s_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D)).to(tl.float32)
             g_tile_tc = g_tile.to(tl.bfloat16)
             w1_tile = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-            acc1 += tl.dot(w1_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK2:
+            acc1 = acc1 + tl.dot(w1_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if RANK >= 2:
                 w2_tile = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                acc2 += tl.dot(w2_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK3:
+                acc2 = acc2 + tl.dot(w2_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if RANK >= 3:
                 w3_tile = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                acc3 += tl.dot(w3_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            if HAS_RANK4:
+                acc3 = acc3 + tl.dot(w3_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            if RANK >= 4:
                 w4_tile = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M)).to(tl.float32)
-                acc4 += tl.dot(w4_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+                acc4 = acc4 + tl.dot(w4_tile.to(tl.bfloat16), g_tile_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dV1_tile = factors[:, None] * acc1
         v1_probe = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
         if ACCUMULATE:
@@ -2348,7 +2343,7 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
         v1_tile = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
         b_vals += tl.sum(acc1 * v1_tile, axis=1)
 
-        if HAS_RANK2:
+        if RANK >= 2:
             dV2_tile = factors[:, None] * acc2
             v2_probe = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
             if ACCUMULATE:
@@ -2357,7 +2352,7 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
             v2_tile = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
             b_vals += tl.sum(acc2 * v2_tile, axis=1)
 
-        if HAS_RANK3:
+        if RANK >= 3:
             dV3_tile = factors[:, None] * acc3
             v3_probe = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
             if ACCUMULATE:
@@ -2365,7 +2360,7 @@ def ssd_rank4_chunk_end_state_bwd_fused_kernel(
             out_dv3_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV3_tile.to(v3_probe.dtype), (1, 1, BLOCK_C, BLOCK_D)))
             v3_tile = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D)).to(tl.float32)
             b_vals += tl.sum(acc3 * v3_tile, axis=1)
-        if HAS_RANK4:
+        if RANK >= 4:
             dV4_tile = factors[:, None] * acc4
             v4_probe = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
             if ACCUMULATE:
@@ -3290,7 +3285,7 @@ def ssd_rank1_dense_output_fwd_kernel(
         W = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         C_tc = C.to(tl.bfloat16)
         W_tc = W.to(tl.bfloat16)
-        R += tl.dot(
+        R = R + tl.dot(
             C_tc,
             tl.trans(W_tc),
             out_dtype=tl.float32,
@@ -3318,7 +3313,7 @@ def ssd_rank1_dense_output_fwd_kernel(
         S0_blk = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D))
         C_blk_tc = C_blk.to(tl.bfloat16)
         S0_blk_tc = S0_blk.to(tl.bfloat16)
-        Y_off_base += tl.dot(
+        Y_off_base = Y_off_base + tl.dot(
             C_blk_tc,
             S0_blk_tc,
             out_dtype=tl.float32,
@@ -3528,7 +3523,7 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
         W_blk = tl.reshape(w_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         C_blk_tc = C_blk.to(tl.bfloat16)
         W_blk_tc = W_blk.to(tl.bfloat16)
-        R += tl.dot(
+        R = R + tl.dot(
             C_blk_tc,
             tl.trans(W_blk_tc),
             out_dtype=tl.float32,
@@ -3554,7 +3549,7 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
         )
         dv_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV_tile.to(V_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
-        dK += tl.dot(
+        dK = dK + tl.dot(
             G_tc,
             tl.trans(V_tc),
             out_dtype=tl.float32,
@@ -3619,7 +3614,7 @@ def ssd_rank1_dense_output_bwd_fused_kernel(
                     input_precision=INPUT_PRECISION,
                 )
                 src += tl.sum(G_tile * y_off_part, axis=1)
-                dC_off += tl.dot(
+                dC_off = dC_off + tl.dot(
                     dB_tile_tc,
                     tl.trans(S0_tile_tc),
                     out_dtype=tl.float32,
@@ -3702,9 +3697,7 @@ def ssd_rank4_dense_output_fwd_kernel(
     M_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
     WRITE_Y_OFF: tl.constexpr,
-    HAS_RANK2: tl.constexpr,
-    HAS_RANK3: tl.constexpr,
-    HAS_RANK4: tl.constexpr,
+    RANK: tl.constexpr,
 ):
     """Phase-3 rank-4 forward: fused rank accumulation with shared L."""
     pid_bhnc = tl.program_id(0)
@@ -3797,52 +3790,52 @@ def ssd_rank4_dense_output_fwd_kernel(
     L = tl.where(valid, tl.exp2(log_delta_l2), 0.0)
 
     R1 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
-    if HAS_RANK2:
+    if RANK >= 2:
         R2 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
-    if HAS_RANK3:
+    if RANK >= 3:
         R3 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
-    if HAS_RANK4:
+    if RANK >= 4:
         R4 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
         C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         C_tc = C_blk.to(tl.bfloat16)
         W1_blk = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-        R1 += tl.dot(C_tc, tl.trans(W1_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        if HAS_RANK2:
+        R1 = R1 + tl.dot(C_tc, tl.trans(W1_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if RANK >= 2:
             W2_blk = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-            R2 += tl.dot(C_tc, tl.trans(W2_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        if HAS_RANK3:
+            R2 = R2 + tl.dot(C_tc, tl.trans(W2_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if RANK >= 3:
             W3_blk = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-            R3 += tl.dot(C_tc, tl.trans(W3_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        if HAS_RANK4:
+            R3 = R3 + tl.dot(C_tc, tl.trans(W3_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if RANK >= 4:
             W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-            R4 += tl.dot(C_tc, tl.trans(W4_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            R4 = R4 + tl.dot(C_tc, tl.trans(W4_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     K1 = L * R1
-    if HAS_RANK2:
+    if RANK >= 2:
         K2 = L * R2
-    if HAS_RANK3:
+    if RANK >= 3:
         K3 = L * R3
-    if HAS_RANK4:
+    if RANK >= 4:
         K4 = L * R4
     d_start = pid_d_tile * BLOCK_D
     V1_in = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
     Y_diag = tl.dot(K1.to(tl.bfloat16), V1_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    if HAS_RANK2:
+    if RANK >= 2:
         V2_in = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-        Y_diag += tl.dot(K2.to(tl.bfloat16), V2_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    if HAS_RANK3:
+        Y_diag = Y_diag + tl.dot(K2.to(tl.bfloat16), V2_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+    if RANK >= 3:
         V3_in = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-        Y_diag += tl.dot(K3.to(tl.bfloat16), V3_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-    if HAS_RANK4:
+        Y_diag = Y_diag + tl.dot(K3.to(tl.bfloat16), V3_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+    if RANK >= 4:
         V4_in = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
-        Y_diag += tl.dot(K4.to(tl.bfloat16), V4_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        Y_diag = Y_diag + tl.dot(K4.to(tl.bfloat16), V4_in.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     Y_off_base = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
         C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         S0_blk = tl.reshape(s0_desc.load([BH_IDX, NC_IDX, m_start, d_start]), (BLOCK_M, BLOCK_D))
-        Y_off_base += tl.dot(C_blk.to(tl.bfloat16), S0_blk.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        Y_off_base = Y_off_base + tl.dot(C_blk.to(tl.bfloat16), S0_blk.to(tl.bfloat16), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     p = tl.exp2(log_p_incl * INV_LN2)
     Y_off = p[:, None] * Y_off_base
     Y = Y_diag + Y_off
@@ -3944,9 +3937,7 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
     D_STATIC: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
     HAS_S0: tl.constexpr,
-    HAS_RANK2: tl.constexpr,
-    HAS_RANK3: tl.constexpr,
-    HAS_RANK4: tl.constexpr,
+    RANK: tl.constexpr,
 ):
     """Phase-3 rank-4 backward fused kernel with shared L and rank guarded math."""
     pid_bhnc = tl.program_id(0)
@@ -4104,47 +4095,47 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
     L = tl.where(valid, tl.exp2(log_delta_l2), 0.0)
 
     R1 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
-    if HAS_RANK2:
+    if RANK >= 2:
         R2 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
-    if HAS_RANK3:
+    if RANK >= 3:
         R3 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
-    if HAS_RANK4:
+    if RANK >= 4:
         R4 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
         C_blk = tl.reshape(c_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
         C_tc = C_blk.to(tl.bfloat16)
         W1_blk = tl.reshape(w1_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-        R1 += tl.dot(C_tc, tl.trans(W1_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        if HAS_RANK2:
+        R1 = R1 + tl.dot(C_tc, tl.trans(W1_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if RANK >= 2:
             W2_blk = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-            R2 += tl.dot(C_tc, tl.trans(W2_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        if HAS_RANK3:
+            R2 = R2 + tl.dot(C_tc, tl.trans(W2_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if RANK >= 3:
             W3_blk = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-            R3 += tl.dot(C_tc, tl.trans(W3_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        if HAS_RANK4:
+            R3 = R3 + tl.dot(C_tc, tl.trans(W3_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        if RANK >= 4:
             W4_blk = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
-            R4 += tl.dot(C_tc, tl.trans(W4_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            R4 = R4 + tl.dot(C_tc, tl.trans(W4_blk.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
     K1 = L * R1
-    if HAS_RANK2:
+    if RANK >= 2:
         K2 = L * R2
-    if HAS_RANK3:
+    if RANK >= 3:
         K3 = L * R3
-    if HAS_RANK4:
+    if RANK >= 4:
         K4 = L * R4
     K1_tc = K1.to(tl.bfloat16)
-    if HAS_RANK2:
+    if RANK >= 2:
         K2_tc = K2.to(tl.bfloat16)
-    if HAS_RANK3:
+    if RANK >= 3:
         K3_tc = K3.to(tl.bfloat16)
-    if HAS_RANK4:
+    if RANK >= 4:
         K4_tc = K4.to(tl.bfloat16)
     dK1 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
-    if HAS_RANK2:
+    if RANK >= 2:
         dK2 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
-    if HAS_RANK3:
+    if RANK >= 3:
         dK3 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
-    if HAS_RANK4:
+    if RANK >= 4:
         dK4 = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
     for d_blk in tl.static_range(0, triton.cdiv(D_STATIC, BLOCK_D)):
         d_start = d_blk * BLOCK_D
@@ -4152,39 +4143,39 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
         G_tc = G_in.to(tl.bfloat16)
         V1_in = tl.reshape(v1_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
         dV1_tile = tl.dot(tl.trans(K1_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        dK1 += tl.dot(G_tc, tl.trans(V1_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+        dK1 = dK1 + tl.dot(G_tc, tl.trans(V1_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dv1_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV1_tile.to(V1_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
-        if HAS_RANK2:
+        if RANK >= 2:
             V2_in = tl.reshape(v2_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
             dV2_tile = tl.dot(tl.trans(K2_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            dK2 += tl.dot(G_tc, tl.trans(V2_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dK2 = dK2 + tl.dot(G_tc, tl.trans(V2_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dv2_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV2_tile.to(V2_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
-        if HAS_RANK3:
+        if RANK >= 3:
             V3_in = tl.reshape(v3_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
             dV3_tile = tl.dot(tl.trans(K3_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            dK3 += tl.dot(G_tc, tl.trans(V3_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dK3 = dK3 + tl.dot(G_tc, tl.trans(V3_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dv3_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV3_tile.to(V3_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
-        if HAS_RANK4:
+        if RANK >= 4:
             V4_in = tl.reshape(v4_desc.load([B_IDX, NC_IDX, 0, H_IDX, d_start]), (BLOCK_C, BLOCK_D))
             dV4_tile = tl.dot(tl.trans(K4_tc), G_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-            dK4 += tl.dot(G_tc, tl.trans(V4_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dK4 = dK4 + tl.dot(G_tc, tl.trans(V4_in.to(tl.bfloat16)), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dv4_desc.store([BH_IDX, NC_IDX, 0, d_start], tl.reshape(dV4_tile.to(V4_in.dtype), (1, 1, BLOCK_C, BLOCK_D)))
 
     dR1 = dK1 * L
-    if HAS_RANK2:
+    if RANK >= 2:
         dR2 = dK2 * L
-    if HAS_RANK3:
+    if RANK >= 3:
         dR3 = dK3 * L
-    if HAS_RANK4:
+    if RANK >= 4:
         dR4 = dK4 * L
     dR1_tc = dR1.to(tl.bfloat16)
-    if HAS_RANK2:
+    if RANK >= 2:
         dR2_tc = dR2.to(tl.bfloat16)
-    if HAS_RANK3:
+    if RANK >= 3:
         dR3_tc = dR3.to(tl.bfloat16)
-    if HAS_RANK4:
+    if RANK >= 4:
         dR4_tc = dR4.to(tl.bfloat16)
     for m_blk in tl.static_range(0, triton.cdiv(M_STATIC, BLOCK_M)):
         m_start = m_blk * BLOCK_M
@@ -4194,36 +4185,36 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
         W1_tc = W1_in.to(tl.bfloat16)
         dC_tile = tl.dot(dR1_tc, W1_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dW1_tile = tl.dot(tl.trans(dR1_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        if HAS_RANK2:
+        if RANK >= 2:
             W2_in = tl.reshape(w2_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             W2_tc = W2_in.to(tl.bfloat16)
-            dC_tile += tl.dot(dR2_tc, W2_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dC_tile = dC_tile + tl.dot(dR2_tc, W2_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dW2_tile = tl.dot(tl.trans(dR2_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        if HAS_RANK3:
+        if RANK >= 3:
             W3_in = tl.reshape(w3_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             W3_tc = W3_in.to(tl.bfloat16)
-            dC_tile += tl.dot(dR3_tc, W3_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dC_tile = dC_tile + tl.dot(dR3_tc, W3_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dW3_tile = tl.dot(tl.trans(dR3_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-        if HAS_RANK4:
+        if RANK >= 4:
             W4_in = tl.reshape(w4_desc.load([B_IDX, NC_IDX, 0, H_IDX, m_start]), (BLOCK_C, BLOCK_M))
             W4_tc = W4_in.to(tl.bfloat16)
-            dC_tile += tl.dot(dR4_tc, W4_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+            dC_tile = dC_tile + tl.dot(dR4_tc, W4_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
             dW4_tile = tl.dot(tl.trans(dR4_tc), C_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
         dc_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dC_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
         dw1_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW1_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
-        if HAS_RANK2:
+        if RANK >= 2:
             dw2_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW2_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
-        if HAS_RANK3:
+        if RANK >= 3:
             dw3_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW3_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
-        if HAS_RANK4:
+        if RANK >= 4:
             dw4_desc.store([BH_IDX, NC_IDX, 0, m_start], tl.reshape(dW4_tile.to(C_in.dtype), (1, 1, BLOCK_C, BLOCK_M)))
 
     Q = dR1 * R1
-    if HAS_RANK2:
+    if RANK >= 2:
         Q += dR2 * R2
-    if HAS_RANK3:
+    if RANK >= 3:
         Q += dR3 * R3
-    if HAS_RANK4:
+    if RANK >= 4:
         Q += dR4 * R4
     left_prefix = tl.cumsum(Q, axis=1)
     left_of = left_prefix - Q
@@ -4249,7 +4240,7 @@ def ssd_rank4_dense_output_bwd_fused_kernel(
                 dB_tc = dB_tile.to(tl.bfloat16)
                 S0_tc = S0_tile.to(tl.bfloat16)
                 y_off_part = p[:, None] * tl.dot(C_tile_tc, S0_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
-                dC_off += tl.dot(dB_tc, tl.trans(S0_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
+                dC_off = dC_off + tl.dot(dB_tc, tl.trans(S0_tc), out_dtype=tl.float32, input_precision=INPUT_PRECISION)
                 dS0_tile = tl.dot(tl.trans(C_tile_tc), dB_tc, out_dtype=tl.float32, input_precision=INPUT_PRECISION)
                 src += tl.sum(G_tile * y_off_part, axis=1)
                 ds0_desc.store([BH_IDX, NC_IDX, m_start, d_start], tl.reshape(dS0_tile, (1, 1, BLOCK_M, BLOCK_D)))
@@ -5806,9 +5797,7 @@ def _ssd_rank4_chunk_end_state_forward_impl_static(
     *,
     cfg: _StaticSsdRank1ShapeConfig,
     ws: _StaticSsdRank1Workspace,
-    has_rank2: bool,
-    has_rank3: bool,
-    has_rank4: bool,
+    rank: int,
 ) -> torch.Tensor:
     B, NC, C_CHUNK, H, M = W1_5d.shape
     D = V1_5d.shape[-1]
@@ -5843,9 +5832,7 @@ def _ssd_rank4_chunk_end_state_forward_impl_static(
         BLOCK_C=C_CHUNK,
         C_STATIC=C_CHUNK,
         INPUT_PRECISION=cfg.input_precision,
-        HAS_RANK2=has_rank2,
-        HAS_RANK3=has_rank3,
-        HAS_RANK4=has_rank4,
+        RANK=rank,
     )
     return s_local_end_md.reshape(BH, NC, M * D)
 
@@ -5865,9 +5852,7 @@ def _ssd_rank4_dense_output_forward_impl_static(
     *,
     cfg: _StaticSsdRank1ShapeConfig,
     ws: _StaticSsdRank1Workspace,
-    has_rank2: bool,
-    has_rank3: bool,
-    has_rank4: bool,
+    rank: int,
 ) -> torch.Tensor:
     B, NC, C_CHUNK, H, M = C_5d.shape
     D = V1_5d.shape[-1]
@@ -5910,9 +5895,7 @@ def _ssd_rank4_dense_output_forward_impl_static(
         M_STATIC=M,
         INPUT_PRECISION=cfg.input_precision,
         WRITE_Y_OFF=False,
-        HAS_RANK2=has_rank2,
-        HAS_RANK3=has_rank3,
-        HAS_RANK4=has_rank4,
+        RANK=rank,
         num_warps=cfg.phase3_forward.num_warps,
         num_stages=cfg.phase3_forward.num_stages,
     )
@@ -5935,9 +5918,7 @@ def _ssd_rank4_dense_output_backward_impl_static(
     *,
     cfg: _StaticSsdRank1ShapeConfig,
     ws: _StaticSsdRank1Workspace,
-    has_rank2: bool,
-    has_rank3: bool,
-    has_rank4: bool,
+    rank: int,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -5958,19 +5939,19 @@ def _ssd_rank4_dense_output_backward_impl_static(
     dV1 = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
     dC = torch.empty((BH, NC, C_CHUNK, M), device=C_5d.device, dtype=C_5d.dtype)
     dW1 = torch.empty((BH, NC, C_CHUNK, M), device=C_5d.device, dtype=C_5d.dtype)
-    if has_rank2:
+    if rank >= 2:
         dV2 = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
         dW2 = torch.empty((BH, NC, C_CHUNK, M), device=C_5d.device, dtype=C_5d.dtype)
     else:
         dV2 = dV1
         dW2 = dW1
-    if has_rank3:
+    if rank >= 3:
         dV3 = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
         dW3 = torch.empty((BH, NC, C_CHUNK, M), device=C_5d.device, dtype=C_5d.dtype)
     else:
         dV3 = dV1
         dW3 = dW1
-    if has_rank4:
+    if rank >= 4:
         dV4 = torch.empty((BH, NC, C_CHUNK, D), device=C_5d.device, dtype=C_5d.dtype)
         dW4 = torch.empty((BH, NC, C_CHUNK, M), device=C_5d.device, dtype=C_5d.dtype)
     else:
@@ -6030,9 +6011,7 @@ def _ssd_rank4_dense_output_backward_impl_static(
         D_STATIC=D,
         INPUT_PRECISION=cfg.input_precision,
         HAS_S0=True,
-        HAS_RANK2=has_rank2,
-        HAS_RANK3=has_rank3,
-        HAS_RANK4=has_rank4,
+        RANK=rank,
         num_warps=phase3_bwd_num_warps,
         num_stages=cfg.phase3_backward.num_stages,
     )
@@ -6061,9 +6040,7 @@ def _ssd_rank4_chunk_end_state_backward_impl_static(
     dlog_chunk: torch.Tensor,
     *,
     cfg: _StaticSsdRank1ShapeConfig,
-    has_rank2: bool,
-    has_rank3: bool,
-    has_rank4: bool,
+    rank: int,
 ) -> None:
     B, NC, C_CHUNK, H, M = W1_5d.shape
     D = V1_5d.shape[-1]
@@ -6111,9 +6088,7 @@ def _ssd_rank4_chunk_end_state_backward_impl_static(
         D_STATIC=D,
         INPUT_PRECISION=cfg.input_precision,
         ACCUMULATE=True,
-        HAS_RANK2=has_rank2,
-        HAS_RANK3=has_rank3,
-        HAS_RANK4=has_rank4,
+        RANK=rank,
         num_warps=cfg.phase1_backward.num_warps,
         num_stages=cfg.phase1_backward.num_stages,
     )
@@ -6139,9 +6114,7 @@ class SsdRank4TritonStatic(torch.autograd.Function):
         CHUNK_SIZE: int,
         INPUT_PRECISION: str,
         RETURN_FINAL_STATE: bool,
-        HAS_RANK2: bool,
-        HAS_RANK3: bool,
-        HAS_RANK4: bool,
+        RANK: int,
     ):
         cfg = _validate_static_hot_path_contract(
             C,
@@ -6186,9 +6159,7 @@ class SsdRank4TritonStatic(torch.autograd.Function):
             log_alpha_chunk,
             cfg=cfg,
             ws=ws,
-            has_rank2=HAS_RANK2,
-            has_rank3=HAS_RANK3,
-            has_rank4=HAS_RANK4,
+            rank=RANK,
         )
         log_alpha_per_chunk_bnh = log_alpha_chunk.sum(dim=2, dtype=torch.float32).contiguous()
         S1_chunk = torch.empty((BH, M * D), device=C.device, dtype=torch.float32)
@@ -6213,9 +6184,7 @@ class SsdRank4TritonStatic(torch.autograd.Function):
             S0_chunk,
             cfg=cfg,
             ws=ws,
-            has_rank2=HAS_RANK2,
-            has_rank3=HAS_RANK3,
-            has_rank4=HAS_RANK4,
+            rank=RANK,
         )
 
         ctx.save_for_backward(C, W1, V1, W2, V2, W3, V3, W4, V4, log_alpha)
@@ -6226,9 +6195,7 @@ class SsdRank4TritonStatic(torch.autograd.Function):
         ctx.D = D
         ctx.NC = NC
         ctx.CHUNK_SIZE = cfg.chunk_size
-        ctx.has_rank2 = bool(HAS_RANK2)
-        ctx.has_rank3 = bool(HAS_RANK3)
-        ctx.has_rank4 = bool(HAS_RANK4)
+        ctx.rank = int(RANK)
         return y_chunk, S1_chunk
 
     @staticmethod
@@ -6237,9 +6204,7 @@ class SsdRank4TritonStatic(torch.autograd.Function):
         B, N, H, M, D, NC = ctx.B, ctx.N, ctx.H, ctx.M, ctx.D, ctx.NC
         CHUNK_SIZE = ctx.CHUNK_SIZE
         BH = B * H
-        has_rank2 = ctx.has_rank2
-        has_rank3 = ctx.has_rank3
-        has_rank4 = ctx.has_rank4
+        rank = ctx.rank
         cfg = _lookup_static_ssd_rank1_shape_config(N=N, M=M, D=D)
         ws = _get_static_workspace(device=C.device, cfg_key=(BH, N, M, D), cfg=cfg, allocate_phase3_s0=False)
 
@@ -6275,9 +6240,7 @@ class SsdRank4TritonStatic(torch.autograd.Function):
             log_alpha_chunk,
             cfg=cfg,
             ws=ws,
-            has_rank2=has_rank2,
-            has_rank3=has_rank3,
-            has_rank4=has_rank4,
+            rank=rank,
         )
         log_alpha_per_chunk_bnh = log_alpha_chunk.sum(dim=2, dtype=torch.float32).contiguous()
         final_replay = ws.phase2_final_replay
@@ -6306,9 +6269,7 @@ class SsdRank4TritonStatic(torch.autograd.Function):
                 S0_chunk,
                 cfg=cfg,
                 ws=ws,
-                has_rank2=has_rank2,
-                has_rank3=has_rank3,
-                has_rank4=has_rank4,
+                rank=rank,
             )
         )
         dlog_chunk = ws.dlog_chunk_accum
@@ -6355,21 +6316,19 @@ class SsdRank4TritonStatic(torch.autograd.Function):
             dV4_chunk,
             dlog_chunk,
             cfg=cfg,
-            has_rank2=has_rank2,
-            has_rank3=has_rank3,
-            has_rank4=has_rank4,
+            rank=rank,
         )
         dlog_chunk.add_(d_log_per_chunk.unsqueeze(-1).to(dlog_chunk.dtype))
 
         dC = _ssd_rank1_restore_grad_layout(dC_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
         dW1 = _ssd_rank1_restore_grad_layout(dW1_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
         dV1 = _ssd_rank1_restore_grad_layout(dV1_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
-        dW2 = _ssd_rank1_restore_grad_layout(dW2_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if has_rank2 else None
-        dV2 = _ssd_rank1_restore_grad_layout(dV2_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if has_rank2 else None
-        dW3 = _ssd_rank1_restore_grad_layout(dW3_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if has_rank3 else None
-        dV3 = _ssd_rank1_restore_grad_layout(dV3_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if has_rank3 else None
-        dW4 = _ssd_rank1_restore_grad_layout(dW4_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if has_rank4 else None
-        dV4 = _ssd_rank1_restore_grad_layout(dV4_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if has_rank4 else None
+        dW2 = _ssd_rank1_restore_grad_layout(dW2_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if rank >= 2 else None
+        dV2 = _ssd_rank1_restore_grad_layout(dV2_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if rank >= 2 else None
+        dW3 = _ssd_rank1_restore_grad_layout(dW3_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if rank >= 3 else None
+        dV3 = _ssd_rank1_restore_grad_layout(dV3_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if rank >= 3 else None
+        dW4 = _ssd_rank1_restore_grad_layout(dW4_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if rank >= 4 else None
+        dV4 = _ssd_rank1_restore_grad_layout(dV4_chunk, B=B, N=N, H=H, C=CHUNK_SIZE) if rank >= 4 else None
         dlog_alpha = dlog_chunk.as_strided((B, N, H), (H * N, 1, N))
         return dC, dW1, dV1, dW2, dV2, dW3, dV3, dW4, dV4, dlog_alpha, None, None, None, None, None, None, None
 
