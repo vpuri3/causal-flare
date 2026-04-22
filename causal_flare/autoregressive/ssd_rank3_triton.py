@@ -1,4 +1,26 @@
-"""Triton path for SSD rank-1 autoregressive chunk-prefix state scans."""
+"""Triton path for SSD rank-{1,3} autoregressive chunk-prefix state scans."""
+
+# -----------------------------------------------------------------------------------------------
+# Phase Timing Snapshot (ms) for ssd_rank3_triton, averaged over 8 iterations (3 warmup)
+# Shape: B=32, H=32, N=2048, M=64, D=64, CHUNK_SIZE=64
+# Dtype: bf16 forward, fp32 backward (with bf16 tensor-core dot inputs)
+#
+# rank | fwd_p1 | fwd_p2 | fwd_p3 | fwd_total | bwd_p3 | bwd_p2 | bwd_p1 | bwd_total | step_total
+# 1    | 0.740  | 0.450  | 0.868  | 2.058     | 4.286  | 0.619  | 1.008  | 5.913     | 7.972
+# 2    | 1.162  | 0.449  | 1.159  | 2.770     | 6.306  | 0.618  | 2.576  | 9.500     | 12.270
+# 3    | 1.695  | 0.447  | 1.760  | 3.902     | 8.681  | 0.619  | 4.802  | 14.102    | 18.004
+# -----------------------------------------------------------------------------------------------
+#
+# Global Relative Error Snapshot (L2): ||ref - test|| / ||ref||
+# Shape: B=1, H=8, N=1024, M=64, D=64, CHUNK_SIZE=64
+# Dtype: bf16 forward, fp32 backward (with bf16 tensor-core dot inputs)
+# Oracle: ssd_rank3_token_loop_oracle, Test: ssd_rank3_triton
+#
+# rank | y_rel_l2  | state_rel_l2 | grad_rel_l2_global | dlog_rel_l2
+# 1    | 0.00422371| 0.00331806   | 0.00444426         | 0.00614213
+# 2    | 0.00457052| 0.00355897   | 0.00457376         | 0.00622903
+# 3    | 0.00477045| 0.00418694   | 0.00464354         | 0.00644302
+# -----------------------------------------------------------------------------------------------
 
 from __future__ import annotations
 

@@ -1,5 +1,23 @@
 """Triton path for SSD rank-1 autoregressive chunk-prefix state scans."""
 
+# -----------------------------------------------------------------------------------------------
+# Phase Timing Snapshot (ms) for ssd_rank1_triton, averaged over 8 iterations (3 warmup)
+# Shape: B=32, H=32, N=2048, M=64, D=64, CHUNK_SIZE=64
+# Dtype: bf16 forward, fp32 backward (with bf16 tensor-core dot inputs)
+#
+# rank | fwd_p1 | fwd_p2 | fwd_p3 | fwd_total | bwd_p3 | bwd_p2 | bwd_p1 | bwd_total | step_total
+# 1    | 0.734  | 0.448  | 1.027  | 2.210     | 3.745  | 0.620  | 1.010  | 5.375     | 7.584
+# -----------------------------------------------------------------------------------------------
+#
+# Global Relative Error Snapshot (L2): ||ref - test|| / ||ref||
+# Shape: B=1, H=8, N=1024, M=64, D=64, CHUNK_SIZE=64
+# Dtype: bf16 forward, fp32 backward (with bf16 tensor-core dot inputs)
+# Oracle: ssd_rank1_token_loop_oracle, Test: ssd_rank1_triton
+#
+# rank | y_rel_l2  | state_rel_l2 | grad_rel_l2_global | dlog_rel_l2
+# 1    | 0.00425018| 0.00319833   | 0.00445858         | 0.00615416
+# -----------------------------------------------------------------------------------------------
+
 from __future__ import annotations
 
 from dataclasses import dataclass
