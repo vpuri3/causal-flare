@@ -6,6 +6,25 @@ Recurrence per `(b, h)` lane:
   y_t[D]  = S_t[D]
 """
 
+# -----------------------------------------------------------------------------------------------
+# Trainlike Timing Snapshot (2026-04-23)
+# Shape: B=32, H=8, N=2048, D=64, CHUNK_SIZE=64
+# Dtype: bf16 forward (V/log_alpha), fp32 backward accumulators
+#
+# mode          | ms
+# fwd           | 0.241
+# fwd+bwd step  | 1.319
+#
+# Single-Step Decode Timing + Accuracy Snapshot (2026-04-23)
+# Shape: B=32, H=8, N=1, D=64
+# Dtype: V/log_alpha=bf16, state=fp32, output=bf16
+# Oracle: ssd_single_rank1_token_loop_oracle (bf16 path)
+#
+# impl    | decode_ms | oracle_ms | y_rel_l2   | state_rel_l2
+# pytorch | 0.085     | 0.077     | 0.00234962 | 0.00225657
+# triton  | 0.083     | 0.077     | 0.00234962 | 0.00225657
+# -----------------------------------------------------------------------------------------------
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -100,6 +119,20 @@ class _Phase1BackwardLaunchConfig:
     block_d: int
     num_warps: int
     num_stages: int
+
+
+@dataclass(frozen=True)
+class _DecodeLaunchConfig:
+    block_d: int
+    num_warps: int
+    num_stages: int
+
+
+_SSD_SINGLE_DECODE_TUNED: dict[tuple[int, int], _DecodeLaunchConfig] = {
+    # key: (BH, D)
+    (256, 64): _DecodeLaunchConfig(block_d=64, num_warps=2, num_stages=2),
+    (1024, 64): _DecodeLaunchConfig(block_d=64, num_warps=2, num_stages=2),
+}
 
 
 def _ensure_triton_allocator() -> None:
@@ -417,9 +450,211 @@ def _reshape_log_alpha_per_chunk_to_bnh(
     )
 
 
+def _squeeze_head_scalar_decode(x: torch.Tensor, *, name: str) -> torch.Tensor:
+    if x.ndim == 4:
+        if x.shape[-1] != 1:
+            raise ValueError(f"{name} must be [B,N,H] or [B,N,H,1]. Got {tuple(x.shape)}.")
+        x = x.squeeze(-1)
+    if x.ndim != 3:
+        raise ValueError(f"{name} must be [B,N,H] or [B,N,H,1]. Got {tuple(x.shape)}.")
+    return x
+
+
 # --------------------------------------------------------------------------------------------------
 # ORACLE / PYTORCH REFERENCE
 # --------------------------------------------------------------------------------------------------
+def ssd_single_decode_pytorch(
+    *,
+    V: torch.Tensor,
+    log_alpha: torch.Tensor,
+    state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Token-loop decode/prefill reference for single-state rank-1 recurrence.
+
+    Contract:
+      - single decode step only (`N == 1`)
+      - token stream `V` can be bf16/fp16/fp32
+      - recurrent `state` is accumulated/returned in fp32
+      - output `y` is returned in `V.dtype`
+    """
+    if V.ndim != 4:
+        raise ValueError(f"V must be [B,N,H,D]. Got {tuple(V.shape)}.")
+    B, N, H, D = V.shape
+    if N != 1:
+        raise ValueError(f"ssd_single_decode_pytorch is single-step only and requires N==1. Got N={N}.")
+    log_alpha = _squeeze_head_scalar_decode(log_alpha, name="log_alpha")
+    if log_alpha.shape != (B, N, H):
+        raise ValueError(f"log_alpha must be [B,N,H]={B, N, H}. Got {tuple(log_alpha.shape)}.")
+    if log_alpha.device != V.device:
+        raise ValueError("V and log_alpha must be on the same device.")
+    if not log_alpha.is_floating_point():
+        raise ValueError("log_alpha must be floating point.")
+
+    log_alpha_f = log_alpha.to(torch.float32).clamp_max(0.0)
+    _require_nonpositive_log_alpha(log_alpha_f, where="ssd_single_decode_pytorch")
+    alpha = torch.exp2(log_alpha_f * _INV_LN2)
+
+    BH = B * H
+    if state is None:
+        S = torch.zeros((B, H, D), device=V.device, dtype=torch.float32)
+    elif state.ndim == 2 and state.shape == (BH, D):
+        S = state.reshape(B, H, D).to(torch.float32)
+    elif state.ndim == 3 and state.shape == (B, H, D):
+        S = state.to(torch.float32)
+    else:
+        raise ValueError(
+            f"state must be [BH,D] or [B,H,D]. Got {tuple(state.shape)} with BH={BH}, D={D}."
+        )
+    if S.device != V.device:
+        raise ValueError("state must be on the same device as V/log_alpha.")
+    if not S.is_floating_point():
+        raise ValueError("state must be floating point.")
+
+    S = alpha[:, 0].unsqueeze(-1) * S + V[:, 0].to(torch.float32)
+    y = S.to(V.dtype).unsqueeze(1)
+    return y, S
+
+
+@triton.jit
+def ssd_single_decode_step_kernel(
+    V_ptr,
+    log_alpha_ptr,
+    state_ptr,
+    Y_ptr,
+    bh_size,
+    d_size,
+    stride_v_bh,
+    stride_v_d,
+    stride_log_bh,
+    stride_state_bh,
+    stride_state_d,
+    stride_y_bh,
+    stride_y_d,
+    BLOCK_D: tl.constexpr,
+):
+    pid_bh = tl.program_id(0)
+    pid_d = tl.program_id(1)
+    if pid_bh >= bh_size:
+        return
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < d_size
+
+    v = tl.load(V_ptr + pid_bh * stride_v_bh + offs_d * stride_v_d, mask=mask_d, other=0.0).to(tl.float32)
+    s_prev = tl.load(
+        state_ptr + pid_bh * stride_state_bh + offs_d * stride_state_d,
+        mask=mask_d,
+        other=0.0,
+    ).to(tl.float32)
+    log_a = tl.load(log_alpha_ptr + pid_bh * stride_log_bh).to(tl.float32)
+    INV_LN2 = 1.4426950408889634
+    alpha = tl.exp2(log_a * INV_LN2)
+    s_new = alpha * s_prev + v
+
+    tl.store(state_ptr + pid_bh * stride_state_bh + offs_d * stride_state_d, s_new, mask=mask_d)
+    tl.store(Y_ptr + pid_bh * stride_y_bh + offs_d * stride_y_d, s_new, mask=mask_d)
+
+
+def _select_decode_launch_config(*, BH: int, D: int) -> _DecodeLaunchConfig:
+    tuned = _SSD_SINGLE_DECODE_TUNED.get((BH, D))
+    if tuned is not None:
+        return tuned
+
+    block_d = _select_largest_block_size(D, _SUPPORTED_BLOCK_X_VALUES, where="decode_step", label="D")
+    if block_d >= 128:
+        return _DecodeLaunchConfig(block_d=block_d, num_warps=4, num_stages=2)
+    if block_d == 64:
+        if BH >= 1024:
+            return _DecodeLaunchConfig(block_d=64, num_warps=2, num_stages=2)
+        if BH >= 256:
+            return _DecodeLaunchConfig(block_d=64, num_warps=2, num_stages=3)
+        return _DecodeLaunchConfig(block_d=64, num_warps=1, num_stages=2)
+    return _DecodeLaunchConfig(block_d=block_d, num_warps=1, num_stages=2)
+
+
+def ssd_single_decode_triton(
+    *,
+    V: torch.Tensor,
+    log_alpha: torch.Tensor,
+    state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Triton token-loop decode/prefill for single-state rank-1 recurrence.
+
+    Contract:
+      - single decode step only (`N == 1`)
+      - token stream `V` can be bf16/fp16/fp32
+      - recurrent `state` is accumulated/returned in fp32
+      - output `y` is returned in `V.dtype`
+    """
+    if not V.is_cuda:
+        raise NotImplementedError("ssd_single_decode_triton requires CUDA tensors.")
+    if V.ndim != 4:
+        raise ValueError(f"V must be [B,N,H,D]. Got {tuple(V.shape)}.")
+    B, N, H, D = V.shape
+    if N != 1:
+        raise ValueError(f"ssd_single_decode_triton is single-step only and requires N==1. Got N={N}.")
+    BH = B * H
+
+    log_alpha = _squeeze_head_scalar_decode(log_alpha, name="log_alpha")
+    if log_alpha.shape != (B, N, H):
+        raise ValueError(f"log_alpha must be [B,N,H]={B, N, H}. Got {tuple(log_alpha.shape)}.")
+    if log_alpha.device != V.device:
+        raise ValueError("log_alpha must be on the same device as V.")
+    if not log_alpha.is_floating_point():
+        raise ValueError("log_alpha must be floating point.")
+    log_alpha_f = log_alpha.to(torch.float32).clamp_max(0.0)
+    _require_nonpositive_log_alpha(log_alpha_f, where="ssd_single_decode_triton")
+
+    if state is None:
+        state_bh = torch.zeros((BH, D), device=V.device, dtype=torch.float32)
+    elif state.ndim == 2 and state.shape == (BH, D):
+        state_bh = state.to(device=V.device, dtype=torch.float32)
+        if not state_bh.is_contiguous():
+            state_bh = state_bh.contiguous()
+    elif state.ndim == 3 and state.shape == (B, H, D):
+        state_bh = state.to(device=V.device, dtype=torch.float32).reshape(BH, D)
+        if not state_bh.is_contiguous():
+            state_bh = state_bh.contiguous()
+    else:
+        raise ValueError(f"state must be [BH,D] or [B,H,D]. Got {tuple(state.shape)} with BH={BH}, D={D}.")
+    if not state_bh.is_floating_point():
+        raise ValueError("state must be floating point.")
+
+    v_t = V[:, 0].reshape(BH, D)
+    if not v_t.is_contiguous():
+        v_t = v_t.contiguous()
+    log_t = log_alpha_f[:, 0].reshape(BH)
+    if not log_t.is_contiguous():
+        log_t = log_t.contiguous()
+    y_t = torch.empty((BH, D), device=V.device, dtype=V.dtype)
+
+    _ensure_triton_allocator()
+    decode_cfg = _select_decode_launch_config(BH=BH, D=D)
+    grid = (BH, triton.cdiv(D, decode_cfg.block_d))
+    ssd_single_decode_step_kernel[grid](
+        v_t,
+        log_t,
+        state_bh,
+        y_t,
+        BH,
+        D,
+        v_t.stride(0),
+        v_t.stride(1),
+        log_t.stride(0),
+        state_bh.stride(0),
+        state_bh.stride(1),
+        y_t.stride(0),
+        y_t.stride(1),
+        BLOCK_D=decode_cfg.block_d,
+        num_warps=decode_cfg.num_warps,
+        num_stages=decode_cfg.num_stages,
+    )
+
+    y = y_t.view(B, H, D).unsqueeze(1).contiguous()
+    final_state = state_bh.view(B, H, D)
+    return y, final_state
+
+
 def ssd_single_rank1_token_loop_oracle(
     V: torch.Tensor,
     log_alpha: torch.Tensor,
@@ -1624,4 +1859,4 @@ def ssd_single_rank1_triton(
     return _restore_output_layout(y_chunk, S1_chunk, B=B, N=N, H=H, C=CHUNK_SIZE)
 
 
-__all__ = ["ssd_single_rank1_pytorch", "ssd_single_rank1_triton"]
+__all__ = ["ssd_single_decode_pytorch", "ssd_single_decode_triton", "ssd_single_rank1_pytorch", "ssd_single_rank1_triton"]

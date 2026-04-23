@@ -18,10 +18,10 @@ import causal_flare.autoregressive.ssd_rank4_triton as s4  # noqa: E402
 
 # Snapshot in the header comment of ssd_rank4_triton.py.
 RANK4_COMMENT_BASELINE = {
-    1: {"fwd_p1": 0.750, "fwd_p2": 0.459, "fwd_p3": 0.879, "fwd_total": 2.088, "bwd_p3": 3.988, "bwd_p2": 0.619, "bwd_p1": 1.005, "bwd_total": 5.613, "step_total": 7.701},
-    2: {"fwd_p1": 1.159, "fwd_p2": 0.453, "fwd_p3": 1.156, "fwd_total": 2.768, "bwd_p3": 5.081, "bwd_p2": 0.616, "bwd_p1": 2.430, "bwd_total": 8.128, "step_total": 10.895},
-    3: {"fwd_p1": 1.715, "fwd_p2": 0.459, "fwd_p3": 1.760, "fwd_total": 3.934, "bwd_p3": 6.364, "bwd_p2": 0.616, "bwd_p1": 3.758, "bwd_total": 10.737, "step_total": 14.672},
-    4: {"fwd_p1": 2.172, "fwd_p2": 0.461, "fwd_p3": 2.951, "fwd_total": 5.584, "bwd_p3": 9.729, "bwd_p2": 0.617, "bwd_p1": 4.961, "bwd_total": 15.306, "step_total": 20.889},
+    1: {"fwd_p1": 0.740, "fwd_p2": 0.450, "fwd_p3": 0.867, "fwd_total": 2.057, "bwd_p3": 3.482, "bwd_p2": 0.619, "bwd_p1": 1.006, "bwd_total": 5.107, "step_total": 7.164},
+    2: {"fwd_p1": 1.149, "fwd_p2": 0.447, "fwd_p3": 1.148, "fwd_total": 2.744, "bwd_p3": 5.294, "bwd_p2": 0.616, "bwd_p1": 2.425, "bwd_total": 8.335, "step_total": 11.078},
+    3: {"fwd_p1": 1.700, "fwd_p2": 0.452, "fwd_p3": 1.753, "fwd_total": 3.905, "bwd_p3": 7.151, "bwd_p2": 0.616, "bwd_p1": 3.763, "bwd_total": 11.530, "step_total": 15.435},
+    4: {"fwd_p1": 2.145, "fwd_p2": 0.447, "fwd_p3": 2.932, "fwd_total": 5.525, "bwd_p3": 9.006, "bwd_p2": 0.616, "bwd_p1": 4.980, "bwd_total": 14.601, "step_total": 20.126},
 }
 
 TIMING_KEYS = ("fwd_p1", "fwd_p2", "fwd_p3", "fwd_total", "bwd_p3", "bwd_p2", "bwd_p1", "bwd_total", "step_total")
