@@ -522,8 +522,8 @@ def _select_phase2_block_nc(*, NC: int) -> int:
 
 
 def _select_phase2_launch_config(*, MD: int, NC: int, where: str) -> _Phase2LaunchConfig:
-    if MD % 32 != 0:
-        raise NotImplementedError(f"{where} requires MD to be divisible by 32; got MD={MD}.")
+    if MD % 16 != 0:
+        raise NotImplementedError(f"{where} requires MD to be divisible by 16; got MD={MD}.")
     if NC % 16 != 0:
         raise NotImplementedError(f"{where} requires NC to be divisible by 16; got NC={NC}.")
     if MD >= 8192:
@@ -534,7 +534,9 @@ def _select_phase2_launch_config(*, MD: int, NC: int, where: str) -> _Phase2Laun
         return _Phase2LaunchConfig(block_md=128, num_warps=4, num_stages=2)
     if MD >= 1024:
         return _Phase2LaunchConfig(block_md=64 if MD % 64 == 0 else 32, num_warps=2, num_stages=2)
-    return _Phase2LaunchConfig(block_md=32, num_warps=2, num_stages=2)
+    if MD >= 32:
+        return _Phase2LaunchConfig(block_md=32, num_warps=2, num_stages=2)
+    return _Phase2LaunchConfig(block_md=16, num_warps=1, num_stages=2)
 
 
 def _select_phase3_forward_launch_config(

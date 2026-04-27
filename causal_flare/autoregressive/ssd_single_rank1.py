@@ -38,7 +38,7 @@ from causal_flare.autoregressive.ssd_rank1_triton import (
     ssd_rank1_prefix_scan_bwd_dense_kernel as ssd_single_rank1_phase2_prefix_scan_bwd_dense_kernel,
 )
 
-_SUPPORTED_D_VALUES = {32, 64, 96, 128, 192, 256}
+_SUPPORTED_D_VALUES = {16, 32, 64, 96, 128, 192, 256}
 _SUPPORTED_CHUNK_SIZES = {32, 64, 128, 256}
 _SUPPORTED_BLOCK_X_VALUES = (128, 64, 32, 16)
 _INV_LN2 = 1.4426950408889634
@@ -48,6 +48,13 @@ _EXPERIMENTAL_TRITON_ALLOCATOR_SET = False
 _PHASE_BWD_WORKSPACE: dict[tuple, torch.Tensor] = {}
 
 _SSD_SINGLE_TUNED_2048: dict[int, dict[str, tuple[int, int, int] | int]] = {
+    16: {
+        "chunk_size": 64,
+        "phase1_fwd": (16, 2, 2),
+        "phase3_fwd": (16, 2, 2),
+        "phase3_bwd": (16, 2, 3),
+        "phase1_bwd": (16, 2, 2),
+    },
     32: {
         "chunk_size": 64,
         "phase1_fwd": (32, 2, 2),
@@ -130,8 +137,14 @@ class _DecodeLaunchConfig:
 
 _SSD_SINGLE_DECODE_TUNED: dict[tuple[int, int], _DecodeLaunchConfig] = {
     # key: (BH, D)
+    (256, 16): _DecodeLaunchConfig(block_d=16, num_warps=1, num_stages=2),
+    (1024, 16): _DecodeLaunchConfig(block_d=16, num_warps=1, num_stages=2),
     (256, 64): _DecodeLaunchConfig(block_d=64, num_warps=2, num_stages=2),
     (1024, 64): _DecodeLaunchConfig(block_d=64, num_warps=2, num_stages=2),
+    (256, 96): _DecodeLaunchConfig(block_d=32, num_warps=2, num_stages=2),
+    (1024, 96): _DecodeLaunchConfig(block_d=32, num_warps=2, num_stages=2),
+    (256, 128): _DecodeLaunchConfig(block_d=128, num_warps=2, num_stages=2),
+    (1024, 128): _DecodeLaunchConfig(block_d=128, num_warps=4, num_stages=2),
 }
 
 
@@ -220,8 +233,8 @@ def _select_phase2_block_nc(*, NC: int) -> int:
 
 def _select_phase2_md_launch(*, MD: int) -> tuple[int, int, int]:
     """Heuristic phase-2 BLOCK_MD/num_warps/num_stages for imported rank1 kernels."""
-    if MD % 32 != 0:
-        raise NotImplementedError(f"_select_phase2_md_launch requires MD divisible by 32; got MD={MD}.")
+    if MD % 16 != 0:
+        raise NotImplementedError(f"_select_phase2_md_launch requires MD divisible by 16; got MD={MD}.")
     if MD >= 8192:
         return (512 if MD % 512 == 0 else 256, 8, 3)
     if MD >= 4096:
@@ -232,7 +245,9 @@ def _select_phase2_md_launch(*, MD: int) -> tuple[int, int, int]:
         return (64 if MD % 64 == 0 else 32, 2, 2)
     if MD >= 128:
         return (64 if MD % 64 == 0 else 32, 2, 2)
-    return (32, 2, 2)
+    if MD >= 32:
+        return (32, 2, 2)
+    return (16, 1, 2)
 
 
 def _select_phase1_forward_launch_config(*, BH: int, NC: int, C_CHUNK: int, D: int) -> _Phase1ForwardLaunchConfig:
